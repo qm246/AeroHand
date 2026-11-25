@@ -110,6 +110,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "hand_too_close": "Tay quá gần camera — lùi tay ra nhẹ để thấy đủ bàn tay",
             "near_edge": "Tay sát mép khung hình — đưa vào vùng giữa camera",
             "low_confidence": "Tín hiệu bàn tay chưa ổn định — giữ lòng bàn tay rõ trước camera",
+            "onnx_fallback_latency": "ONNX vượt ngưỡng độ trễ (> 8 ms) — đã tự động chuyển về Heuristic 3D an toàn",
+            "onnx_fallback_errors": "ONNX gặp lỗi liên tiếp — đã tự động chuyển về Heuristic 3D an toàn",
         },
         "tile_dirs": {
             "left": "Nửa trái",
@@ -264,6 +266,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "hand_too_close": "Hand is very close — pull back slightly so all fingers fit",
             "near_edge": "Hand near frame edge — keep hand centered in camera view",
             "low_confidence": "Low hand tracking confidence — keep palm clearly visible",
+            "onnx_fallback_latency": "ONNX latency exceeded 8 ms p95 — automatically fell back to Heuristic 3D",
+            "onnx_fallback_errors": "Repeated ONNX errors — automatically fell back to Heuristic 3D",
         },
         "tile_dirs": {
             "left": "Left Half",

@@ -1111,6 +1111,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 "fps": round(snap.fps, 1),
                 "delegate": snap.delegate,
                 "classifier_name": snap.classifier_name,
+                "classifier_telemetry": snap.classifier_telemetry,
                 "accessibility_ok": snap.accessibility_ok,
                 "permissions": snap.permissions,
                 "guard_reason": snap.guard_reason,

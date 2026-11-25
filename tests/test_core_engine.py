@@ -1744,3 +1744,133 @@ def test_quality_gate_flags_low_confidence():
     assert "low_confidence" in q["warnings"]
     assert "hand_clipped_edge" in q["warnings"]
     assert "time_gaps" in q["warnings"]
+
+
+def test_onnx_error_falls_back_to_heuristic():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    now_s = [10.0]
+    releases: List[int] = []
+
+    class _FlakyOnnx:
+        def __init__(self) -> None:
+            self.fail = True
+            self.pose = PoseName.THUMB_INDEX_PINCH
+
+        def predict(self, *args, **kwargs):
+            if self.fail:
+                raise RuntimeError("onnx crash")
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.1
+            probs[self.pose] = 0.9
+            return PinchPrediction(self.pose, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    fallback = Heuristic3DPinchClassifier()
+    onnx = _FlakyOnnx()
+    guarded = GuardedClassifier(
+        onnx,
+        fallback,
+        shadow_mode=False,
+        max_p95_ms=8.0,
+        max_errors=3,
+        error_window_s=10.0,
+        on_error=lambda: releases.append(1),
+        clock_s=lambda: now_s[0],
+    )
+
+    pinched = list(_make_open_hand())
+    m_tip = pinched[12]
+    pinched[4] = Landmark(m_tip.x - 0.005, m_tip.y, m_tip.z)
+
+    # First 3 errors within 10s: each fails open to IDLE and triggers release_all callback; 3rd switches to heuristic
+    for i in range(3):
+        now_s[0] = 10.0 + i * 1.0
+        pred = guarded.predict(pinched, pinched, "Right", float(i * 33))
+        assert pred.pose == PoseName.IDLE
+    assert len(releases) == 3
+    assert guarded.fell_back is True
+    assert guarded.fallback_reason == "onnx_fallback_errors"
+
+    # Next frame uses Heuristic3D seamlessly and detects the middle pinch
+    pred_fb = guarded.predict(pinched, pinched, "Right", 120.0)
+    assert pred_fb.pose == PoseName.THUMB_MIDDLE_PINCH
+
+    # Shadow mode logs disagreement rate without acting on ONNX
+    onnx2 = _FlakyOnnx()
+    onnx2.fail = False
+    onnx2.pose = PoseName.THUMB_PINKY_PINCH  # disagrees with heuristic (THUMB_MIDDLE_PINCH)
+    shadow = GuardedClassifier(onnx2, fallback, shadow_mode=True)
+    pred_sh = shadow.predict(pinched, pinched, "Right", 200.0)
+    assert pred_sh.pose == PoseName.THUMB_MIDDLE_PINCH  # acts on heuristic, NOT ONNX
+    tel = shadow.telemetry()
+    assert tel["shadow_mode"] is True
+    assert tel["shadow_frames"] == 1
+    assert tel["shadow_disagreement_rate"] == 1.0
+
+
+def test_buffers_cleared_on_hand_loss(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+
+    norm_fp = tmp_path / "norm_buf.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp = tmp_path / "dummy_buf.onnx"
+    model_fp.write_bytes(b"placeholder")
+
+    class _FakeInput:
+        name = "input"
+
+    class _FakeOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            return [_FakeInput()]
+
+        def run(self, _out, _feed):
+            return [np.array([[2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _FakeOrt)
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+
+    clf = ONNXPinchClassifier(model_path=model_fp, normalizer_path=norm_fp, sequence_length=5)
+    eng = HandCursorEngine(cfg, classifier=clf)
+    fwd = _make_open_hand(forward_z=-0.25)
+
+    # Feed 3 frames with both Left & Right hands -> both buffers have 3 entries
+    for k in range(3):
+        eng.process_frame(
+            [HandInput("Left", fwd, fwd), HandInput("Right", fwd, fwd)], k * 33.0, 1920.0, 1080.0
+        )
+    assert len(clf._buffers["Right"]) == 3
+    assert len(clf._buffers["Left"]) == 3
+
+    # Right hand vanishes on next frame while Left remains -> Right buffer cleared, Left keeps accumulating!
+    eng.process_frame([HandInput("Left", fwd, fwd)], 100.0, 1920.0, 1080.0)
+    assert len(clf._buffers["Right"]) == 0
+    assert len(clf._buffers["Left"]) == 4
+
+    # Switching classifier clears all remaining buffers cleanly
+    eng.set_classifier(Heuristic3DPinchClassifier())
+    assert len(clf._buffers["Left"]) == 0

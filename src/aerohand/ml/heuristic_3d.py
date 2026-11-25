@@ -62,7 +62,7 @@ class Heuristic3DPinchClassifier:
         self.dual_pinch_off_dist: float = float(c.get("dual_pinch_off_dist", 0.65))
         self.min_margin: float = float(c.get("min_margin", 0.08))
 
-    def reset(self) -> None:
+    def reset(self, hand: Optional[Handedness] = None) -> None:
         return None
 
     def predict(

@@ -565,6 +565,11 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             </select>
           </div>
           <div class="row">
+            <div class="row-label"><strong id="lbl-shadow-mode">Chế độ Shadow Mode (A/B an toàn)</strong><span id="sub-shadow-mode">Chạy song song ONNX để đo độ lệch mà chưa tác động chuột</span></div>
+            <label class="switch"><input type="checkbox" id="cfg-shadow-mode" onchange="setKey('classifier.shadow_mode', this.checked)"><span class="track"></span></label>
+          </div>
+          <div id="ml-guard-status" style="font-size:11.5px;color:var(--teal);margin-top:6px"></div>
+          <div class="row">
             <div class="row-label"><strong>MediaPipe Delegate</strong><span>CPU XNNPACK (0 rò rỉ RAM, ổn định 24/7 trên macOS)</span></div>
             <select id="cfg-trk-del" onchange="setKey('tracker.delegate', this.value)">
               <option value="CPU">CPU XNNPACK (Khuyên dùng — Ổn định)</option>
@@ -1078,6 +1083,10 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
 
     // ML Studio
     document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");
+    const shCb = document.getElementById("cfg-shadow-mode");
+    if (shCb) shCb.checked = !!getPath(c, "classifier.shadow_mode", false);
+    setTxt("lbl-shadow-mode", "Chế độ Shadow Mode (A/B an toàn)", "Shadow Mode (Safe Side-by-Side Eval)");
+    setTxt("sub-shadow-mode", "Chạy song song ONNX để đo độ lệch mà chưa tác động chuột", "Run ONNX alongside Heuristic 3D and log disagreement rate without acting");
     const delSel = document.getElementById("cfg-trk-del");
     if (delSel) delSel.value = getPath(c, "tracker.delegate", "CPU");
     const recHandSel = document.getElementById("col-rec-hand");
@@ -1212,6 +1221,25 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
 
     // Collector & Timing (only update when ML tab active to save DOM work)
     if (CURRENT_TAB === "ml") {
+      const ct = snap.classifier_telemetry || {};
+      const guardEl = document.getElementById("ml-guard-status");
+      if (guardEl) {
+        if (ct.fell_back && ct.fallback_reason) {
+          guardEl.style.color = "var(--amber)";
+          guardEl.textContent = "⚠ " + ((i18n.warnings && i18n.warnings[ct.fallback_reason]) || ct.fallback_reason);
+        } else if (ct.shadow_mode) {
+          const pct = ((ct.shadow_disagreement_rate || 0) * 100).toFixed(1);
+          guardEl.style.color = "var(--teal)";
+          guardEl.textContent = isVi
+            ? `Shadow Mode: lệch ${pct}% (${ct.shadow_disagreements || 0}/${ct.shadow_frames || 0} frame) • ONNX p95=${ct.onnx_p95_ms || 0} ms`
+            : `Shadow Mode: ${pct}% disagreement (${ct.shadow_disagreements || 0}/${ct.shadow_frames || 0} frames) • ONNX p95=${ct.onnx_p95_ms || 0} ms`;
+        } else if (ct.onnx_p95_ms > 0) {
+          guardEl.style.color = "var(--teal)";
+          guardEl.textContent = `ONNX p95: ${ct.onnx_p95_ms} ms • Errors: ${ct.onnx_errors || 0}`;
+        } else {
+          guardEl.textContent = "";
+        }
+      }
       const col = snap.collector || {};
       const colI18n = i18n.collector || {};
       document.getElementById("col-total").textContent = (col.total || 0) + (isVi ? " mẫu" : " samples");

@@ -29,5 +29,5 @@ class PinchClassifier(Protocol):
     ) -> PinchPrediction:
         ...
 
-    def reset(self) -> None:
+    def reset(self, hand: Optional[Handedness] = None) -> None:
         ...

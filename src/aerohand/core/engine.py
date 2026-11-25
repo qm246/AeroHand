@@ -336,9 +336,11 @@ class HandCursorEngine:
         self,
         config: Dict[str, Any],
         classifier: Optional[PinchClassifier] = None,
+        on_classifier_error: Optional[Any] = None,
     ) -> None:
         self.config = config
         self.classifier = classifier
+        self._on_classifier_error = on_classifier_error
         self.smoother = LandmarkSmoother()
         self.zoom = ZoomController(config.get("gestures"))
         self._hands: Dict[Handedness, _PerHandState] = {
@@ -456,6 +458,21 @@ class HandCursorEngine:
 
             hs.palm_wheel.update_config(pw_cfg)
 
+    def _reset_classifier(self, hand: Optional[Handedness] = None) -> None:
+        if self.classifier is None:
+            return
+        try:
+            self.classifier.reset(hand)  # type: ignore[call-arg]
+        except TypeError:
+            if hand is None:
+                self.classifier.reset()
+
+    def set_classifier(self, classifier: Optional[PinchClassifier]) -> None:
+        """Hot-swap active classifier while clearing all temporal buffers cleanly."""
+        self._reset_classifier(None)
+        self.classifier = classifier
+        self._reset_classifier(None)
+
     def reset(self) -> None:
         self.smoother.reset()
         self.zoom.reset()
@@ -464,8 +481,7 @@ class HandCursorEngine:
         self._active_hands.clear()
         self.last_zoom = ZoomOutput()
         self.last_warning = None
-        if self.classifier is not None:
-            self.classifier.reset()
+        self._reset_classifier(None)
 
     def anchor_cursor(self, hand: Handedness, x: float, y: float) -> None:
         """Synchronize engine pointer state to real OS cursor without jumping."""
@@ -667,6 +683,11 @@ class HandCursorEngine:
                     logger.warning(f"[ENGINE] Classifier failed (fail-open to IDLE): {exc}")
                     pose_probs = idle_probabilities()
                     pred_pose = PoseName.IDLE
+                    if self._on_classifier_error is not None:
+                        try:
+                            self._on_classifier_error()
+                        except Exception:
+                            pass
             ml_ms += (time.perf_counter() - tm0) * 1000.0
 
             # Record dedicated zoom pose eligibility (never mixes click/drag/scroll/palm-wheel)
@@ -873,10 +894,11 @@ class HandCursorEngine:
             timestamp_ms,
         )
 
-        # Reset vanished hands cleanly
+        # Reset vanished hands cleanly (including per-hand classifier temporal ring buffers)
         for lost in list(self._active_hands - seen):
             self._hands[lost].reset()
             self.smoother.reset(lost)
+            self._reset_classifier(lost)
         self._active_hands = seen
 
         if not inputs and frame_brightness is not None and frame_brightness < 38.0:

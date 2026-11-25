@@ -40,7 +40,7 @@ from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.collector import PinchDataCollector
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
-from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
 from aerohand.platform.audio import AudioFeedback
 from aerohand.platform.camera import ThreadedCamera, list_cameras
 from aerohand.platform.control_api import LocalControlAPIServer
@@ -71,6 +71,7 @@ class RuntimeSnapshot:
     fps: float = 0.0
     delegate: str = "CPU"
     classifier_name: str = "Heuristic3DPinchClassifier"
+    classifier_telemetry: Dict[str, Any] = field(default_factory=dict)
     accessibility_ok: bool = True
     permissions: Dict[str, bool] = field(default_factory=dict)
     guard_reason: str = ""
@@ -110,10 +111,18 @@ class RuntimeSnapshot:
     error: Optional[str] = None
 
 
-def build_classifier(config: Dict[str, Any]) -> PinchClassifier:
+def build_classifier(
+    config: Dict[str, Any],
+    *,
+    on_error: Optional[Callable[[], None]] = None,
+) -> PinchClassifier:
     cls_cfg = config.get("classifier") or {}
     backend = str(cls_cfg.get("backend", "heuristic_3d")).strip().lower()
-    if backend == "onnx_tcn":
+    shadow_mode = bool(cls_cfg.get("shadow_mode", False))
+    max_p95_ms = float(cls_cfg.get("max_onnx_p95_ms", 8.0))
+    heuristic = Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
+
+    if backend == "onnx_tcn" or shadow_mode:
         mpath = cls_cfg.get("onnx_model_path")
         npath = cls_cfg.get("onnx_normalizer_path")
         if mpath and npath:
@@ -125,17 +134,24 @@ def build_classifier(config: Dict[str, Any]) -> PinchClassifier:
                 np_ = repo_root() / npath
             if mp.is_file() and np_.is_file():
                 try:
-                    return ONNXPinchClassifier(
+                    onnx_clf = ONNXPinchClassifier(
                         model_path=mp,
                         normalizer_path=np_,
                         sequence_length=int(cls_cfg.get("sequence_length", 5)),
                         feature_set=str(cls_cfg.get("feature_set", "auto")),
                     )
+                    return GuardedClassifier(
+                        onnx_clf,
+                        heuristic,
+                        shadow_mode=(shadow_mode and backend != "onnx_tcn") or shadow_mode,
+                        max_p95_ms=max_p95_ms,
+                        on_error=on_error,
+                    )
                 except Exception as exc:
                     logger.warning(f"[ML] Failed loading ONNX TCN ({exc}); falling back to heuristic_3d.")
             else:
                 logger.info("[ML] ONNX model not trained yet; using heuristic_3d until model is exported.")
-    return Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
+    return heuristic
 
 
 class AeroHandRuntime:
@@ -199,9 +215,11 @@ class AeroHandRuntime:
         self._lerp_lock = threading.Lock()
         self._lerp_active: bool = False
 
-        self.classifier = build_classifier(config)
-        self.engine = HandCursorEngine(config, classifier=self.classifier)
         self.input_ctl = MacOSInputController(config.get("typing_guard"), dry_run=self.dry_run)
+        self.classifier = build_classifier(config, on_error=self._on_classifier_error)
+        self.engine = HandCursorEngine(
+            config, classifier=self.classifier, on_classifier_error=self._on_classifier_error
+        )
         self.audio = AudioFeedback(config.get("audio"))
         self.dictation = VoiceDictationController(
             config.get("dictation"),
@@ -315,6 +333,24 @@ class AeroHandRuntime:
             self._last_action_text = f"Dictated: {text[:36]}"
             self.input_ctl.paste_text_utf8(text)
 
+    def _on_classifier_error(self) -> None:
+        self._force_release_held_inputs("Classifier inference error")
+
+    def classifier_telemetry(self) -> Dict[str, Any]:
+        if isinstance(self.classifier, GuardedClassifier):
+            return self.classifier.telemetry()
+        return {
+            "active_backend": type(self.classifier).__name__,
+            "shadow_mode": False,
+            "shadow_frames": 0,
+            "shadow_disagreements": 0,
+            "shadow_disagreement_rate": 0.0,
+            "onnx_p95_ms": 0.0,
+            "onnx_errors": 0,
+            "fell_back": False,
+            "fallback_reason": None,
+        }
+
     def _emit_click_pulse(self, kind: str, x: float, y: float) -> None:
         self._click_seq += 1
         self._last_click_event = {"seq": self._click_seq, "kind": kind, "x": round(x, 1), "y": round(y, 1)}
@@ -415,9 +451,11 @@ class AeroHandRuntime:
         if (
             str(new_cls.get("backend", "heuristic_3d")) != str(old_cls.get("backend", "heuristic_3d"))
             or str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
+            or bool(new_cls.get("shadow_mode", False)) != bool(old_cls.get("shadow_mode", False))
+            or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
         ):
-            self.classifier = build_classifier(effective)
-            self.engine.classifier = self.classifier
+            self.classifier = build_classifier(effective, on_error=self._on_classifier_error)
+            self.engine.set_classifier(self.classifier)
 
     # ------------------------------------------------------------------
     # Data Collector Studio Controls (callable from WKWebView UI)
@@ -616,6 +654,7 @@ class AeroHandRuntime:
         def _get_vitals() -> Dict[str, Any]:
             v = self.vitals_mon.read(force=True).to_dict()
             v["timing"] = self.get_snapshot().timing
+            v["classifier"] = self.classifier_telemetry()
             return v
 
         def _set_tracking(enabled: bool) -> bool:
@@ -1313,6 +1352,10 @@ class AeroHandRuntime:
                     else {k.value: (1.0 if k == PoseName.IDLE else 0.0) for k in ALL_POSE_NAMES}
                 )
 
+                cls_tel = self.classifier_telemetry()
+                if warn_dict is None and cls_tel.get("fell_back") and cls_tel.get("fallback_reason"):
+                    warn_dict = {"level": "warning", "code": str(cls_tel["fallback_reason"])}
+
                 snap = RuntimeSnapshot(
                     running=True,
                     paused=self._paused,
@@ -1320,7 +1363,8 @@ class AeroHandRuntime:
                     is_idle=is_idle,
                     fps=fps_ema,
                     delegate=tracker.delegate_used,
-                    classifier_name=type(self.classifier).__name__,
+                    classifier_name=str(cls_tel.get("active_backend", type(self.classifier).__name__)),
+                    classifier_telemetry=cls_tel,
                     accessibility_ok=acc_ok,
                     permissions=perms,
                     guard_reason=self.input_ctl.last_guard_reason,

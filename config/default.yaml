@@ -50,7 +50,7 @@ tracker:
 
 hand:
   cursor_hand: "Right"                 # "Right" | "Left" | "Both"
-  click_hand: "Right"                  # "Right" | "Left" | "Both"
+  click_hand: "Right"                  # "Right" | "Left" | "Both" | "Same"
   gesture_preset: "airpoint"           # "airpoint" | "classic" | "custom"
 
 gestures:

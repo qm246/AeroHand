@@ -575,6 +575,21 @@ class AeroHandRuntime:
                 hand_id=chosen.handedness,
             )
 
+    def _select_click_hand(
+        self, outputs: List[HandOutput], primary: Optional[HandOutput]
+    ) -> Optional[HandOutput]:
+        """Resolve which hand drives click/right-click/drag actions (supports split cursor/click hands)."""
+        hand_cfg = self.config.get("hand") or {}
+        click_pref = str(hand_cfg.get("click_hand", "Right"))
+        if click_pref.lower() == "same":
+            return primary
+        if click_pref in ("Left", "Right"):
+            for o in outputs:
+                if o.hand == click_pref:
+                    return o
+            return None
+        return primary
+
     def _select_primary_hand(self, outputs: List[HandOutput]) -> Optional[HandOutput]:
         if not outputs:
             return None
@@ -756,6 +771,8 @@ class AeroHandRuntime:
         c = primary.cursor
         abs_x = self._screen_ox + c.x
         abs_y = self._screen_oy + c.y
+        click_ho = self._select_click_hand(outputs, primary)
+        cp = click_ho.pose if click_ho is not None else None
 
         if (
             p.is_grabbing
@@ -763,6 +780,7 @@ class AeroHandRuntime:
             or p.is_scrolling
             or p.is_dictating
             or p.active_pose is not None
+            or (cp is not None and (cp.is_grabbing or cp.grab_just_started))
         ):
             self._last_primary_ms = now_ms
 
@@ -781,45 +799,46 @@ class AeroHandRuntime:
             with self._lerp_lock:
                 self._lerp_active = False
 
-        if p.is_pinching:
-            self.audio.play_click_down()
+        if cp is not None:
+            if cp.is_pinching:
+                self.audio.play_click_down()
 
-        if p.is_clicking:
-            self.audio.play_click_up()
-            cnt = max(1, p.click_count)
-            self._last_action_text = "Double Click" if cnt == 2 else "Left Click"
-            self._practice["click"] = True
-            self._emit_click_pulse("double_click" if cnt == 2 else "left_click", abs_x, abs_y)
-            self.input_ctl.mouse_click(abs_x, abs_y, button="left", click_count=cnt)
-            active_hint = "click"
+            if cp.is_clicking:
+                self.audio.play_click_up()
+                cnt = max(1, cp.click_count)
+                self._last_action_text = "Double Click" if cnt == 2 else "Left Click"
+                self._practice["click"] = True
+                self._emit_click_pulse("double_click" if cnt == 2 else "left_click", abs_x, abs_y)
+                self.input_ctl.mouse_click(abs_x, abs_y, button="left", click_count=cnt)
+                active_hint = "click"
 
-        if p.is_right_clicking:
-            self.audio.play_click_up()
-            self._last_action_text = "Right Click"
-            self._practice["right_click"] = True
-            self._emit_click_pulse("right_click", abs_x, abs_y)
-            self.input_ctl.mouse_click(abs_x, abs_y, button="right", click_count=1)
-            active_hint = "right_click"
+            if cp.is_right_clicking:
+                self.audio.play_click_up()
+                self._last_action_text = "Right Click"
+                self._practice["right_click"] = True
+                self._emit_click_pulse("right_click", abs_x, abs_y)
+                self.input_ctl.mouse_click(abs_x, abs_y, button="right", click_count=1)
+                active_hint = "right_click"
 
-        if p.grab_just_started:
-            self.audio.play_click_down()
-            self._drag_started_ms = now_ms
-            self._last_primary_ms = now_ms
-            if self._last_frame_ms <= 0.0:
-                self._last_frame_ms = now_ms
-            self._mouse_button_held = True
-            self._last_action_text = "Drag Start"
-            self._practice["drag"] = True
-            self._emit_click_pulse("grab", abs_x, abs_y)
-            self.input_ctl.mouse_down(abs_x, abs_y, button="left")
-        elif p.grab_just_ended:
-            self.audio.play_click_up()
-            self._drag_started_ms = None
-            self._mouse_button_held = False
-            self._last_action_text = "Drag Release"
-            self.input_ctl.mouse_up(abs_x, abs_y, button="left")
-        if p.is_grabbing:
-            active_hint = "grab"
+            if cp.grab_just_started:
+                self.audio.play_click_down()
+                self._drag_started_ms = now_ms
+                self._last_primary_ms = now_ms
+                if self._last_frame_ms <= 0.0:
+                    self._last_frame_ms = now_ms
+                self._mouse_button_held = True
+                self._last_action_text = "Drag Start"
+                self._practice["drag"] = True
+                self._emit_click_pulse("grab", abs_x, abs_y)
+                self.input_ctl.mouse_down(abs_x, abs_y, button="left")
+            elif cp.grab_just_ended:
+                self.audio.play_click_up()
+                self._drag_started_ms = None
+                self._mouse_button_held = False
+                self._last_action_text = "Drag Release"
+                self.input_ctl.mouse_up(abs_x, abs_y, button="left")
+            if cp.is_grabbing:
+                active_hint = "grab"
 
         # Voice Dictation hold gesture (`thumb_index_pinch`)
         if p.dictation_just_started:

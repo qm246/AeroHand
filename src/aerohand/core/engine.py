@@ -233,8 +233,15 @@ class HandCursorEngine:
             hs.is_grabbing = False
             hs.is_dictating = False
 
+    def _effective_click_hand(self) -> str:
+        return self.cursor_hand if str(self.click_hand).lower() == "same" else self.click_hand
+
+    def _is_hand_allowed_for_click_actions(self, hand: Handedness) -> bool:
+        eff = self._effective_click_hand()
+        return eff == "Both" or eff == hand
+
     def _is_click_allowed_for_hand(self, hand: Handedness) -> bool:
-        return self.enable_click and (self.click_hand == "Both" or self.click_hand == hand)
+        return self.enable_click and self._is_hand_allowed_for_click_actions(hand)
 
     def _update_pointing_gate(self, hs: _PerHandState, dir_z: float) -> bool:
         if not self.enable_pointing_gate:
@@ -454,11 +461,11 @@ class HandCursorEngine:
                             is_clicking = True
                             hs.last_click_ms = timestamp_ms
                             hs.last_click_count = click_count
-                    elif tap_act == "right_click" and self.enable_right_click:
+                    elif tap_act == "right_click" and self.enable_right_click and self._is_hand_allowed_for_click_actions(hand):
                         is_right_clicking = True
                 elif ev.type == "hold_start":
                     hold_act = hs.pose_sm.get_hold_action(ev.pose)
-                    if hold_act == "drag" and self.enable_grab:
+                    if hold_act == "drag" and self.enable_grab and self._is_hand_allowed_for_click_actions(hand):
                         hs.is_grabbing = True
                         grab_started = True
                     elif hold_act == "dictation" and self.enable_dictation:
@@ -476,6 +483,7 @@ class HandCursorEngine:
                     if (
                         ev.pose == PoseName.THUMB_RING_PINCH
                         and self.enable_right_click
+                        and self._is_hand_allowed_for_click_actions(hand)
                         and ev.motion_distance < self.still_right_click_motion_px
                     ):
                         is_right_clicking = True

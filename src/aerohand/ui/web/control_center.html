@@ -363,15 +363,23 @@
 
         <div class="card">
           <div class="card-title"><span id="t-hand-mode">CHẾ ĐỘ BÀN TAY & BẬT/TẮT TỪNG CỬ CHỈ</span></div>
-          <div class="grid-2">
-            <div class="row"><div class="row-label"><strong>Số tay nhận diện</strong><span>Bật 2 tay cho Zoom & Palm Wheel trái/phải</span></div>
+          <div class="grid-3">
+            <div class="row"><div class="row-label"><strong id="lbl-num-hands">Số tay nhận diện</strong><span id="sub-num-hands">Bật 2 tay cho Zoom & Palm Wheel trái/phải</span></div>
               <select id="cfg-num-hands" onchange="setKey('tracker.num_hands', parseInt(this.value))">
                 <option value="2">2 tay (Đầy đủ Airpoint)</option>
                 <option value="1">1 tay (Tiết kiệm pin)</option>
               </select>
             </div>
-            <div class="row"><div class="row-label"><strong>Tay điều khiển chuột</strong><span>Ưu tiên tay thuận</span></div>
-              <select id="cfg-cursor-hand" onchange="setKey('hand.cursor_hand', this.value); setKey('hand.click_hand', this.value);">
+            <div class="row"><div class="row-label"><strong id="lbl-cursor-hand">Tay điều khiển con trỏ</strong><span id="sub-cursor-hand">Tay dùng để di chuyển con trỏ</span></div>
+              <select id="cfg-cursor-hand" onchange="setKey('hand.cursor_hand', this.value)">
+                <option value="Right">Tay phải (Right)</option>
+                <option value="Left">Tay trái (Left)</option>
+                <option value="Both">Cả hai tay (Both)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-click-hand">Tay bấm Click / Kéo thả</strong><span id="sub-click-hand">Có thể chọn riêng tay trỏ và tay bấm</span></div>
+              <select id="cfg-click-hand" onchange="setKey('hand.click_hand', this.value)">
+                <option value="Same">Giống tay con trỏ</option>
                 <option value="Right">Tay phải (Right)</option>
                 <option value="Left">Tay trái (Left)</option>
                 <option value="Both">Cả hai tay (Both)</option>
@@ -754,9 +762,30 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       ).join("");
     }
 
-    // Hand selectors
+    // Hand selectors (independent cursor_hand & click_hand)
+    const handI18n = i18n.hands || {};
+    setTxt("lbl-num-hands", "Số tay nhận diện", "Tracked Hands");
+    setTxt("sub-num-hands", "Bật 2 tay cho Zoom & Palm Wheel trái/phải", "Enable 2 hands for Zoom & Left/Right Palm Wheel");
+    setTxt("lbl-cursor-hand", handI18n.cursor_hand || "Tay điều khiển con trỏ", handI18n.cursor_hand || "Cursor Hand");
+    setTxt("sub-cursor-hand", handI18n.cursor_hand_desc || "Tay dùng để di chuyển con trỏ", handI18n.cursor_hand_desc || "Hand used to move the pointer");
+    setTxt("lbl-click-hand", handI18n.click_hand || "Tay bấm Click / Kéo thả", handI18n.click_hand || "Click / Drag Hand");
+    setTxt("sub-click-hand", handI18n.click_hand_desc || "Có thể chọn riêng tay trỏ và tay bấm", handI18n.click_hand_desc || "Can be assigned independently from cursor hand");
+    const curHandSel = document.getElementById("cfg-cursor-hand");
+    curHandSel.innerHTML = [
+      ["Right", handI18n.right || "Right"],
+      ["Left", handI18n.left || "Left"],
+      ["Both", handI18n.both || "Both"],
+    ].map(([v, lbl]) => `<option value="${v}">${lbl}</option>`).join("");
+    const clkHandSel = document.getElementById("cfg-click-hand");
+    clkHandSel.innerHTML = [
+      ["Same", handI18n.same_as_cursor || "Same as cursor hand"],
+      ["Right", handI18n.right || "Right"],
+      ["Left", handI18n.left || "Left"],
+      ["Both", handI18n.both || "Both"],
+    ].map(([v, lbl]) => `<option value="${v}">${lbl}</option>`).join("");
     document.getElementById("cfg-num-hands").value = String(getPath(c, "tracker.num_hands", 2));
-    document.getElementById("cfg-cursor-hand").value = String(getPath(c, "hand.cursor_hand", "Right"));
+    curHandSel.value = String(getPath(c, "hand.cursor_hand", "Right"));
+    clkHandSel.value = String(getPath(c, "hand.click_hand", "Right"));
 
     // Gesture toggles
     const gt = [

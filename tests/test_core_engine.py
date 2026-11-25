@@ -1021,3 +1021,124 @@ def test_new_pose_blocked_when_gate_closed():
         assert outs[0].cursor.is_pointing is False
         assert outs[0].pose.active_pose is None
         assert outs[0].pose.is_pinching is False
+
+
+def test_right_click_blocked_for_non_click_hand():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["hand"]["cursor_hand"] = "Left"
+    cfg["hand"]["click_hand"] = "Right"
+
+    class _PerHandPoseClassifier:
+        def __init__(self) -> None:
+            self.by_hand = {"Left": PoseName.THUMB_RING_PINCH, "Right": PoseName.IDLE}
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            pose = self.by_hand.get(handedness, PoseName.IDLE)
+            probs = idle_probabilities()
+            if pose != PoseName.IDLE:
+                probs[PoseName.IDLE] = 0.05
+                probs[pose] = 0.95
+            return PinchPrediction(pose, probs, "high")
+
+        def reset(self):
+            pass
+
+    clf = _PerHandPoseClassifier()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    fwd = _make_open_hand(forward_z=-0.25)
+
+    # Hold thumb_ring_pinch still on Left hand (non-click hand), then release
+    eng.process_frame([HandInput("Left", fwd, fwd)], 0.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Left", fwd, fwd)], 33.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Left", fwd, fwd)], 260.0, 1920.0, 1080.0)
+    clf.by_hand["Left"] = PoseName.IDLE
+    right_clicked = False
+    for k in range(6):
+        outs = eng.process_frame([HandInput("Left", fwd, fwd)], 300.0 + k * 33.0, 1920.0, 1080.0)
+        if outs[0].pose.is_right_clicking:
+            right_clicked = True
+    assert right_clicked is False
+
+    # Now repeat on Right hand (click hand) -> MUST emit right_click
+    clf.by_hand["Right"] = PoseName.THUMB_RING_PINCH
+    eng.process_frame([HandInput("Right", fwd, fwd)], 600.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Right", fwd, fwd)], 633.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Right", fwd, fwd)], 860.0, 1920.0, 1080.0)
+    clf.by_hand["Right"] = PoseName.IDLE
+    right_clicked_r = False
+    for k in range(6):
+        outs = eng.process_frame([HandInput("Right", fwd, fwd)], 900.0 + k * 33.0, 1920.0, 1080.0)
+        if outs[0].pose.is_right_clicking:
+            right_clicked_r = True
+    assert right_clicked_r is True
+
+
+def test_drag_blocked_for_non_click_hand():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["hand"]["cursor_hand"] = "Left"
+    cfg["hand"]["click_hand"] = "Right"
+    cfg["audio"]["enabled"] = False
+
+    class _PerHandClf:
+        def __init__(self) -> None:
+            self.by_hand = {"Left": PoseName.THUMB_INDEX_MIDDLE_PINCH, "Right": PoseName.IDLE}
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            pose = self.by_hand.get(handedness, PoseName.IDLE)
+            probs = idle_probabilities()
+            if pose != PoseName.IDLE:
+                probs[PoseName.IDLE] = 0.05
+                probs[pose] = 0.95
+            return PinchPrediction(pose, probs, "high")
+
+        def reset(self):
+            pass
+
+    clf = _PerHandClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    fwd = _make_open_hand(forward_z=-0.25)
+
+    # Left hand (non-click hand) holds drag pose -> must NOT start grab
+    eng.process_frame([HandInput("Left", fwd, fwd)], 0.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Left", fwd, fwd)], 33.0, 1920.0, 1080.0)
+    outs = eng.process_frame([HandInput("Left", fwd, fwd)], 260.0, 1920.0, 1080.0)
+    assert outs[0].pose.is_grabbing is False
+    assert outs[0].pose.grab_just_started is False
+
+    # Split cursor=Left / click=Right runtime routing: Right click fires at Left hand's cursor position!
+    rt = AeroHandRuntime(cfg, dry_run=False)
+    clicks: List[tuple[float, float, str]] = []
+
+    class _CapInput(_FakeInputCtl):
+        def mouse_click(self, x: float, y: float, button: str = "left", click_count: int = 1) -> bool:
+            clicks.append((x, y, button))
+            return True
+
+    rt.input_ctl = _CapInput()  # type: ignore[assignment]
+    from aerohand.core.types import CursorOutput, HandOutput, PoseOutput
+
+    left_out = HandOutput(
+        hand="Left",
+        cursor=CursorOutput(hand="Left", x=321.0, y=456.0, is_pointing=True, is_valid=True),
+        pose=PoseOutput(hand="Left"),
+    )
+    right_out = HandOutput(
+        hand="Right",
+        cursor=CursorOutput(hand="Right", x=999.0, y=999.0, is_pointing=True, is_valid=True),
+        pose=PoseOutput(hand="Right", is_clicking=True, click_count=1),
+    )
+    primary = rt._select_primary_hand([left_out, right_out])
+    assert primary is not None and primary.hand == "Left"
+    rt._dispatch_actions([left_out, right_out], primary, 1000.0)
+    assert clicks == [(321.0, 456.0, "left")]

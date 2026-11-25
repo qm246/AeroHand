@@ -113,15 +113,16 @@ class PalmWheelDetector:
     def __init__(self, cfg: Optional[Dict[str, Any]] = None) -> None:
         c = cfg or {}
         self.enabled: bool = bool(c.get("enabled", True))
-        self.activation_hold_ms: float = float(c.get("activation_hold_ms", 200.0))
+        self.activation_hold_ms: float = float(c.get("activation_hold_ms", 350.0))
+        self.max_activation_motion_norm: float = float(c.get("max_activation_motion_norm", 0.035))
         self.press_down_threshold: float = float(c.get("press_down_threshold", 0.95))
         self.press_up_threshold: float = float(c.get("press_up_threshold", 1.10))
         self.cylinder_radius_multiplier: float = float(c.get("cylinder_radius_multiplier", 0.50))
-        self.palm_facing_dot_threshold: float = float(c.get("palm_facing_dot_threshold", 0.50))
+        self.palm_facing_dot_threshold: float = float(c.get("palm_facing_dot_threshold", 0.60))
         self.palm_facing_dot_hysteresis: float = float(c.get("palm_facing_dot_hysteresis", 0.05))
         self.open_palm_grace_ms: float = float(c.get("open_palm_grace_ms", 100.0))
         self.confirmation_hold_ms: float = float(c.get("confirmation_hold_ms", 200.0))
-        self.cooldown_ms: float = float(c.get("cooldown_ms", 350.0))
+        self.cooldown_ms: float = float(c.get("cooldown_ms", 450.0))
 
         default_slots: Dict[FingerName, Optional[str]] = {
             "thumb": "toggle_pause",
@@ -137,6 +138,7 @@ class PalmWheelDetector:
 
         self._state: PalmWheelState = "inactive"
         self._activation_start_ms: Optional[float] = None
+        self._activation_anchor: Optional[Tuple[float, float]] = None
         self._confirm_start_ms: Optional[float] = None
         self._last_action_ms: float = -1e9
         self._last_open_palm_ms: Optional[float] = None
@@ -147,6 +149,7 @@ class PalmWheelDetector:
     def reset(self) -> None:
         self._state = "inactive"
         self._activation_start_ms = None
+        self._activation_anchor = None
         self._confirm_start_ms = None
         self._last_open_palm_ms = None
         self._open_palm_stable = False
@@ -202,16 +205,26 @@ class PalmWheelDetector:
 
         out = PalmWheelOutput(state=self._state, finger_extended=finger_ext)
 
+        palm_cx = 0.5 * (landmarks[0].x + landmarks[9].x)
+        palm_cy = 0.5 * (landmarks[0].y + landmarks[9].y)
+
         if self._state == "inactive":
             if open_now:
                 self._state = "activating"
                 self._activation_start_ms = timestamp_ms
+                self._activation_anchor = (palm_cx, palm_cy)
                 out.state = "activating"
                 out.progress = 0.0
         elif self._state == "activating":
             if not open_now:
                 self.reset()
                 return PalmWheelOutput(state="inactive", finger_extended=finger_ext)
+            if self._activation_anchor is not None and self.max_activation_motion_norm > 0.0:
+                drift = math.hypot(palm_cx - self._activation_anchor[0], palm_cy - self._activation_anchor[1])
+                if drift > self.max_activation_motion_norm:
+                    # Moving hand (stretching/waving/hair) -> reset hold timer instead of firing menu
+                    self._activation_start_ms = timestamp_ms
+                    self._activation_anchor = (palm_cx, palm_cy)
             start_ms = self._activation_start_ms if self._activation_start_ms is not None else timestamp_ms
             elapsed = timestamp_ms - start_ms
             out.progress = min(1.0, elapsed / max(1.0, self.activation_hold_ms))

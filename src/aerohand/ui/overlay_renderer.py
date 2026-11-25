@@ -1,0 +1,165 @@
+"""
+Airpoint-style visual overlay renderer for the Floating Camera Pill & Preview window.
+Draws crisp anti-aliased 21-landmark hand skeleton, active pinch highlight, 3D pointing-gate
+indicator, and Palm Wheel activation ring.
+"""
+
+from __future__ import annotations
+
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+from aerohand.core.types import HandInput, HandOutput, PoseName
+
+HAND_CONNECTIONS: Tuple[Tuple[int, int], ...] = (
+    (0, 1), (1, 2), (2, 3), (3, 4),
+    (0, 5), (5, 6), (6, 7), (7, 8),
+    (0, 9), (9, 10), (10, 11), (11, 12),
+    (0, 13), (13, 14), (14, 15), (15, 16),
+    (0, 17), (17, 18), (18, 19), (19, 20),
+    (5, 9), (9, 13), (13, 17),
+)
+
+# BGR colors inspired by Airpoint's clean teal/blue dark aesthetic
+COL_TEAL = (191, 212, 45)      # #2dd4bf (Left hand)
+COL_BLUE = (250, 165, 96)      # #60a5fa (Right hand)
+COL_GREEN = (128, 232, 74)
+COL_AMBER = (36, 191, 251)
+COL_ROSE = (113, 113, 248)
+COL_WHITE = (245, 247, 250)
+COL_MUTED = (165, 172, 184)
+COL_BONE = (210, 218, 228)
+
+
+def render_camera_hud(
+    frame_bgr: np.ndarray,
+    raw_hands: List[HandInput],
+    primary: Optional[HandOutput],
+    *,
+    fps: float,
+    paused: bool,
+    dry_run: bool,
+    is_idle: bool,
+    guard_reason: str = "",
+    compact: bool = True,
+) -> np.ndarray:
+    """Render an Airpoint-style floating camera HUD frame (BGR)."""
+    vis = frame_bgr.copy()
+    h, w = vis.shape[:2]
+
+    # Subtle dark vignette tint for crisp skeleton contrast
+    overlay = vis.copy()
+
+    # Draw hand skeletons
+    for hand_inp in raw_hands:
+        accent = COL_BLUE if hand_inp.handedness == "Right" else COL_TEAL
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_inp.landmarks[:21]]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(vis, pts[a], pts[b], COL_BONE, 2, cv2.LINE_AA)
+        for idx, (px, py) in enumerate(pts):
+            if idx in (4, 8, 12, 16, 20):
+                cv2.circle(vis, (px, py), 5, accent, -1, cv2.LINE_AA)
+                cv2.circle(vis, (px, py), 6, COL_WHITE, 1, cv2.LINE_AA)
+            else:
+                cv2.circle(vis, (px, py), 3, accent, -1, cv2.LINE_AA)
+
+        # Highlight active gesture ring on fingertip / palm
+        if primary is not None and primary.hand == hand_inp.handedness:
+            p = primary.pose
+            c = primary.cursor
+            if p.is_clicking or p.is_pinching:
+                cv2.circle(vis, pts[12], 14, COL_GREEN, 2, cv2.LINE_AA)
+                cv2.circle(vis, pts[4], 14, COL_GREEN, 2, cv2.LINE_AA)
+            elif p.is_grabbing:
+                cv2.circle(vis, pts[8], 16, COL_AMBER, 3, cv2.LINE_AA)
+            elif p.is_scrolling:
+                cv2.circle(vis, pts[16], 15, COL_TEAL, 2, cv2.LINE_AA)
+            elif c.is_pointing:
+                cv2.circle(vis, pts[8], 10, COL_BLUE, 2, cv2.LINE_AA)
+
+            # Palm Wheel activation progress arc around palm center
+            if p.palm_wheel_state in ("activating", "active", "confirmed"):
+                pcx = (pts[0][0] + pts[9][0]) // 2
+                pcy = (pts[0][1] + pts[9][1]) // 2
+                rad = 38
+                ring_col = COL_GREEN if p.palm_wheel_state == "active" else COL_AMBER
+                cv2.circle(vis, (pcx, pcy), rad, (50, 58, 72), 3, cv2.LINE_AA)
+                end_angle = int(360 * max(0.0, min(1.0, p.palm_wheel_progress)))
+                cv2.ellipse(vis, (pcx, pcy), (rad, rad), -90, 0, end_angle, ring_col, 4, cv2.LINE_AA)
+                if p.palm_wheel_state == "active":
+                    cv2.putText(
+                        vis,
+                        "PALM WHEEL",
+                        (max(8, pcx - 42), max(22, pcy - rad - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.45,
+                        COL_GREEN,
+                        1,
+                        cv2.LINE_AA,
+                    )
+
+    # Top translucent status pill bar
+    bar_h = 34 if compact else 54
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), (14, 18, 26), -1)
+    cv2.addWeighted(overlay, 0.72, vis, 0.28, 0.0, vis)
+
+    if paused:
+        dot_col, state_txt = COL_AMBER, "PAUSED"
+    elif guard_reason:
+        dot_col, state_txt = COL_ROSE, f"GUARD: {guard_reason}"
+    elif dry_run:
+        dot_col, state_txt = COL_AMBER, "DRY-RUN"
+    elif is_idle:
+        dot_col, state_txt = COL_MUTED, "IDLE (8 FPS)"
+    else:
+        dot_col, state_txt = COL_GREEN, "LIVE"
+
+    cv2.circle(vis, (16, 17), 5, dot_col, -1, cv2.LINE_AA)
+    cv2.putText(
+        vis,
+        f"AeroHand  {state_txt}",
+        (28, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.50,
+        COL_WHITE,
+        1,
+        cv2.LINE_AA,
+    )
+    fps_txt = f"{fps:4.0f} FPS"
+    cv2.putText(
+        vis,
+        fps_txt,
+        (w - 78, 22),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.48,
+        COL_MUTED,
+        1,
+        cv2.LINE_AA,
+    )
+
+    # Bottom status badge for active pose & pointing gate
+    if primary is not None:
+        p = primary.pose
+        c = primary.cursor
+        pose_label = p.active_pose.value if p.active_pose else p.pose.value
+        if pose_label == PoseName.IDLE.value:
+            pose_label = "pointing" if c.is_pointing else "resting (gate)"
+        gate_col = COL_GREEN if c.is_pointing else COL_MUTED
+        pill_y = h - 30
+        ov2 = vis.copy()
+        cv2.rectangle(ov2, (0, pill_y), (w, h), (14, 18, 26), -1)
+        cv2.addWeighted(ov2, 0.72, vis, 0.28, 0.0, vis)
+        cv2.putText(
+            vis,
+            f"{pose_label}  |  dirZ {c.pointing_dir_z:+.2f}",
+            (12, h - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.48,
+            gate_col,
+            1,
+            cv2.LINE_AA,
+        )
+
+    return vis

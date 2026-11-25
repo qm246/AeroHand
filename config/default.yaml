@@ -137,15 +137,16 @@ window_tile:
 
 palm_wheel:
   enabled: true
-  activation_hold_ms: 200
+  activation_hold_ms: 350            # Hold open palm steady ~350ms to prevent hair/stretch FA
+  max_activation_motion_norm: 0.035  # Cancel activation if palm moves rapidly (>3.5% frame/step)
   press_down_threshold: 0.95         # Distance / cylinder_radius (< 1.0 = inside cylinder)
   press_up_threshold: 1.10
   cylinder_radius_multiplier: 0.50   # R = 0.5 * palm_length
-  palm_facing_dot_threshold: 0.50
+  palm_facing_dot_threshold: 0.60    # Require clearer frontal palm facing camera
   palm_facing_dot_hysteresis: 0.05
   open_palm_grace_ms: 100
   confirmation_hold_ms: 200
-  cooldown_ms: 350
+  cooldown_ms: 450
   slots:
     thumb: "toggle_pause"
     index: "mission_control"

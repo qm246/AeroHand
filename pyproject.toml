@@ -38,6 +38,7 @@ dev = [
 
 [project.scripts]
 aerohand = "aerohand.__main__:main"
+aerohand-app = "aerohand.ui.app:main"
 
 [tool.setuptools.package-dir]
 "" = "src"
@@ -55,3 +56,4 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+ignore = ["E501"]

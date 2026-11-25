@@ -34,6 +34,15 @@ COL_WHITE = (245, 247, 250)
 COL_MUTED = (165, 172, 184)
 COL_BONE = (210, 218, 228)
 
+_POSE_HIGHLIGHT_TIPS: Dict[PoseName, Tuple[int, ...]] = {
+    PoseName.THUMB_INDEX_PINCH: (4, 8),
+    PoseName.THUMB_MIDDLE_PINCH: (4, 12),
+    PoseName.THUMB_INDEX_MIDDLE_PINCH: (4, 8, 12),
+    PoseName.THUMB_RING_PINCH: (4, 16),
+    PoseName.THUMB_PINKY_PINCH: (4, 20),
+    PoseName.THUMB_PINKY_BASE: (4, 17),
+}
+
 
 def render_camera_hud(
     frame_bgr: np.ndarray,
@@ -76,16 +85,26 @@ def render_camera_hud(
         if ho is not None:
             p = ho.pose
             c = ho.cursor
+            ap = p.active_pose or p.pose
+            ring_tips = _POSE_HIGHLIGHT_TIPS.get(ap)
             if p.is_clicking or p.is_pinching:
-                cv2.circle(vis, pts[12], 14, COL_GREEN, 2, cv2.LINE_AA)
-                cv2.circle(vis, pts[4], 14, COL_GREEN, 2, cv2.LINE_AA)
+                for tip_idx in ring_tips or (4, 12):
+                    cv2.circle(vis, pts[tip_idx], 14, COL_GREEN, 2, cv2.LINE_AA)
             elif p.is_grabbing:
-                cv2.circle(vis, pts[8], 16, COL_AMBER, 3, cv2.LINE_AA)
+                for tip_idx in ring_tips or (4, 8, 12):
+                    cv2.circle(vis, pts[tip_idx], 14, COL_AMBER, 3 if tip_idx != 4 else 2, cv2.LINE_AA)
             elif p.is_dictating:
-                cv2.circle(vis, pts[8], 16, COL_PURPLE, 3, cv2.LINE_AA)
-                cv2.circle(vis, pts[4], 14, COL_PURPLE, 2, cv2.LINE_AA)
+                for tip_idx in ring_tips or (4, 8):
+                    cv2.circle(vis, pts[tip_idx], 15, COL_PURPLE, 3 if tip_idx != 4 else 2, cv2.LINE_AA)
             elif p.is_scrolling:
-                cv2.circle(vis, pts[16], 15, COL_TEAL, 2, cv2.LINE_AA)
+                for tip_idx in ring_tips or (4, 16):
+                    cv2.circle(vis, pts[tip_idx], 14, COL_TEAL, 2, cv2.LINE_AA)
+            elif p.is_window_tiling:
+                for tip_idx in ring_tips or (4, 20):
+                    cv2.circle(vis, pts[tip_idx], 14, COL_BLUE, 2, cv2.LINE_AA)
+            elif p.is_spaces_nav:
+                for tip_idx in ring_tips or (4, 17):
+                    cv2.circle(vis, pts[tip_idx], 14, COL_BLUE, 2, cv2.LINE_AA)
             elif c.is_pointing:
                 cv2.circle(vis, pts[8], 10, accent, 2, cv2.LINE_AA)
 

@@ -302,7 +302,7 @@
         </div>
 
         <div class="grid-4">
-          <div class="stat"><label id="st-fps-lbl">Tốc độ khung hình</label><div class="val" id="st-fps">-- FPS</div><div class="sub" id="st-del">GPU Metal</div></div>
+          <div class="stat"><label id="st-fps-lbl">Tốc độ khung hình</label><div class="val" id="st-fps">-- FPS</div><div class="sub" id="st-del">CPU XNNPACK</div></div>
           <div class="stat"><label id="st-lat-lbl">Độ trễ Pipeline</label><div class="val" id="st-lat">-- ms</div><div class="sub" id="st-cls">Heuristic 3D</div></div>
           <div class="stat"><label id="st-sys-lbl">Hệ thống</label><div class="val" id="st-cpu">--% CPU</div><div class="sub" id="st-ram">-- MB RAM</div></div>
           <div class="stat"><label id="st-guard-lbl">Typing Guard</label><div class="val" id="st-guard">Sẵn sàng</div><div class="sub" id="st-app">macOS</div></div>
@@ -343,17 +343,22 @@
       <!-- 2. GESTURES -->
       <div id="tab-gestures" class="tab-pane">
         <div class="card">
-          <div class="card-title"><span id="t-presets">BỘ CỬ CHỈ MẪU (1 CHẠM)</span></div>
+          <div class="card-title"><span id="t-presets">BỘ CỬ CHỈ MẪU (1 CHẠM)</span><span class="pill-tag" id="active-preset-pill">Airpoint</span></div>
           <div class="grid-2">
             <div class="preset-card" id="preset-airpoint" onclick="applyPreset('airpoint')">
-              <h4>✦ Chuẩn Airpoint (Khuyên dùng)</h4>
-              <p>Trỏ giữ yên chỉ chuột • Cái+Giữa = Click • Cái+Trỏ+Giữa = Kéo thả • Cái+Áp út = Cuộn/Chuột phải • Cái+Trỏ = Đọc giọng nói</p>
+              <h4 id="pr-ap-title">✦ Chuẩn Airpoint (Mặc định • Khuyên dùng)</h4>
+              <p id="pr-ap-desc">Ngón trỏ giữ nguyên chỉ chuột • Cái + Giữa = Click trái • 3 ngón (Cái + Trỏ + Giữa) = Kéo thả • Cái + Áp út = Chuột phải / Cuộn 2D • Cái + Trỏ (giữ) = Đọc giọng nói</p>
             </div>
             <div class="preset-card" id="preset-classic" onclick="applyPreset('classic')">
-              <h4>👆 Cổ điển (Quen tay người mới)</h4>
-              <p>Cái+Trỏ (chạm) = Click • Cái+Trỏ (giữ) = Kéo thả • Cái+Giữa = Đọc giọng nói • Cái+Áp út = Cuộn/Chuột phải</p>
+              <h4 id="pr-cl-title">👆 Cổ điển (Giống GestureCtl cũ)</h4>
+              <p id="pr-cl-desc">Cái + Trỏ (chạm) = Click trái • Cái + Trỏ (giữ) = Kéo thả • Cái + Giữa (giữ) = Đọc giọng nói • Cái + Áp út = Chuột phải / Cuộn 2D</p>
             </div>
           </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span id="t-active-map">BẢN ĐỒ CỬ CHỈ ĐANG KÍCH HOẠT (TỰ ĐỘNG ĐỒNG BỘ)</span></div>
+          <div class="grid-2" id="active-gesture-map"></div>
         </div>
 
         <div class="card">
@@ -567,8 +572,8 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       <!-- 8. ONBOARDING & PRACTICE -->
       <div id="tab-onboarding" class="tab-pane">
         <div class="card">
-          <div class="card-title"><span>BÀI TẬP THỰC HÀNH TƯƠNG TÁC (TỰ SÁNG XANH KHI LÀM ĐÚNG)</span><button class="btn sm" onclick="post('reset_practice')">↺ Làm lại</button></div>
-          <p style="font-size:12px;color:var(--muted);margin-bottom:10px">Giơ bàn tay hướng vào camera (ngón trỏ hơi hướng về màn hình) và thử lần lượt 8 thao tác dưới đây. Mọi cử chỉ đã hoạt động kể cả khi bật chế độ Chạy thử (Dry-Run)!</p>
+          <div class="card-title"><span id="t-practice-hdr">BÀI TẬP THỰC HÀNH 10 CỬ CHỈ CHUẨN (TỰ SÁNG XANH KHI LÀM ĐÚNG)</span><button class="btn sm" id="btn-reset-practice" onclick="post('reset_practice')">↺ Làm lại</button></div>
+          <p id="t-practice-sub" style="font-size:12px;color:var(--muted);margin-bottom:10px">Hướng dẫn tự động cập nhật theo bộ cử chỉ bạn đang chọn (mặc định là Chuẩn Airpoint: Ngón trỏ chỉ chuột, Cái + Giữa bấm Click trái). Hoạt động ngay cả khi bật chế độ Chạy thử (Dry-Run)!</p>
           <div class="grid-2" id="practice-grid"></div>
         </div>
       </div>
@@ -673,10 +678,81 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     document.getElementById("btn-reset").textContent = isVi ? "Mặc định" : "Reset";
     document.getElementById("btn-quit").textContent = isVi ? "Thoát" : "Quit";
 
-    // Presets
+    // Presets & Active Gesture Summary (auto-synced with tap_actions / hold_actions!)
     const curPreset = getPath(c, "hand.gesture_preset", "airpoint");
     document.getElementById("preset-airpoint").classList.toggle("selected", curPreset === "airpoint");
     document.getElementById("preset-classic").classList.toggle("selected", curPreset === "classic");
+    const presetPill = document.getElementById("active-preset-pill");
+    if (presetPill) presetPill.textContent = curPreset === "classic" ? (isVi ? "Cổ điển (GestureCtl)" : "Classic") : (isVi ? "Chuẩn Airpoint" : "Airpoint Default");
+
+    // Bilingual static headers
+    const setTxt = (id, vi, en) => { const el = document.getElementById(id); if (el) el.textContent = isVi ? vi : en; };
+    setTxt("qa-recenter", "Căn giữa chuột", "Recenter Cursor");
+    setTxt("st-fps-lbl", "Tốc độ khung hình", "Frame Rate");
+    setTxt("st-lat-lbl", "Độ trễ Pipeline", "Pipeline Latency");
+    setTxt("st-sys-lbl", "Hệ thống", "System Vitals");
+    setTxt("t-live-hand", "TÍN HIỆU BÀN TAY & XÁC SUẤT CỬ CHỈ TRỰC TIẾP", "LIVE HAND TELEMETRY & POSE PROBABILITIES");
+    setTxt("t-perms", "QUYỀN HỆ THỐNG MACOS", "MACOS PERMISSIONS");
+    setTxt("t-presets", "BỘ CỬ CHỈ MẪU (1 CHẠM)", "ONE-CLICK GESTURE PRESETS");
+    setTxt("t-active-map", "BẢN ĐỒ CỬ CHỈ ĐANG KÍCH HOẠT (TỰ ĐỘNG ĐỒNG BỘ)", "ACTIVE GESTURE MAP (LIVE SYNCED)");
+    setTxt("t-hand-mode", "CHẾ ĐỘ BÀN TAY & BẬT/TẮT TỪNG CỬ CHỈ", "HAND MODE & PER-GESTURE TOGGLES");
+    setTxt("t-remap", "TÙY BIẾN ÁNH XẠ CỬ CHỈ (TAP & HOLD)", "CUSTOM POSE REMAPPING (TAP & HOLD)");
+    setTxt("pr-ap-title", "✦ Chuẩn Airpoint (Mặc định • Khuyên dùng)", "✦ Airpoint Standard (Default • Recommended)");
+    setTxt("pr-ap-desc", "Ngón trỏ giữ nguyên chỉ chuột • Cái + Giữa = Click trái • 3 ngón (Cái + Trỏ + Giữa) = Kéo thả • Cái + Áp út = Chuột phải / Cuộn 2D • Cái + Trỏ (giữ) = Đọc giọng nói", "Index aims steadily • Thumb + Middle = Left Click • 3-Finger Pinch = Drag • Thumb + Ring = Right Click / 2D Scroll • Thumb + Index (Hold) = Dictation");
+    setTxt("pr-cl-title", "👆 Cổ điển (Giống GestureCtl cũ)", "👆 Classic (GestureCtl Style)");
+    setTxt("pr-cl-desc", "Cái + Trỏ (chạm) = Click trái • Cái + Trỏ (giữ) = Kéo thả • Cái + Giữa (giữ) = Đọc giọng nói • Cái + Áp út = Chuột phải / Cuộn 2D", "Thumb + Index (Tap) = Left Click • Thumb + Index (Hold) = Drag • Thumb + Middle (Hold) = Dictation • Thumb + Ring = Right Click / 2D Scroll");
+    setTxt("t-practice-hdr", "BÀI TẬP THỰC HÀNH 10 CỬ CHỈ CHUẨN (TỰ SÁNG XANH KHI LÀM ĐÚNG)", "INTERACTIVE 10-GESTURE PRACTICE (LIGHTS UP GREEN LIVE)");
+    setTxt("t-practice-sub", "Hướng dẫn tự động cập nhật theo bộ cử chỉ bạn đang chọn (mặc định là Chuẩn Airpoint: Ngón trỏ chỉ chuột, Cái + Giữa bấm Click trái). Hoạt động ngay cả khi bật chế độ Chạy thử (Dry-Run)!", "Instructions automatically match your active gesture bindings (Airpoint default: Index points, Thumb + Middle clicks). Works even in Dry-Run mode!");
+    setTxt("btn-reset-practice", "↺ Làm lại", "↺ Reset");
+
+    // Helper: find which pose(s) currently trigger a given tap or hold action
+    const tapMapNow = getPath(c, "pose_state_machine.tap_actions", {});
+    const holdMapNow = getPath(c, "pose_state_machine.hold_actions", {});
+    const clickHoldOn = !!getPath(c, "pose_state_machine.enable_click_hold", false);
+    const gEn = (k) => getPath(c, `gestures.${k}`, true) !== false;
+    const findPoses = (mapObj, actionName) =>
+      Object.entries(mapObj).filter(([, act]) => act === actionName).map(([pk]) => pk);
+    const pName = (pk) => poses[pk] || pk;
+    const joinPoses = (list) => list.length ? list.map(pName).join(" / ") : (isVi ? "Chưa gán" : "Unassigned");
+
+    const clickPoses = findPoses(tapMapNow, "left_click");
+    const dragPoses = [...findPoses(holdMapNow, "drag")];
+    if (clickHoldOn) {
+      for (const cp of clickPoses) {
+        if (!dragPoses.includes(cp)) dragPoses.push(cp);
+      }
+    }
+    const rclickTapPoses = findPoses(tapMapNow, "right_click");
+    const scrollPoses = findPoses(holdMapNow, "scroll");
+    const dictPoses = findPoses(holdMapNow, "dictation");
+    const tilePoses = findPoses(holdMapNow, "window_tile");
+    const spacesPoses = findPoses(holdMapNow, "spaces_nav");
+
+    const rclickDesc = rclickTapPoses.length
+      ? (isVi ? "Chạm thả nhanh: " : "Quick tap: ") + joinPoses(rclickTapPoses)
+      : (isVi ? "Giữ yên rồi thả: " : "Hold still & release: ") + joinPoses(scrollPoses);
+    const offTag = (enabled) => enabled
+      ? ""
+      : `<span class="perm-miss" style="font-size:10.5px">${isVi ? "Đang tắt" : "Off"}</span>`;
+
+    const mapItems = [
+      ["👆", isVi ? "Di chuyển con trỏ" : "Move Cursor", isVi ? "Giữ ngón trỏ hướng camera (dirZ < -0.15)" : "Point index forward (dirZ < -0.15)", true],
+      ["🖱️", isVi ? "Click trái / Double Click" : "Left Click / Double Click", (isVi ? "Chạm thả nhanh: " : "Quick tap: ") + joinPoses(clickPoses), gEn("enable_click")],
+      ["✋", isVi ? "Kéo thả (Click & Drag)" : "Click & Drag", (isVi ? "Chụm giữ & kéo: " : "Hold & drag: ") + joinPoses(dragPoses), gEn("enable_grab")],
+      ["🔘", isVi ? "Chuột phải" : "Right Click", rclickDesc, gEn("enable_right_click")],
+      ["📜", isVi ? "Cuộn 2D quán tính" : "2D Inertial Scroll", (isVi ? "Giữ & di chuyển: " : "Hold & slide: ") + joinPoses(scrollPoses), gEn("enable_scroll")],
+      ["🎙️", isVi ? "Đọc giọng nói (Việt / Anh)" : "Voice Dictation", (isVi ? "Chụm giữ để nói: " : "Hold to speak: ") + joinPoses(dictPoses), gEn("enable_dictation")],
+      ["🪟", isVi ? "Chia cửa sổ (AXUIElement)" : "Tile Window", (isVi ? "Giữ & vuốt 4 hướng: " : "Hold & slide: ") + joinPoses(tilePoses), gEn("enable_window_tile")],
+      ["🖥️", isVi ? "Đổi Space / Mission Control" : "Spaces / Mission Control", (isVi ? "Giữ & vuốt: " : "Hold & slide: ") + joinPoses(spacesPoses), gEn("enable_spaces_nav")],
+      ["🎡", isVi ? "Palm Wheel (2 tay • Submenu)" : "Palm Wheel (2-Hand Radial)", isVi ? "Xòe lòng bàn tay 0.35s rồi gập 1 ngón" : "Open palm 350ms, then curl 1 finger", !!getPath(c, "palm_wheel.enabled", true)],
+      ["🔍", isVi ? "Phóng to / Thu nhỏ (2 tay)" : "Two-Hand Pinch Zoom", isVi ? "Chụm cả 2 tay kéo giãn / thu lại" : "Pinch both hands and spread / pull", gEn("enable_zoom")],
+    ];
+    const mapEl = document.getElementById("active-gesture-map");
+    if (mapEl) {
+      mapEl.innerHTML = mapItems.map(([ico, title, desc, enabled]) =>
+        `<div class="perm-pill" style="${enabled ? "" : "opacity:0.55"}"><div><strong>${ico} ${title}</strong><div style="font-size:11px;color:var(--muted)">${desc}</div></div>${offTag(enabled)}</div>`
+      ).join("");
+    }
 
     // Hand selectors
     document.getElementById("cfg-num-hands").value = String(getPath(c, "tracker.num_hands", 2));
@@ -829,16 +905,18 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       `<div class="bar-row"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="cb-${p}" style="width:0%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--teal)" id="cv-${p}">0</span></div>`
     ).join("");
 
-    // Practice cards
+    // Practice cards (100% synced to active gesture bindings!)
     const pItems = [
       ["move", isVi ? "1. Di chuyển con trỏ" : "1. Move Cursor", isVi ? "Giơ ngón trỏ hướng camera & lướt nhẹ" : "Point index forward & glide"],
-      ["click", isVi ? "2. Click trái" : "2. Left Click", isVi ? "Chạm thả nhanh Cái + Giữa (hoặc Trỏ)" : "Tap Thumb + Middle"],
-      ["right_click", isVi ? "3. Chuột phải" : "3. Right Click", isVi ? "Chụm Cái + Áp út giữ yên rồi thả" : "Hold Thumb + Ring still & release"],
-      ["drag", isVi ? "4. Kéo thả (Drag)" : "4. Click & Drag", isVi ? "Chụm Cái + Trỏ + Giữa và kéo" : "Hold 3-finger pinch & move"],
-      ["scroll", isVi ? "5. Cuộn 2D quán tính" : "5. 2D Scroll", isVi ? "Chụm Cái + Áp út và di lên/xuống" : "Pinch Thumb + Ring & slide"],
-      ["window_tile", isVi ? "6. Chia cửa sổ" : "6. Tile Window", isVi ? "Chụm Cái + Út rồi vuốt Trái/Phải/Lên" : "Pinch Thumb + Pinky & slide"],
-      ["spaces_nav", isVi ? "7. Chuyển Space" : "7. Spaces Nav", isVi ? "Chạm Cái + Gốc út rồi vuốt ngang/lên" : "Touch Pinky Base & slide"],
-      ["palm_wheel", isVi ? "8. Palm Wheel" : "8. Palm Wheel", isVi ? "Xòe lòng bàn tay 0.35s rồi gập 1 ngón" : "Hold open palm 350ms & curl 1 finger"],
+      ["click", isVi ? "2. Click trái" : "2. Left Click", (isVi ? "Chạm thả nhanh: " : "Tap: ") + joinPoses(clickPoses)],
+      ["drag", isVi ? "3. Kéo thả (Drag)" : "3. Click & Drag", (isVi ? "Chụm giữ & kéo: " : "Hold & move: ") + joinPoses(dragPoses)],
+      ["right_click", isVi ? "4. Chuột phải" : "4. Right Click", rclickDesc],
+      ["scroll", isVi ? "5. Cuộn 2D quán tính" : "5. 2D Scroll", (isVi ? "Giữ & di lên/xuống: " : "Hold & slide: ") + joinPoses(scrollPoses)],
+      ["window_tile", isVi ? "6. Chia cửa sổ" : "6. Tile Window", (isVi ? "Giữ & vuốt Trái/Phải/Lên: " : "Hold & slide: ") + joinPoses(tilePoses)],
+      ["spaces_nav", isVi ? "7. Chuyển Space" : "7. Spaces Nav", (isVi ? "Giữ & vuốt ngang/lên: " : "Hold & slide: ") + joinPoses(spacesPoses)],
+      ["palm_wheel", isVi ? "8. Palm Wheel" : "8. Palm Wheel", isVi ? "Xòe lòng bàn tay 0.35s rồi gập 1 ngón" : "Open palm 350ms & curl 1 finger"],
+      ["dictation", isVi ? "9. Đọc giọng nói" : "9. Voice Dictation", (isVi ? "Giữ để nói rồi thả: " : "Hold to speak: ") + joinPoses(dictPoses)],
+      ["zoom", isVi ? "10. Zoom 2 tay" : "10. Two-Hand Zoom", isVi ? "Chụm 2 tay kéo giãn / thu lại" : "Pinch both hands & spread"],
     ];
     document.getElementById("practice-grid").innerHTML = pItems.map(([k, t, d]) =>
       `<div class="practice-card" id="pr-${k}"><div><strong>${t}</strong><div style="font-size:11px;color:var(--muted)">${d}</div></div><div class="practice-check" id="prc-${k}">○</div></div>`
@@ -889,7 +967,9 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
 
     // Hand & probabilities
     document.getElementById("live-dirz").textContent = `dirZ: ${(snap.dir_z || 0) >= 0 ? "+" : ""}${(snap.dir_z || 0).toFixed(2)} (${snap.is_pointing ? "OPEN" : "GATE"})`;
-    document.getElementById("live-hand-txt").textContent = (isVi ? "Tay chính: " : "Active Hand: ") + (snap.hand || (isVi ? "Chưa thấy" : "None")) + " • Pose: " + (snap.active_pose || snap.pose || "idle");
+    const poseKeyNow = snap.active_pose || snap.pose || "idle";
+    const poseFriendly = (i18n.poses && i18n.poses[poseKeyNow]) || poseKeyNow;
+    document.getElementById("live-hand-txt").textContent = (isVi ? "Tay chính: " : "Active Hand: ") + (snap.hand || (isVi ? "Chưa thấy" : "None")) + " • " + poseFriendly;
     document.getElementById("live-last-act").textContent = (isVi ? "Hành động: " : "Action: ") + (snap.last_action || "Ready");
     const probs = snap.probabilities || {};
     for (const p of POSE_KEYS) {

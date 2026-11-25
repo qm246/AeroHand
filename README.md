@@ -1,61 +1,117 @@
-# AeroHand
+<div align="center">
 
-**Low-latency, touchless macOS hand controller** combining:
-- **Airpoint SDK's ergonomics & controllers** (Apache-2.0): decoupled index-tip aiming + `thumb_middle` click, 2-stage OneEuro smoothing, 60 Hz lerp cursor, 2D axis-locked scroll with inertia, short-slide Spaces & Window Tiling, 3D Forward-Pointing Gate, and 3D Palm Cylinder Palm Wheel.
-- **GestureCtl's native macOS safety & ML foundation**: zero-Electron Quartz `CGEvent` injection, session-counter **Typing Guard** (0 Input Monitoring permission), `release_all()` failsafe, 8 FPS Idle Throttle, Gram-Schmidt 3D `palm_frame`, and pluggable **3D Heuristic → Self-Trained ONNX TCN** classifier.
+# ✦ AeroHand
 
-> **License & Clean-Room Note**: Licensed under **Apache-2.0** (see [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)). Contains **zero** proprietary AirMouse weights or extracted assets from `Airpoint.app`.
+**Ứng dụng điều khiển macOS không chạm độ trễ thấp — xử lý 100% cục bộ trên máy.**
 
----
+🇻🇳 **Tiếng Việt** · [🇺🇸 English](./docs/README.en.md) · [📐 Kiến trúc hệ thống](./docs/ARCHITECTURE.md)
 
-## Gesture Cheat-Sheet (Single Hand — Right Hand Default)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-teal.svg)](LICENSE)
+[![Platform: macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)](#cài-đặt--chạy-nhanh-macos-apple-silicon)
+[![Version: v0.2.0](https://img.shields.io/badge/Version-0.2.0-emerald.svg)](#)
 
-| Action | Gesture | Notes |
-| :--- | :--- | :--- |
-| **Move Cursor** | Point index finger toward screen (`dirZ < -0.15`) | 2-stage OneEuro + distance comp + 60 Hz lerp |
-| **Left Click / Double Click** | Tap **Thumb + Middle** (`thumb_middle_pinch`) | Decoupled from index tip → eliminates cursor shift |
-| **Drag** | Hold **Thumb + Index + Middle** (`thumb_index_middle_pinch`) | Never confuses slow clicks with drags |
-| **Right Click** | Hold **Thumb + Ring** still (`< 15 px`) & release | Dual-behavior pose |
-| **Scroll (2D + Inertia)** | Hold **Thumb + Ring** & move (`>= 15 px`) | X/Y axis lock + natural coasting inertia |
-| **Spaces / Mission Control** | Hold **Thumb + Pinky Base** & slide (`>= 20 px`) | Left/Right = Spaces; Up/Down = Mission Control / Exposé |
-| **Window Tiling** | Hold **Thumb + Pinky Tip** & slide (`>= 20 px`), release | Left / Right / Maximize / Restore |
-| **Quick Menu (Palm Wheel)** | Open palm facing camera (`>= 200 ms`), curl 1 finger & release | Thumb=Pause, Index=Mission Control, Middle=Recenter, Ring=Spotlight, Pinky=Play/Pause |
+</div>
 
 ---
 
-## Quick Start (macOS Apple Silicon)
+**AeroHand** kết hợp trọn vẹn hai thế mạnh:
+- **Công thái học, bộ điều khiển & trải nghiệm từ [Airpoint SDK](https://github.com/andrewslabmd/airpoint-sdk) (Apache-2.0)**: tách ngón trỏ chỉ chuột + chụm **Cái + Giữa** click trái chống lệch con trỏ, lọc mượt 2 tầng One-Euro + nội suy 60 Hz Lerp, cuộn 2D khóa trục có quán tính & Momentum Phase, chia cửa sổ, chuyển Space, Zoom 2 tay, Palm Wheel 2 tay kèm Submenu lồng nhau, đọc giọng nói (Voice Dictation), Local HTTP API/CLI, và Overlay trực quan nổi trên màn hình.
+- **Nền tảng an toàn macOS bản địa & khoa học ML từ GestureCtl**: bơm sự kiện Quartz `CGEventPost` + `AXUIElement` (không cần Electron), **Typing Guard 0-Permission** (không đòi quyền Input Monitoring), **Idle Throttle 8 FPS** tiết kiệm pin, **AM-7 Large-Gap Filter Reset**, hệ trục 3D **Gram-Schmidt `palm_frame`**, và kiến trúc phân loại có thể nâng cấp liền mạch từ **Heuristic 3D → ONNX 1D-TCN tự huấn luyện**.
 
+> **Minh bạch giấy phép (Clean-Room)**: Mã nguồn phát hành theo giấy phép **Apache-2.0** (xem [`LICENSE`](LICENSE) và [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)). Hoàn toàn **không** chứa trọng số độc quyền `AirMouse` hay tài nguyên trích xuất từ ứng dụng thương mại. Toàn bộ dữ liệu camera và giọng nói xử lý cục bộ trên máy.
+
+---
+
+## Tính năng nổi bật (v0.2.0)
+
+- **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác*), **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì.
+- **4 lớp Overlay nổi trên toàn màn hình (click-through)**:
+  - Đĩa tròn **Palm Wheel 5 cánh** kèm breadcrumb menu con (theo tay hoặc cố định giữa màn hình).
+  - Vòng sóng **Click Pulse** ngay tại con trỏ khi Click / Double-Click / Chuột phải / Drag.
+  - Khung kính mờ **Window Tile Ghost Preview** xem trước vùng snap cửa sổ.
+  - **Toast gợi ý cử chỉ**, sóng âm **Voice Dictation** và **cảnh báo thông minh** (ánh sáng yếu, tay quá xa/gần, sát mép khung hình).
+- **Floating Camera HUD Hover-Fade**: chọn 4 góc màn hình, 3 kích thước (S/M/L), tự mờ khi rảnh và sáng 100% khi rê chuột qua.
+- **Chia cửa sổ chuẩn bằng Accessibility API (`AXUIElement`)**: hoạt động mọi ứng dụng macOS, hỗ trợ đa màn hình (Multi-Monitor) và hiệu ứng animation mượt.
+- **Voice Dictation Tiếng Việt (`vi-VN`) & Tiếng Anh (`en-US`)**: dùng Apple `SFSpeechRecognizer` cục bộ (hỗ trợ `mlx_whisper`), chèn chữ có dấu UTF-8 an toàn không lỗi bộ gõ Telex/EVKey.
+- **Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`), `aerohand` CLI, URL Scheme `aerohand://` (cho Apple Shortcuts / Raycast), **Hồ sơ theo ứng dụng (Per-App Profiles)**, phím tắt toàn cục (`Cmd+Shift+A/R/H`), và tự khởi động cùng macOS (**Launch at Login**).
+- **Ổn định 24/7 trên macOS**: chạy MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS, khắc phục triệt để lỗi rò rỉ `CVPixelBuffer` của MediaPipe Metal trên macOS) + `autorelease_pool`.
+
+---
+
+## Bảng 10 Cử Chỉ Chuẩn Airpoint (Mặc định)
+
+*(Bạn có thể chuyển 1 chạm sang **Preset Cổ điển: Cái + Trỏ bấm Click** hoặc tự remap từng cử chỉ trong tab **Cử chỉ**.)*
+
+| # | Thao tác | Cử chỉ (Tay phải mặc định) | Ghi chú |
+| :---: | :--- | :--- | :--- |
+| 1 | **Di chuyển con trỏ** | Giơ **ngón trỏ** hướng về màn hình (`dirZ < -0.15`) | Lọc One-Euro 2 tầng + bù khoảng cách + 60 Hz Lerp |
+| 2 | **Click trái / Double Click** | Chạm thả **Ngón cái + Ngón giữa** (`thumb_middle_pinch`) | Tách khỏi ngón trỏ → không làm lệch điểm ngắm |
+| 3 | **Kéo thả (Drag)** | Chụm giữ **3 ngón: Cái + Trỏ + Giữa** (`thumb_index_middle_pinch`) | Không bao giờ nhầm giữa bấm chậm và kéo thả |
+| 4 | **Chuột phải** | Chụm **Cái + Áp út** giữ yên (`< 15 px`) rồi thả | Hành vi kép thông minh với Cuộn |
+| 5 | **Cuộn 2D quán tính** | Chụm **Cái + Áp út** và di lên/xuống/trái/phải (`>= 15 px`) | Khóa trục X/Y + Momentum Phase như Trackpad Apple |
+| 6 | **Đọc giọng nói (Dictation)** | Chụm giữ **Cái + Trỏ** (`thumb_index_pinch`) để nói, thả để chèn chữ | Hỗ trợ Tiếng Việt có dấu (`vi-VN`) & Tiếng Anh (`en-US`) |
+| 7 | **Chia cửa sổ (Window Tile)** | Chụm **Cái + Út** và vuốt Trái / Phải / Lên / Xuống, thả ra | Resize trực tiếp bằng `AXUIElement` + khung xem trước |
+| 8 | **Chuyển Space / Mission Control** | Chạm **Cái + Gốc ngón út** và vuốt ngang / lên / xuống | Tương đương vuốt 4 ngón Trackpad |
+| 9 | **Menu nhanh Palm Wheel (2 tay)** | Xòe lòng bàn tay hướng camera giữ `0.35s`, gập 1 ngón chọn | **Tay phải**: Tracking, Mission Control, Spotlight, Giọng nói, Nhạc→Âm lượng · **Tay trái**: Siri, Cửa sổ, Chỉnh sửa, Ứng dụng, Emoji |
+| 10 | **Phóng to / Thu nhỏ (Zoom)** | Chụm cả **2 tay** kéo giãn ra / thu lại | Phóng to (`Cmd +`) / Thu nhỏ (`Cmd -`) |
+
+---
+
+## Cài đặt & Chạy nhanh (macOS Apple Silicon)
+
+### 1. Cài đặt môi trường (`uv`)
 ```bash
-cd /Users/macos/Documents/AeroHand
+git clone https://github.com/qm246/AeroHand.git
+cd AeroHand
 uv sync --extra dev
-
-# 1. Run unit tests
-uv run pytest -q
-
-# 2. Dry-run with live camera preview HUD (no OS clicks/moves injected)
-uv run aerohand --dry-run --preview
-
-# 3. Live macOS control (requires Camera + Accessibility permissions)
-uv run aerohand --preview
-
-# 4. Headless low-CPU mode (no OpenCV preview window)
-uv run aerohand
 ```
 
-Press `q` in preview window (or `Ctrl+C` in terminal) to stop safely (`release_all()` is always called on exit).
+### 2. Chạy ứng dụng Desktop (`AeroHand.app`)
+```bash
+# Đóng gói ứng dụng native AeroHand.app ra Desktop (đã ký ad-hoc & live-link mã nguồn)
+uv run python scripts/build_macos_app.py
+
+# Mở ứng dụng
+open ~/Desktop/AeroHand.app
+```
+> **Cấp quyền lần đầu**: Mở tab **Tổng quan** trong AeroHand để kiểm tra và bật nhanh quyền **Camera**, **Trợ năng (Accessibility)**, và (nếu dùng giọng nói) **Microphone** + **Nhận dạng giọng nói**. Khi chưa cấp Trợ năng, app tự khởi động ở chế độ **Chạy thử (Dry-Run)** an toàn.
+
+### 3. Điều khiển bằng CLI & Apple Shortcuts
+Khi `AeroHand.app` đang chạy, Local Control API lắng nghe tại `http://127.0.0.1:17420`:
+```bash
+uv run aerohand status --json                 # Xem trạng thái, FPS, pose hiện tại
+uv run aerohand tracking off                  # Tạm dừng theo dõi
+uv run aerohand tracking on                   # Tiếp tục theo dõi
+uv run aerohand settings set cursor.sensitivity 2.4
+uv run aerohand vitals                        # Xem CPU, RAM, độ trễ từng tầng
+uv run aerohand see                           # Chụp ảnh màn hình
+```
+Liên kết nhanh cho **Apple Shortcuts / Raycast**:
+`aerohand://open` · `aerohand://tracking/on` · `aerohand://tracking/off` · `aerohand://recenter` · `aerohand://dictation`
+
+### 4. Chạy chế độ dòng lệnh & kiểm thử
+```bash
+uv run pytest -q                              # Chạy toàn bộ 14 unit/integration test
+uv run ruff check src tests scripts           # Kiểm tra lint
+uv run aerohand run --dry-run --preview       # Chạy thử bằng cửa sổ OpenCV
+```
 
 ---
 
-## Upgrading from 3D Heuristic MVP to Self-Trained ONNX TCN
+## Nâng cấp Model ML: Từ Heuristic 3D lên ONNX 1D-TCN tự huấn luyện
 
-AeroHand ships with **`Heuristic3DPinchClassifier`** working out-of-the-box using `world_landmarks` + 3D `palm_frame`. When you want higher accuracy under extreme hand tilts:
-1. Install ML extras: `uv sync --extra ml --extra train`
-2. Record labeled pinch data via `aerohand --collect-dir recordings/pinch_v1` (press `0..6` for class labels, `r` to toggle recording, `s` to save JSON).
-3. Train a causal 1D dilated TCN on the strictly rotation/translation-invariant 3D features in `aerohand.ml.features_3d` (no screen-absolute 2D coordinates) and export to `.onnx`.
-4. Point `config/user_overrides.yaml` to your `.onnx` + normalizer JSON (`classifier.backend: "onnx_tcn"`) — zero engine code changes required.
+AeroHand chạy sẵn ngay bằng **`Heuristic3DPinchClassifier`** (hình học 3D trong `palm_frame` bất biến góc xoay). Để nâng độ chính xác pinch khi nghiêng tay gắt lên ngang các model thương mại:
+
+1. Mở tab **Dữ liệu ML** ngay trong `AeroHand.app`, quay ~300–500 mẫu cho từng cử chỉ (`0..6`) và bấm **Lưu JSON** (lưu vào `data/sessions/`).
+2. Cài nhóm thư viện huấn luyện và chạy script train Causal 1D-TCN (hỗ trợ so sánh A/B giữa **`invariant348`** và **`airmouse885`**):
+```bash
+uv sync --extra train
+uv run python scripts/train_tcn.py --sessions data/sessions --out-dir models --feature-set invariant348
+```
+3. Mở tab **Dữ liệu ML** trong app → đổi **Bộ phân loại Pinch** sang **`ONNX 1D-TCN`** (không cần sửa code).
 
 ---
 
-## Project Layout
+## Cấu trúc dự án
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for full architecture, data flow, and safety invariants.
+Xem chi tiết kiến trúc dữ liệu, luồng xử lý và các bất biến an toàn tại **[docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)**.

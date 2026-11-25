@@ -226,6 +226,8 @@ class AeroHandRuntime:
             "window_tile": False,
             "spaces_nav": False,
             "palm_wheel": False,
+            "dictation": False,
+            "zoom": False,
         }
         self._move_accum_px: float = 0.0
 
@@ -592,6 +594,7 @@ class AeroHandRuntime:
                 self._lerp_active = False
             if z_out.step != 0:
                 self.audio.play_wheel_tick()
+                self._practice["zoom"] = True
                 self._last_action_text = "Zoom In" if z_out.step > 0 else "Zoom Out"
                 self.input_ctl.zoom_step(z_out.step)
             return "zoom"
@@ -661,6 +664,7 @@ class AeroHandRuntime:
         # Voice Dictation hold gesture (`thumb_index_pinch`)
         if p.dictation_just_started:
             self.audio.play_wheel_tick()
+            self._practice["dictation"] = True
             self.dictation.start()
             self._last_action_text = "Dictation listening..."
         elif p.dictation_just_ended:

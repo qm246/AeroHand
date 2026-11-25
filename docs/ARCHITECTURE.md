@@ -1,44 +1,57 @@
-# AeroHand Architecture
+# Kiến Trúc Hệ Thống AeroHand (v0.2.0)
 
-## Design Goal
-Combine the **best ergonomic & control algorithms** of `andrewslabmd/airpoint-sdk` (Apache-2.0) with the **native macOS safety, low-CPU runtime, and scientific evaluation discipline** built in `GestureCtl`, inside a clean standalone Python/PyObjC codebase.
+## 1. Mục tiêu thiết kế
+Kết hợp **thuật toán công thái học & trải nghiệm UX hoàn chỉnh** của `andrewslabmd/airpoint-sdk` (Apache-2.0) với **nền tảng an toàn macOS bản địa, tiêu thụ tài nguyên thấp và kỷ luật đánh giá ML** từ `GestureCtl` trong một ứng dụng macOS gọn nhẹ chạy hoàn toàn bằng Python + PyObjC + `WKWebView` bản địa (không cần Electron/Node).
 
-## Runtime Data Flow
+---
+
+## 2. Luồng xử lý dữ liệu thời gian thực
 
 ```text
-AVFoundation Webcam (~30 fps, ThreadedCamera, zero backlog)
+AVFoundation Multi-Camera (`platform/camera.py`, zero backlog + đo độ sáng khung hình)
   │
-  ▼  (Idle Throttle drops to 8 fps after 3s with no hand)
-MediaPipe HandLandmarker (`models/hand_landmarker.task`, GPU -> CPU auto-fallback)
-  │  outputs: 21 image landmarks + 21 metric 3D world_landmarks + handedness
+  ▼  (Idle Throttle hạ xuống 8 FPS sau 3 giây không thấy tay)
+MediaPipe HandLandmarker (`models/hand_landmarker.task`, num_hands=2)
+  │  • Mặc định: CPU XNNPACK NEON (0 rò rỉ bộ nhớ, ~14 ms/frame trên Apple M1 Pro)
+  │  • Tránh lỗi rò rỉ CVPixelBuffer/IOSurface (~1.25 MB/frame) của MediaPipe Metal trên macOS
   ▼
 HandCursorEngine (`src/aerohand/core/engine.py`)
-  ├─ 1. LandmarkSmoother (Stage-1 OneEuro: mc=2.0, beta=45.0, gap_reset=100ms)
-  ├─ 2. PalmWheelDetector (3D Palm Cylinder R=0.5*palm_len + palm_facing_dot >= 0.5)
-  ├─ 3. CursorKinematics (index tip LM8, Stage-2 OneEuro mc=1.0 beta=0.01,
-  │      distance compensation, acceleration, 15% jump reject, OS cursor anchor)
-  ├─ 4. 3D Forward-Pointing Gate (`(LM8-LM0).z / len < -0.15`, hysteresis +0.04)
-  ├─ 5. Pluggable PinchClassifier (`src/aerohand/ml/`) — fail-open to IDLE on error
-  │      • MVP: `Heuristic3DPinchClassifier` (3D `palm_frame` normalized distances)
-  │      • Upgrade: `ONNXPinchClassifier` (self-trained causal 1D TCN, seq_len=5,
-  │                 312 strictly rotation/translation/scale-invariant 3D features)
-  ├─ 6. PoseStateMachine (per-pose asymmetric Schmitt + dual time/motion Tap->Hold)
-  └─ 7. Hold Controllers:
-         • ScrollController (2D X/Y axis lock + breakout + rate-independent inertia)
-         • SpacesNavController (thumb_pinky_base + 20px slide)
-         • WindowTileController (thumb_pinky_pinch + 20px slide, fire on release)
+  ├─ 1. Stage-1 LandmarkSmoother (One-Euro mc=2.0, beta=45.0 + AM-7 gap_reset=100ms)
+  ├─ 2. PalmWheelDetector 2 tay (`Left` L1..L5 & `Right` R1..R5, Submenu nhiều tầng,
+  │      3D Palm Cylinder R=0.5*palm_len, hold 350ms + khóa chống rung + nắm tay thoát nhanh)
+  ├─ 3. CursorKinematics (đầu ngón trỏ LM8, Stage-2 One-Euro mc=1.0 beta=0.01,
+  │      bù khoảng cách, gia tốc, loại bước nhảy >15%, neo con trỏ OS)
+  ├─ 4. 3D Forward-Pointing Gate (`(LM8 - LM0).z / len < -0.15`, hysteresis +0.04)
+  ├─ 5. Pluggable PinchClassifier (`src/aerohand/ml/`) — fail-open về IDLE khi có lỗi
+  │      • Mặc định: `Heuristic3DPinchClassifier` (khoảng cách 3D trong `palm_frame`)
+  │      • Nâng cấp: `ONNXPinchClassifier` (Causal 1D-TCN, seq_len=5, tự nhận diện
+  │                  `invariant348` 348 chiều bất biến 3D hoặc `airmouse885` 885 chiều)
+  ├─ 6. PoseStateMachine (ngưỡng Schmitt bất đối xứng từng pose + chuyển Tap → Hold)
+  ├─ 7. Bộ điều khiển hành động:
+  │      • ScrollController (khóa trục X/Y + quán tính độc lập tốc độ khung hình)
+  │      • SpacesNavController (`thumb_pinky_base` + vuốt 20px)
+  │      • WindowTileController (`thumb_pinky_pinch` + vuốt 20px, xem trước trước khi thả)
+  │      • ZoomController (chụm 2 tay kéo giãn / thu lại)
+  └─ 8. PipelineTiming Profiler & Smart Tracking Warnings (thiếu sáng, quá xa/gần, mép khung)
   │
   ▼
-macOS Native Platform (`src/aerohand/platform/`)
-  ├─ 60 Hz CursorLerpInterpolator (`lerp_speed=55`) smooths 30 Hz camera to 60 Hz motion
-  ├─ Typing Guard (`kCGSessionEventTap` counter — ZERO Input Monitoring permission!)
-  ├─ Quartz `CGEventPost` (left/right click, drag, 2D `wheelCount=2` scroll, Spaces)
-  ├─ Window Tiling (AXUIElement native resize) + Audio feedback (`NSSound`)
-  └─ Failsafe `release_all()` on hand loss, pause, exception, or shutdown
+Tầng macOS Bản Địa (`src/aerohand/platform/`) & Giao Diện (`src/aerohand/ui/`)
+  ├─ 60 Hz CursorLerpInterpolator (`lerp_speed=55`) nội suy mượt từ webcam 30 Hz
+  ├─ Typing Guard (`kCGSessionEventTap` + `HIDSystemState` — 0 quyền Input Monitoring!)
+  ├─ Quartz `CGEventPost` (Click, Drag, 2D Scroll có ScrollPhase + MomentumPhase, Media/Volume)
+  ├─ Accessibility `AXUIElement` Window Tiling (hỗ trợ đa màn hình + animation mượt)
+  ├─ VoiceDictationController (`SFSpeechRecognizer` local `vi-VN`/`en-US` + chèn UTF-8 an toàn)
+  ├─ Per-App Profiles (theo dõi `frontmostApplication` bundle ID) + Local HTTP API (`127.0.0.1:17420`)
+  ├─ Control Center 8 tab (`NSWindow` + `WKWebView`, song ngữ Việt/Anh `i18n`)
+  ├─ Screen Overlay trong suốt click-through (`overlay.html`: Palm Wheel 5 cánh, Click Pulse, Tile Preview, Toasts)
+  └─ Hover-Fade Floating Camera HUD (`HoverCameraView` + `objc.autorelease_pool()`)
 ```
 
-## Safety Invariants
-1. **Zero stuck buttons/modifiers**: Hand loss > `hand_lost_release_ms`, drag > `max_drag_duration_ms`, pause, or quit always invokes `InputController.release_all()`.
-2. **Typing Guard always active**: Physical keyboard input suppresses gestures for `1.5 s`; physical mouse/trackpad input suppresses pointer/click/drag/scroll for `1.0 s`. Posting synthetic events to `kCGSessionEventTap` avoids polluting `HIDSystemState`, eliminating Input Monitoring permission friction.
-3. **Fail-open classifier**: Any runtime error in heuristic or ONNX inference falls back to `PoseName.IDLE` rather than crashing or latching a click.
-4. **Clean-room ML**: Feature vectors exclude raw screen-absolute `(x, y)` coordinates so single-user TCN models cannot overfit to desk framing. No proprietary AirMouse assets are ever included.
+---
+
+## 3. Các bất biến an toàn (Safety Invariants)
+1. **Không bao giờ kẹt nút chuột / phím tắt**: Mất tay quá `hand_lost_release_ms` (`350 ms`), kéo thả quá `20 s`, tạm dừng, lỗi ngoại lệ hoặc thoát app đều bắt buộc gọi `MacOSInputController.release_all()`.
+2. **Typing Guard luôn bảo vệ không cần Input Monitoring**: Gõ phím vật lý chặn cử chỉ tay trong `1.5 s`; chạm chuột/trackpad chặn trong `1.0 s`. Mọi sự kiện ảo đều bơm vào `kCGSessionEventTap` để không làm nhiễm bộ đếm `HIDSystemState`.
+3. **Fail-open ở tầng phân loại ML**: Bất kỳ lỗi nào trong heuristic hoặc ONNX Runtime đều rơi an toàn về `PoseName.IDLE`, không crash và không giữ dính click.
+4. **Ổn định bộ nhớ dài hạn**: MediaPipe chạy `CPU XNNPACK` mặc định (0 rò rỉ `CVPixelBuffer`) kết hợp `objc.autorelease_pool()` ở vòng lặp HUD 20 Hz.
+5. **Clean-Room & Quyền riêng tư 100% cục bộ**: Không có dữ liệu ảnh camera hay tệp trọng số độc quyền nào rời khỏi máy hoặc bị đóng gói trong repo.

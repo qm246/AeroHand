@@ -35,6 +35,7 @@ from aerohand.core.engine import (
     HandCursorEngine,
     PinchCalibrationWizard,
     format_live_hint_toast,
+    format_refusal_reason,
 )
 from aerohand.core.kinematics import CursorLerpInterpolator
 from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
@@ -100,6 +101,8 @@ class RuntimeSnapshot:
     spaces_nav_preview: Optional[str] = None
     active_hint: Optional[str] = None
     active_hint_text: Optional[str] = None
+    refusal_code: Optional[str] = None
+    refusal_reason: Optional[str] = None
     warning: Optional[Dict[str, str]] = None
     dictation: Dict[str, Any] = field(default_factory=dict)
     timing: Dict[str, float] = field(default_factory=dict)
@@ -652,6 +655,8 @@ class AeroHandRuntime:
         new_cfg = deepcopy(self.base_config)
         h3d = new_cfg.setdefault("classifier", {}).setdefault("heuristic_3d", {})
         h3d["pinch_on_dist"] = float(sugg["pinch_on_dist"])
+        if "pinch_off_dist" in sugg:
+            h3d["pinch_off_dist"] = float(sugg["pinch_off_dist"])
         h3d["pinky_base_on_dist"] = float(sugg["pinky_base_on_dist"])
         h3d["dual_pinch_on_dist"] = float(sugg["dual_pinch_on_dist"])
         th_map = new_cfg.setdefault("pose_state_machine", {}).setdefault("thresholds", {})
@@ -1497,6 +1502,19 @@ class AeroHandRuntime:
                 if warn_dict is None and cls_tel.get("fell_back") and cls_tel.get("fallback_reason"):
                     warn_dict = {"level": "warning", "code": str(cls_tel["fallback_reason"])}
 
+                dict_status = self.dictation.status_dict()
+                refusal_code: Optional[str] = None
+                if self._paused:
+                    refusal_code = "paused"
+                elif self.input_ctl.last_guard_reason:
+                    refusal_code = "typing_guard_active"
+                elif dict_status.get("discard_active") and dict_status.get("last_discard_reason"):
+                    dr = str(dict_status["last_discard_reason"])
+                    refusal_code = "two_hand_zoom_active" if dr == "two_hand_zoom" else f"dictation_{dr}"
+                elif self.engine.last_refusal_code:
+                    refusal_code = self.engine.last_refusal_code
+                refusal_reason = format_refusal_reason(refusal_code, self.config)
+
                 snap = RuntimeSnapshot(
                     running=True,
                     paused=self._paused,
@@ -1534,8 +1552,10 @@ class AeroHandRuntime:
                     ),
                     active_hint=active_hint,
                     active_hint_text=format_live_hint_toast(active_hint, self.config),
+                    refusal_code=refusal_code,
+                    refusal_reason=refusal_reason,
                     warning=warn_dict,
-                    dictation=self.dictation.status_dict(),
+                    dictation=dict_status,
                     timing=timing.to_dict(),
                     vitals=self.vitals_mon.read().to_dict(),
                     collector=self.collector_status(),

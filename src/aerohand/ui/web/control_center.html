@@ -317,6 +317,7 @@
               <button class="btn sm danger" id="btn-not-intended-dash" onclick="post('mark_not_intended')">🚫 Không phải tôi muốn</button>
             </div>
           </div>
+          <div id="live-refusal-line" style="font-size:11.5px;color:var(--teal);margin-bottom:8px;padding:6px 10px;border-radius:8px;background:rgba(45,212,191,0.08);border:1px solid rgba(45,212,191,0.18)"></div>
           <div id="prob-bars"></div>
         </div>
 
@@ -649,7 +650,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       <!-- 8. ONBOARDING & PRACTICE -->
       <div id="tab-onboarding" class="tab-pane">
         <div class="card">
-          <div class="card-title"><span id="t-cal-hdr">HIỆU CHỈNH NHANH 30 GIÂY (THEO BÀN TAY CỦA BẠN)</span><span class="pill-tag" id="cal-step-pill">0 / 6</span></div>
+          <div class="card-title"><span id="t-cal-hdr">HIỆU CHỈNH NHANH 30 GIÂY (THEO BÀN TAY CỦA BẠN)</span><span class="pill-tag" id="cal-step-pill">0 / 7</span></div>
           <p id="t-cal-sub" style="font-size:12px;color:var(--muted);margin-bottom:10px">Giữ lần lượt 6 cử chỉ chụm trong 3 giây mỗi cử chỉ để đo khoảng cách thực tế trong hệ tọa độ 3D và gợi ý ngưỡng an toàn.</p>
           <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
             <button class="btn primary" id="btn-cal-start" onclick="post('calibration_start')">🎯 Bắt đầu hiệu chỉnh 30 giây</button>
@@ -1199,6 +1200,22 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     const poseFriendly = (i18n.poses && i18n.poses[poseKeyNow]) || poseKeyNow;
     document.getElementById("live-hand-txt").textContent = (isVi ? "Tay chính: " : "Active Hand: ") + (snap.hand || (isVi ? "Chưa thấy" : "None")) + " • " + poseFriendly;
     document.getElementById("live-last-act").textContent = (isVi ? "Hành động: " : "Action: ") + (snap.last_action || "Ready");
+    const refEl = document.getElementById("live-refusal-line");
+    if (refEl) {
+      const rr = i18n.refusal_reasons || {};
+      const title = rr.title || (isVi ? "Vì sao không kích hoạt?" : "Why didn't it trigger?");
+      if (snap.refusal_reason) {
+        refEl.style.color = "var(--amber)";
+        refEl.style.borderColor = "rgba(251,191,36,0.32)";
+        refEl.style.background = "rgba(251,191,36,0.08)";
+        refEl.textContent = `ℹ ${title} ${snap.refusal_reason}`;
+      } else {
+        refEl.style.color = "var(--teal)";
+        refEl.style.borderColor = "rgba(45,212,191,0.18)";
+        refEl.style.background = "rgba(45,212,191,0.08)";
+        refEl.textContent = `✓ ${rr.ready || (isVi ? "Đang sẵn sàng nhận cử chỉ" : "Ready to recognize gestures")}`;
+      }
+    }
     const probs = snap.probabilities || {};
     for (const p of POSE_KEYS) {
       const pct = Math.round((probs[p] || 0) * 100);
@@ -1369,7 +1386,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     const cal = snap.calibration || {};
     const calI18n = i18n.calibration || {};
     const calPill = document.getElementById("cal-step-pill");
-    if (calPill) calPill.textContent = `${cal.step_index || 0} / ${cal.total_steps || 6}`;
+    if (calPill) calPill.textContent = `${cal.step_index || 0} / ${cal.total_steps || 7}`;
     const btnStart = document.getElementById("btn-cal-start");
     const btnCancel = document.getElementById("btn-cal-cancel");
     const btnApply = document.getElementById("btn-cal-apply");

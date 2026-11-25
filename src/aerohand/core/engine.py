@@ -70,9 +70,12 @@ CALIBRATION_POSES: Tuple[PoseName, ...] = (
     PoseName.THUMB_PINKY_BASE,
     PoseName.THUMB_INDEX_MIDDLE_PINCH,
 )
+LOOSE_PINCH_STEP: str = "loose_pinch"
+CALIBRATION_STEPS: Tuple[str, ...] = tuple(p.value for p in CALIBRATION_POSES) + (LOOSE_PINCH_STEP,)
 
 # Safe threshold bounds so calibration can never create hyper-sensitive or unusable settings
 SAFE_PINCH_ON_BOUNDS: Tuple[float, float] = (0.24, 0.46)
+SAFE_PINCH_OFF_BOUNDS: Tuple[float, float] = (0.48, 0.78)
 SAFE_PINKY_BASE_ON_BOUNDS: Tuple[float, float] = (0.30, 0.54)
 SAFE_DUAL_PINCH_ON_BOUNDS: Tuple[float, float] = (0.28, 0.50)
 SAFE_ENTER_THRESHOLD_BOUNDS: Tuple[float, float] = (0.65, 0.88)
@@ -82,32 +85,35 @@ def measure_pose_palm_distance(
     landmarks_2d: List[Landmark],
     world_landmarks: Optional[List[Landmark]],
     handedness: Handedness,
-    pose: PoseName,
+    pose: PoseName | str,
 ) -> Optional[float]:
-    """Measure fingertip contact distance for `pose` in 3D orthonormal `palm_frame` units."""
+    """Measure fingertip contact (or loose-pinch near-miss) distance in 3D `palm_frame` units."""
     src = world_landmarks if (world_landmarks is not None and len(world_landmarks) >= 21) else landmarks_2d
     pf = compute_palm_frame(src, anchor="palm_center", is_left_hand=(handedness == "Left"), scale_metric="palm_width")
     if pf is None:
         return None
-    if pose == PoseName.THUMB_INDEX_PINCH:
+    key = pose.value if isinstance(pose, PoseName) else str(pose)
+    if key == LOOSE_PINCH_STEP:
+        return min(pf.dist(THUMB_TIP, INDEX_TIP), pf.dist(THUMB_TIP, MIDDLE_TIP))
+    if key == PoseName.THUMB_INDEX_PINCH.value:
         return pf.dist(THUMB_TIP, INDEX_TIP)
-    if pose == PoseName.THUMB_MIDDLE_PINCH:
+    if key == PoseName.THUMB_MIDDLE_PINCH.value:
         return pf.dist(THUMB_TIP, MIDDLE_TIP)
-    if pose == PoseName.THUMB_RING_PINCH:
+    if key == PoseName.THUMB_RING_PINCH.value:
         return pf.dist(THUMB_TIP, RING_TIP)
-    if pose == PoseName.THUMB_PINKY_PINCH:
+    if key == PoseName.THUMB_PINKY_PINCH.value:
         return pf.dist(THUMB_TIP, PINKY_TIP)
-    if pose == PoseName.THUMB_PINKY_BASE:
+    if key == PoseName.THUMB_PINKY_BASE.value:
         return pf.dist(THUMB_TIP, PINKY_MCP)
-    if pose == PoseName.THUMB_INDEX_MIDDLE_PINCH:
+    if key == PoseName.THUMB_INDEX_MIDDLE_PINCH.value:
         return max(pf.dist(THUMB_TIP, INDEX_TIP), pf.dist(THUMB_TIP, MIDDLE_TIP))
     return None
 
 
 def suggest_calibrated_thresholds(medians: Dict[str, float]) -> Dict[str, Any]:
     """
-    Convert per-pose median `palm_frame` contact distances into safe suggested overrides.
-    Never suggests values below the documented safe minimum or above the safe maximum.
+    Convert per-pose median `palm_frame` contact distances (plus optional `loose_pinch` near-miss)
+    into safe suggested overrides. Never exceeds documented safe bounds.
     """
     def _clamp(val: float, lo: float, hi: float) -> float:
         return round(max(lo, min(hi, float(val))), 3)
@@ -124,9 +130,19 @@ def suggest_calibrated_thresholds(medians: Dict[str, float]) -> Dict[str, Any]:
     ]
     if single_vals:
         med_single = sorted(single_vals)[len(single_vals) // 2]
-        pinch_on = _clamp(med_single + 0.08, *SAFE_PINCH_ON_BOUNDS)
+        raw_pinch_on = med_single + 0.08
     else:
-        pinch_on = 0.34
+        raw_pinch_on = 0.34
+
+    loose_raw = medians.get(LOOSE_PINCH_STEP)
+    if loose_raw is not None and float(loose_raw) > 0.0:
+        # Keep pinch_on safely below user's loose near-miss distance so 1-2 cm hover won't false-trigger
+        raw_pinch_on = min(raw_pinch_on, float(loose_raw) - 0.06)
+        pinch_on = _clamp(raw_pinch_on, *SAFE_PINCH_ON_BOUNDS)
+        pinch_off = _clamp(max(pinch_on + 0.16, float(loose_raw) + 0.05), *SAFE_PINCH_OFF_BOUNDS)
+    else:
+        pinch_on = _clamp(raw_pinch_on, *SAFE_PINCH_ON_BOUNDS)
+        pinch_off = _clamp(max(0.62, pinch_on + 0.24), *SAFE_PINCH_OFF_BOUNDS)
 
     pb_raw = medians.get(PoseName.THUMB_PINKY_BASE.value)
     pinky_base_on = _clamp((pb_raw + 0.09) if pb_raw else 0.42, *SAFE_PINKY_BASE_ON_BOUNDS)
@@ -140,12 +156,12 @@ def suggest_calibrated_thresholds(medians: Dict[str, float]) -> Dict[str, Any]:
         if d is None or d <= 0.0:
             enter_thresholds[p.value] = 0.75
         else:
-            # Slightly tighter enter threshold if user's natural contact is very tight, looser if wider
             raw_th = 0.82 - max(0.0, (d - 0.22)) * 0.45
             enter_thresholds[p.value] = _clamp(raw_th, *SAFE_ENTER_THRESHOLD_BOUNDS)
 
     return {
         "pinch_on_dist": pinch_on,
+        "pinch_off_dist": pinch_off,
         "pinky_base_on_dist": pinky_base_on,
         "dual_pinch_on_dist": dual_on,
         "enter_thresholds": enter_thresholds,
@@ -154,14 +170,14 @@ def suggest_calibrated_thresholds(medians: Dict[str, float]) -> Dict[str, Any]:
 
 
 class PinchCalibrationWizard:
-    """Interactive 30-second per-pose calibration wizard (6 pinch poses x 3s hold)."""
+    """Interactive personal calibration wizard (6 pinch poses + 1 loose-pinch near-miss step)."""
 
     def __init__(self, hold_seconds: float = 3.0) -> None:
         self.hold_seconds: float = max(1.0, float(hold_seconds))
         self.state: str = "idle"  # "idle" | "running" | "done"
         self.step_index: int = 0
         self._step_started_s: float = 0.0
-        self._samples: Dict[str, List[float]] = {p.value: [] for p in CALIBRATION_POSES}
+        self._samples: Dict[str, List[float]] = {k: [] for k in CALIBRATION_STEPS}
         self.suggestion: Optional[Dict[str, Any]] = None
 
     def start(self, now_s: Optional[float] = None) -> None:
@@ -169,7 +185,7 @@ class PinchCalibrationWizard:
         self.state = "running"
         self.step_index = 0
         self._step_started_s = t
-        self._samples = {p.value: [] for p in CALIBRATION_POSES}
+        self._samples = {k: [] for k in CALIBRATION_STEPS}
         self.suggestion = None
 
     def cancel(self) -> None:
@@ -187,22 +203,22 @@ class PinchCalibrationWizard:
         if self.state != "running":
             return self.status(now_s=now_s)
         t = time.monotonic() if now_s is None else float(now_s)
-        pose = CALIBRATION_POSES[self.step_index]
+        step_key = CALIBRATION_STEPS[self.step_index]
         if landmarks_2d is not None and len(landmarks_2d) >= 21:
-            d = measure_pose_palm_distance(landmarks_2d, world_landmarks, handedness, pose)
-            if d is not None and 0.01 < d < 1.5:
-                self._samples[pose.value].append(d)
+            d = measure_pose_palm_distance(landmarks_2d, world_landmarks, handedness, step_key)
+            if d is not None and 0.01 < d < 1.8:
+                self._samples[step_key].append(d)
 
         elapsed = t - self._step_started_s
         if elapsed >= self.hold_seconds:
             self.step_index += 1
             self._step_started_s = t
-            if self.step_index >= len(CALIBRATION_POSES):
+            if self.step_index >= len(CALIBRATION_STEPS):
                 medians: Dict[str, float] = {}
-                for p in CALIBRATION_POSES:
-                    vals = sorted(self._samples[p.value])
+                for k in CALIBRATION_STEPS:
+                    vals = sorted(self._samples[k])
                     if vals:
-                        medians[p.value] = vals[len(vals) // 2]
+                        medians[k] = vals[len(vals) // 2]
                 self.suggestion = suggest_calibrated_thresholds(medians)
                 self.state = "done"
         return self.status(now_s=t)
@@ -210,8 +226,8 @@ class PinchCalibrationWizard:
     def status(self, now_s: Optional[float] = None) -> Dict[str, Any]:
         t = time.monotonic() if now_s is None else float(now_s)
         cur_pose = (
-            CALIBRATION_POSES[self.step_index].value
-            if self.state == "running" and self.step_index < len(CALIBRATION_POSES)
+            CALIBRATION_STEPS[self.step_index]
+            if self.state == "running" and self.step_index < len(CALIBRATION_STEPS)
             else None
         )
         remaining_s = (
@@ -222,7 +238,7 @@ class PinchCalibrationWizard:
         return {
             "state": self.state,
             "step_index": self.step_index,
-            "total_steps": len(CALIBRATION_POSES),
+            "total_steps": len(CALIBRATION_STEPS),
             "current_pose": cur_pose,
             "remaining_s": round(remaining_s, 1),
             "sample_counts": {k: len(v) for k, v in self._samples.items()},
@@ -285,6 +301,55 @@ def format_live_hint_toast(
         return str(base_label)
     pose_names = " / ".join(poses_i18n.get(pk, pk) for pk in matched_poses)
     return f"{base_label} • {pose_names}"
+
+
+def format_refusal_reason(
+    code: Optional[str],
+    config: Dict[str, Any],
+    *,
+    lang: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Format the live bilingual "Why didn't it trigger?" reason line reading the LIVE gesture map
+    and active settings (zero hard-coded gesture names, V040-04).
+    """
+    if not code:
+        return None
+    eff_lang = lang or str((config.get("ui") or {}).get("language", "vi"))
+    pack = get_lang_pack(eff_lang)
+    reasons = pack.get("refusal_reasons") or {}
+    poses_i18n = pack.get("poses") or {}
+    hands_i18n = pack.get("hands") or {}
+    tmpl = reasons.get(code)
+    if not tmpl:
+        return str(code)
+
+    psm = config.get("pose_state_machine") or {}
+    tap_map = psm.get("tap_actions") or {}
+    hold_map = psm.get("hold_actions") or {}
+    click_poses = [pk for pk, act in tap_map.items() if act == "left_click"]
+    dict_poses = [pk for pk, act in hold_map.items() if act == "dictation"]
+
+    click_pose_lbl = " / ".join(poses_i18n.get(pk, pk) for pk in click_poses) or (
+        (pack.get("actions") or {}).get("left_click", "Left Click")
+    )
+    dict_pose_lbl = " / ".join(poses_i18n.get(pk, pk) for pk in dict_poses) or (
+        (pack.get("actions") or {}).get("dictation", "Dictation")
+    )
+    raw_click_hand = str((config.get("hand") or {}).get("click_hand", "Right"))
+    hand_key = "same_as_cursor" if raw_click_hand.lower() == "same" else raw_click_hand.lower()
+    click_hand_lbl = hands_i18n.get(hand_key, raw_click_hand)
+
+    dir_z_th = float((config.get("cursor") or {}).get("pointing_forward_z_threshold", -0.15))
+    arm_ms = int(round(float((config.get("gestures") or {}).get("dictation_arm_ms", 350))))
+
+    return str(tmpl).format(
+        click_pose=click_pose_lbl,
+        dictation_pose=dict_pose_lbl,
+        click_hand=click_hand_lbl,
+        dir_z=f"{dir_z_th:+.2f}",
+        arm_ms=arm_ms,
+    )
 
 
 @dataclass
@@ -375,6 +440,7 @@ class HandCursorEngine:
         self.last_zoom: ZoomOutput = ZoomOutput()
         self.last_timing: PipelineTiming = PipelineTiming()
         self.last_warning: Optional[TrackingWarning] = None
+        self.last_refusal_code: Optional[str] = None
         self.dwell_lock_activations: int = 0
         self.dwell_unlock_without_click: int = 0
         self.update_config(config)
@@ -1157,6 +1223,35 @@ class HandCursorEngine:
         if not inputs and frame_brightness is not None and frame_brightness < 38.0:
             warning = TrackingWarning(level="warning", code="low_light")
         self.last_warning = warning
+
+        # Compute concise "Why didn't it trigger?" diagnostic code (V040-04)
+        refusal_code: Optional[str] = None
+        if zoom_intent or self.last_zoom.is_zooming:
+            refusal_code = "two_hand_zoom_active"
+        elif any(
+            (not self._hands[o.hand].is_dictating)
+            and self._hands[o.hand].dictation_pose_enter_ms is not None
+            and o.pose.active_pose is not None
+            and self._hands[o.hand].pose_sm.get_hold_action(o.pose.active_pose) == "dictation"
+            for o in outputs
+        ):
+            refusal_code = "dictation_arming"
+        elif outputs and all((not o.cursor.is_pointing) and (o.pose.active_pose is None) for o in outputs):
+            if self.enable_pointing_gate:
+                refusal_code = "pointing_gate_closed"
+        elif any(
+            o.pose.pose != PoseName.IDLE
+            and (
+                self._hands[o.hand].pose_sm.get_tap_action(o.pose.pose) == "left_click"
+                or self._hands[o.hand].pose_sm.get_hold_action(o.pose.pose) == "drag"
+            )
+            and (not self._is_hand_allowed_for_click_actions(o.hand))
+            for o in outputs
+        ):
+            refusal_code = "non_click_hand"
+        elif warning is not None and warning.code == "hand_too_far":
+            refusal_code = "hand_too_far"
+        self.last_refusal_code = refusal_code
 
         total_ms = (time.perf_counter() - t0) * 1000.0
         self.last_timing = PipelineTiming(

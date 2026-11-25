@@ -2819,3 +2819,94 @@ def test_default_feature_set_decision_rule():
         {"macro_f1_mean": 0.935, "idle_fp_rate_mean": 0.010, "ft_per_hour_mean": 0.8},
     )
     assert d3["winner"] == "airmouse885"
+
+
+def test_i18n_vi_en_keys_equal():
+    import re
+    import shutil
+    import subprocess
+
+    from aerohand.i18n.translations import TRANSLATIONS
+
+    def _collect_keys(obj, prefix=""):
+        keys = set()
+        for k, v in obj.items():
+            full = f"{prefix}.{k}" if prefix else str(k)
+            if isinstance(v, dict):
+                keys |= _collect_keys(v, full)
+            else:
+                assert isinstance(v, str) and v.strip(), f"Empty or non-string i18n leaf: {full}"
+                keys.add(full)
+        return keys
+
+    vi_keys = _collect_keys(TRANSLATIONS["vi"])
+    en_keys = _collect_keys(TRANSLATIONS["en"])
+    assert vi_keys == en_keys, f"i18n mismatch: vi-only={vi_keys - en_keys}, en-only={en_keys - vi_keys}"
+
+    # Verify JS syntax of both WKWebView HTML UIs on macOS CI
+    if shutil.which("osascript"):
+        root = Path(__file__).resolve().parent.parent / "src" / "aerohand" / "ui" / "web"
+        for fname in ("overlay.html", "control_center.html"):
+            txt = (root / fname).read_text(encoding="utf-8")
+            m = re.search(r"<script>(.*)</script>", txt, re.S)
+            assert m is not None, f"Missing <script> in {fname}"
+            res = subprocess.run(
+                ["osascript", "-l", "JavaScript", "-e", "new Function(" + repr(m.group(1)) + '); "OK";'],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert res.returncode == 0, f"JS syntax error in {fname}: {res.stderr}"
+
+
+def test_reason_line_uses_live_gesture_map():
+    from aerohand.config import apply_gesture_preset
+    from aerohand.core.engine import format_refusal_reason
+
+    cfg_air = load_config()
+    msg_air_vi = format_refusal_reason("dictation_arming", cfg_air, lang="vi")
+    assert msg_air_vi is not None and "Chụm Cái + Trỏ" in msg_air_vi
+
+    # Switch to Classic preset (dictation -> thumb_middle_pinch) -> reason line updates dynamically!
+    cfg_cls = apply_gesture_preset(cfg_air, "classic")
+    msg_cls_vi = format_refusal_reason("dictation_arming", cfg_cls, lang="vi")
+    assert msg_cls_vi is not None and "Chụm Cái + Giữa" in msg_cls_vi
+    assert "Chụm Cái + Trỏ" not in msg_cls_vi
+
+    # Custom remap for click hand & left click pose in English
+    cfg_custom = load_config()
+    cfg_custom["hand"]["click_hand"] = "Left"
+    cfg_custom["pose_state_machine"]["tap_actions"] = {"thumb_pinky_pinch": "left_click"}
+    msg_en = format_refusal_reason("non_click_hand", cfg_custom, lang="en")
+    assert msg_en is not None and "Thumb + Pinky Pinch" in msg_en and "Left Hand" in msg_en
+
+
+def test_calibration_includes_loose_pinch_step():
+    from aerohand.core.engine import (
+        CALIBRATION_STEPS,
+        LOOSE_PINCH_STEP,
+        SAFE_PINCH_OFF_BOUNDS,
+        SAFE_PINCH_ON_BOUNDS,
+        PinchCalibrationWizard,
+    )
+
+    assert LOOSE_PINCH_STEP in CALIBRATION_STEPS
+    assert len(CALIBRATION_STEPS) == 7
+
+    wiz = PinchCalibrationWizard(hold_seconds=1.0)
+    wiz.start(now_s=0.0)
+    h = _make_open_hand()
+    seen_steps = []
+    t = 0.0
+    for _ in range(len(CALIBRATION_STEPS)):
+        st = wiz.status(now_s=t)
+        seen_steps.append(st["current_pose"])
+        wiz.update(h, h, "Right", now_s=t + 0.2)
+        wiz.update(h, h, "Right", now_s=t + 1.05)
+        t += 1.05
+
+    assert LOOSE_PINCH_STEP in seen_steps
+    assert wiz.state == "done"
+    assert wiz.suggestion is not None
+    assert SAFE_PINCH_ON_BOUNDS[0] <= wiz.suggestion["pinch_on_dist"] <= SAFE_PINCH_ON_BOUNDS[1]
+    assert SAFE_PINCH_OFF_BOUNDS[0] <= wiz.suggestion["pinch_off_dist"] <= SAFE_PINCH_OFF_BOUNDS[1]

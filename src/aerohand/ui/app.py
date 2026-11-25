@@ -384,6 +384,23 @@ class WebBridgeHandler(AppKit.NSObject):
             logger.debug(f"[BRIDGE] Failed handling JS message: {exc}")
 
 
+class OverlayNavigationDelegate(AppKit.NSObject):
+    """WKNavigationDelegate that auto-reloads overlay.html if macOS terminates WebContent."""
+
+    def initWithCallback_(self, callback: Callable[[Any], None]):
+        self = objc.super(OverlayNavigationDelegate, self).init()
+        if self is None:
+            return None
+        self._callback = callback
+        return self
+
+    def webViewWebContentProcessDidTerminate_(self, webview) -> None:
+        try:
+            self._callback(webview)
+        except Exception as exc:
+            logger.warning(f"[OVERLAY] WebContent recovery callback failed: {exc}")
+
+
 class AeroHandAppDelegate(AppKit.NSObject):
     """Main-thread AppKit controller for Menu Bar, WKWebView Control Center, Overlay & HUD."""
 
@@ -400,6 +417,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self.overlay_webview = None
         self._overlay_entries: list[Dict[str, Any]] = []
         self._overlay_bridge_handler = None
+        self._overlay_nav_delegate = None
         self._overlay_screen_signature: Tuple[Tuple[int, int, int, int], ...] = ()
         self._overlay_had_visuals: bool = False
         self._screen_geom = ScreenGeometry()
@@ -701,6 +719,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
             style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
             if self._overlay_bridge_handler is None:
                 self._overlay_bridge_handler = WebBridgeHandler.alloc().initWithCallback_(self._on_js_message)
+            if self._overlay_nav_delegate is None:
+                self._overlay_nav_delegate = OverlayNavigationDelegate.alloc().initWithCallback_(
+                    self._on_overlay_webcontent_terminated
+                )
 
             raw_frames: List[Tuple[float, float, float, float]] = []
             for idx, sc in enumerate(screens):
@@ -735,6 +757,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                     wv.setValue_forKey_(Foundation.NSNumber.numberWithBool_(False), "drawsBackground")
                 except Exception:
                     pass
+                wv.setNavigationDelegate_(self._overlay_nav_delegate)
                 wv.loadFileURL_allowingReadAccessToURL_(file_url, dir_url)
                 panel.setContentView_(wv)
 
@@ -756,6 +779,21 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 self.overlay_panel = prim["panel"]
                 self.overlay_webview = prim["webview"]
                 self._overlay_ready = True
+
+    def _on_overlay_webcontent_terminated(self, webview: Any) -> None:
+        logger.warning("[OVERLAY] WKWebView WebContent process terminated; self-healing reload triggered.")
+        html_path = Path(__file__).resolve().parent / "web" / "overlay.html"
+        file_url = Foundation.NSURL.fileURLWithPath_(str(html_path))
+        dir_url = Foundation.NSURL.fileURLWithPath_(str(html_path.parent))
+        for entry in self._overlay_entries:
+            if entry["webview"] is webview:
+                entry["ready"] = False
+                entry["payload_builder"].reset()
+                try:
+                    webview.loadFileURL_allowingReadAccessToURL_(file_url, dir_url)
+                except Exception as exc:
+                    logger.warning(f"[OVERLAY] Failed to reload WebView: {exc}")
+                break
 
     def onScreenParametersChanged_(self, _notification) -> None:
         screens = list(AppKit.NSScreen.screens() or [])
@@ -1186,6 +1224,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 "pose": snap.pose,
                 "active_pose": snap.active_pose,
                 "last_action": snap.last_action,
+                "refusal_code": snap.refusal_code,
+                "refusal_reason": snap.refusal_reason,
                 "probabilities": snap.probabilities,
                 "dictation": snap.dictation,
                 "timing": snap.timing,

@@ -2600,3 +2600,98 @@ def test_negative_snapshot_roundtrips_to_trainer(tmp_path: Path):
     assert xs.shape == (40 - 5 + 1, 5, FEATURE_DIM_3D)
     assert np.all(ys == 0)
     assert np.all(np.isfinite(xs))
+
+
+def _load_replay_eval_module(name: str = "replay_eval_mod"):
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent.parent / "scripts" / "replay_eval.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_replay_is_deterministic(tmp_path: Path):
+    import json
+
+    mod = _load_replay_eval_module("replay_eval_det")
+    col = PinchDataCollector(session_meta={"subject": "eval", "wrist_angle": "0", "distance": "mid", "lighting": "bright"})
+    col.set_recording(True)
+    h = _make_open_hand(forward_z=-0.25)
+    col.set_pose(PoseName.IDLE)
+    for i in range(15):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    col.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+    pinched = list(h)
+    pinched[4] = Landmark(h[12].x + 0.004, h[12].y + 0.004, h[12].z)
+    for i in range(15, 25):
+        col.add_frame(pinched, pinched, "Right", 0.95, 1000 + i * 33)
+    fp = col.save(tmp_path)
+
+    cfg = load_config()
+    r1 = mod.evaluate_recordings(session_paths=[fp], config=cfg)
+    r2 = mod.evaluate_recordings(session_paths=[fp], config=cfg)
+    assert json.dumps(r1, sort_keys=True) == json.dumps(r2, sort_keys=True)
+    assert r1["total_frames"] == 25
+    assert r1["classification"]["accuracy"] > 0.5
+
+
+def test_replay_reports_false_triggers(tmp_path: Path):
+    from aerohand.ml.base import PinchPrediction
+
+    mod = _load_replay_eval_module("replay_eval_ft")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    # 20 frames (~660 ms) of ground-truth idle
+    for i in range(20):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    neg_fp = col.save(tmp_path)
+
+    class _FalseClickClf:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            self.n += 1
+            probs = idle_probabilities()
+            # Trigger one spurious tap (enter on frames 4-6, release on frames 7-10)
+            if 4 <= self.n <= 6:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            self.n = 0
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        classifier=_FalseClickClf(),
+        max_ft_per_hour=2.0,
+    )
+    assert rep["false_triggers"]["clicks"] == 1
+    assert rep["false_triggers"]["total"] == 1
+    assert rep["false_triggers"]["total_ft_per_hour"] > 2.0
+    assert rep["passed"] is False
+
+    # Baseline regression gate check
+    rep_reg = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        classifier=_FalseClickClf(),
+        max_ft_per_hour=100000.0,
+        baseline={"classification": {"macro_f1": 0.99}, "false_triggers": {"total_ft_per_hour": 0.0}},
+        max_f1_regression=0.01,
+    )
+    assert rep_reg["baseline_diff"]["regressed_macro_f1"] is True
+    assert rep_reg["passed"] is False

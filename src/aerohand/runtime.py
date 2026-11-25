@@ -476,6 +476,7 @@ class AeroHandRuntime:
             or str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
             or bool(new_cls.get("shadow_mode", False)) != bool(old_cls.get("shadow_mode", False))
             or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
+            or (new_cls.get("heuristic_3d") or {}) != (old_cls.get("heuristic_3d") or {})
         ):
             self.classifier = build_classifier(effective, on_error=self._on_classifier_error)
             self.engine.set_classifier(self.classifier)

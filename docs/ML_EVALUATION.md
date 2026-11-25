@@ -105,3 +105,30 @@ Tiêu chí đạt chuẩn CI/phát hành:
 1. Bật `classifier.shadow_mode: true` trong tab **Dữ liệu ML** (hoặc `aerohand settings set classifier.shadow_mode true`). Lúc này hệ thống vẫn điều khiển chuột bằng `Heuristic3DPinchClassifier`, đồng thời chạy song song ONNX và ghi nhận tỷ lệ bất đồng (`shadow_disagreement_rate`) + độ trễ `onnx_p95_ms` qua `aerohand vitals --json`.
 2. Theo dõi phiên thực tế ≥ 15 phút: kiểm tra `onnx_p95_ms < 8.0 ms` và `onnx_errors == 0`.
 3. Chuyển `classifier.backend: "onnx_tcn"` (`shadow_mode: false`). Lớp bảo vệ `GuardedClassifier` vẫn giám sát liên tục và tự động hạ về `Heuristic3DPinchClassifier` kèm `release_all()` nếu độ trễ `p95 > 8 ms` hoặc có ≥ 3 lỗi trong 10 giây.
+
+---
+
+## 6. Cổng Ý định dựa trên Dữ liệu cho Heuristic 3D (`V050-01`)
+
+Phân tích JSONL sự kiện kích hoạt nhầm trên bộ âm tính đời thực `D-dev` (12 kịch bản, 24,62 phút đồng hồ / 7,42 phút `hand_present_idle`, đã sửa đảo nhãn tay gương GestureCtl `Left <-> Right`) cho thấy đa số kích hoạt nhầm xảy ra khi cổ tay dịch chuyển/xoay nhanh hoặc bàn tay xuất hiện trong tư thế nắm cốc/điện thoại.
+
+4 cổng ý định cấu hình độc lập dưới `classifier.heuristic_3d` (chỉ áp dụng khi **vào** cử chỉ mới chưa chốt `latch`, tuyệt đối không cắt ngang lúc đang giữ kéo thả/cuộn/đọc giọng nói):
+1. `enable_approach_gate` (`approach_window_ms: 1500.0`, `approach_open_margin: 0.04`): yêu cầu cặp ngón tay từng tách ra trước khi khép vào; chặn hoàn toàn tiếp xúc tĩnh khi tay mới vào khung hình.
+2. `enable_motion_gate` (`max_wrist_speed: 0.18`, `max_wrist_ang_speed_deg_s: 95.0`): chặn vào cử chỉ mới khi cổ tay dịch chuyển hoặc xoay 3D nhanh (`max(instant, EMA)`).
+3. `enable_posture_gate` (`index_ext_min: 1.25`): yêu cầu ngón trỏ duỗi khi thực hiện các cử chỉ không dùng ngón trỏ (`thumb_middle_pinch`, `thumb_ring_pinch`, `thumb_pinky_pinch`).
+4. `enable_grip_guard` (`grip_half_curled_min: 3`, `grip_loose_ratio: 1.05`): chặn tiếp xúc lỏng khi ≥ 3 ngón đang gập nửa (cầm cốc/điện thoại) mà không ảnh hưởng tới chụm chặt chủ ý.
+
+### Kết quả kiểm chứng Trước / Sau trên `D-dev` & mẫu dương tính liên tục (`dev2_batch1`)
+
+| Chỉ số | Trước (`v0.4.1`, tắt cổng) | Sau (`V050-01`, bật 4 cổng) | Thay đổi |
+|---|---:|---:|---:|
+| Tổng FT trên `D-dev` (12 kịch bản) | 16 | **4** | **-75,0%** |
+| Tốc độ FT `hand_present_idle` (95% Poisson UCB) | 129,3 / giờ (UCB 196,4) | **32,3 / giờ (UCB 74,0)** | **-75,0%** |
+| Tốc độ FT theo `wall_clock` (24,62 phút) | 39,0 / giờ | **9,7 / giờ** | **-75,0%** |
+| `left_click` / `drag_start` / `window_tile` / `palm_wheel` | 5 / 2 / 1 / 0 | **0 / 0 / 0 / 0** | **-100%** |
+| `scroll_stroke` / `dictation_start` | 5 / 3 | **2 / 2** | -60% / -33% |
+| Tổng FT trên `T-dev` (5 kịch bản chỉ tay) | 29 | **19** | **-34,5%** |
+| Recall dương tính `clicks_pinch_cadence_near_145s` | 99,2% khung / 50/50 lượt | **95,0% khung / 49/50 lượt (98,0%)** | Đạt ≥ 95% |
+| Recall dương tính `clicks_pinch_cadence_near_250s` | 94,4% khung / 53/53 lượt | **94,4% khung / 53/53 lượt (100,0%)** | Không giảm |
+
+> **Lưu ý thống kê**: Phơi nhiễm `D-dev` chỉ đạt `0,1237 giờ` `hand_present_idle` (cận trên 95% với 4 sự kiện là `74,0 FT/giờ`). Các cổng hình học chỉ giảm tải bước đầu; để chứng minh ≤ 2 FT/giờ (UCB 95%) cần huấn luyện TCN trên bộ dữ liệu đa lớp và đánh giá 1 lần trên tập held-out đóng niêm phong ≥ 1,5 giờ (`V050-02`–`V050-04`).

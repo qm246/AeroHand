@@ -1798,8 +1798,10 @@ def test_onnx_error_falls_back_to_heuristic():
     assert guarded.fell_back is True
     assert guarded.fallback_reason == "onnx_fallback_errors"
 
-    # Next frame uses Heuristic3D seamlessly and detects the middle pinch
-    pred_fb = guarded.predict(pinched, pinched, "Right", 120.0)
+    # Next frames use Heuristic3D seamlessly (open -> pinch approach) and detect the middle pinch
+    open_h = _make_open_hand()
+    guarded.predict(open_h, open_h, "Right", 100.0)
+    pred_fb = guarded.predict(pinched, pinched, "Right", 133.0)
     assert pred_fb.pose == PoseName.THUMB_MIDDLE_PINCH
 
     # Shadow mode logs disagreement rate without acting on ONNX
@@ -3368,3 +3370,113 @@ def test_zoom_still_cancels_dictation_within_arbitration_window():
     r_out = next(o for o in outs if o.hand == "Right")
     assert r_out.pose.dictation_cancelled is True
     assert r_out.pose.is_dictating is False
+
+
+
+def test_approach_gate_blocks_static_contact():
+    # Hand appears already in static thumb-middle contact without ever opening -> MUST stay IDLE
+    clf = Heuristic3DPinchClassifier({"enable_approach_gate": True, "approach_window_ms": 1500.0})
+    open_h = _make_open_hand()
+    pinched = list(open_h)
+    pinched[4] = Landmark(open_h[12].x - 0.004, open_h[12].y, open_h[12].z)
+
+    for i in range(10):
+        pred = clf.predict(pinched, pinched, "Right", i * 33.0)
+        assert pred.pose == PoseName.IDLE
+
+    # Once the hand genuinely opens then closes -> MUST detect THUMB_MIDDLE_PINCH
+    pred_open = clf.predict(open_h, open_h, "Right", 400.0)
+    assert pred_open.pose == PoseName.IDLE
+    pred_close = clf.predict(pinched, pinched, "Right", 433.0)
+    assert pred_close.pose == PoseName.THUMB_MIDDLE_PINCH
+    assert pred_close.probabilities[PoseName.THUMB_MIDDLE_PINCH] >= 0.75
+
+
+def test_posture_gate_requires_extended_index_for_click():
+    clf = Heuristic3DPinchClassifier(
+        {"enable_approach_gate": True, "enable_posture_gate": True, "index_ext_min": 1.25}
+    )
+    open_h = _make_open_hand()
+    clf.predict(open_h, open_h, "Right", 0.0)
+
+    # Curl index tip right onto index MCP (ext ratio ~1.0 < 1.25) while thumb touches middle -> blocked!
+    curled_click = list(open_h)
+    curled_click[8] = Landmark(open_h[5].x, open_h[5].y, open_h[5].z)
+    curled_click[4] = Landmark(open_h[12].x - 0.004, open_h[12].y, open_h[12].z)
+    pred_blocked = clf.predict(curled_click, curled_click, "Right", 33.0)
+    assert pred_blocked.pose == PoseName.IDLE
+
+    # Extend index normally while thumb touches middle -> allowed!
+    clean_click = list(open_h)
+    clean_click[4] = Landmark(open_h[12].x - 0.004, open_h[12].y, open_h[12].z)
+    pred_ok = clf.predict(clean_click, clean_click, "Right", 66.0)
+    assert pred_ok.pose == PoseName.THUMB_MIDDLE_PINCH
+
+
+def test_motion_gate_blocks_fast_wrist():
+    clf = Heuristic3DPinchClassifier(
+        {
+            "enable_approach_gate": True,
+            "enable_motion_gate": True,
+            "max_wrist_speed": 0.18,
+            "max_wrist_ang_speed_deg_s": 95.0,
+        }
+    )
+    open_h = _make_open_hand()
+    clf.predict(open_h, open_h, "Right", 0.0)
+
+    # Translate whole hand quickly by dx=0.05 in 33ms (~1.5 screen/s >> 0.18) while pinching -> blocked!
+    fast_pinch = [Landmark(p.x + 0.05, p.y, p.z) for p in open_h]
+    fast_pinch[4] = Landmark(fast_pinch[12].x - 0.004, fast_pinch[12].y, fast_pinch[12].z)
+    pred_fast = clf.predict(fast_pinch, fast_pinch, "Right", 33.0)
+    assert pred_fast.pose == PoseName.IDLE
+
+    # Steady wrist after reset + open -> allowed!
+    clf.reset("Right")
+    clf.predict(open_h, open_h, "Right", 500.0)
+    steady_pinch = list(open_h)
+    steady_pinch[4] = Landmark(open_h[12].x - 0.004, open_h[12].y, open_h[12].z)
+    pred_steady = clf.predict(steady_pinch, steady_pinch, "Right", 533.0)
+    assert pred_steady.pose == PoseName.THUMB_MIDDLE_PINCH
+
+
+def test_gates_do_not_block_clean_pinch_fixture():
+    # Clean open -> pinch -> hold (even with wrist drag movement) -> release works with zero gate penalty
+    cfg = load_config()
+    hcfg = dict(cfg["classifier"]["heuristic_3d"])
+    clf = Heuristic3DPinchClassifier(hcfg)
+    ungated = Heuristic3DPinchClassifier(
+        {
+            **hcfg,
+            "enable_approach_gate": False,
+            "enable_posture_gate": False,
+            "enable_motion_gate": False,
+            "enable_grip_guard": False,
+        }
+    )
+    open_h = _make_open_hand(forward_z=-0.25)
+
+    for target_pose, tip_indices in (
+        (PoseName.THUMB_INDEX_PINCH, (8,)),
+        (PoseName.THUMB_MIDDLE_PINCH, (12,)),
+        (PoseName.THUMB_RING_PINCH, (16,)),
+        (PoseName.THUMB_PINKY_PINCH, (20,)),
+    ):
+        clf.reset("Right")
+        # 3 steady open frames
+        for i in range(3):
+            assert clf.predict(open_h, open_h, "Right", i * 33.0).pose == PoseName.IDLE
+        # Clean steady pinch entry matches ungated score identically
+        pinched = list(open_h)
+        t = open_h[tip_indices[0]]
+        pinched[4] = Landmark(t.x - 0.003, t.y, t.z)
+        pred_ref = ungated.predict(pinched, pinched, "Right", 100.0)
+        pred_enter = clf.predict(pinched, pinched, "Right", 100.0)
+        assert pred_enter.pose == target_pose
+        assert pred_enter.probabilities[target_pose] == pytest.approx(
+            pred_ref.probabilities[target_pose], abs=1e-6
+        )
+        # Once latched, moving the wrist rapidly during a hold/drag MUST keep the pose active!
+        moved = [Landmark(p.x + 0.04, p.y - 0.02, p.z) for p in pinched]
+        pred_hold = clf.predict(moved, moved, "Right", 133.0)
+        assert pred_hold.pose == target_pose

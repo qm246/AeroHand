@@ -97,18 +97,40 @@ def convert_gesturectl_file(
     wall_clock_s = round(max(0.0, (max(all_ts) - min(all_ts)) / 1000.0), 3) if len(all_ts) >= 2 else 0.0
     fps_est = float(raw.get("fps_est") or raw.get("fps") or raw.get("target_fps") or 30.0)
 
-    # Identify cue transition timestamps when converting cadence pinch sessions
-    transition_ts: List[float] = []
+    # Identify cue segments with per-segment adaptive edge trim so short ~350 ms cadence
+    # `press` pulses are cleaned at edges without trimming away 100% of the pulse.
+    cue_segments: List[Tuple[str, float, float]] = []
     if is_cadence_pinch:
-        prev_cue: Optional[str] = None
+        seg_cue: Optional[str] = None
+        seg_start = 0.0
+        seg_end = 0.0
         for fr in raw_frames:
             if not isinstance(fr, dict):
                 continue
             cue = str(fr.get("cue_phase") or "").strip().lower()
             ts = float(fr.get("timestamp_ms", 0.0))
-            if prev_cue is not None and cue != prev_cue:
-                transition_ts.append(ts)
-            prev_cue = cue
+            if seg_cue is None:
+                seg_cue, seg_start, seg_end = cue, ts, ts
+            elif cue == seg_cue:
+                seg_end = ts
+            else:
+                cue_segments.append((seg_cue, seg_start, seg_end))
+                seg_cue, seg_start, seg_end = cue, ts, ts
+        if seg_cue is not None:
+            cue_segments.append((seg_cue, seg_start, seg_end))
+
+    def _is_in_trim_zone(ts_val: float, cue_val: str) -> bool:
+        if trim_ms <= 0.0 or not cue_segments:
+            return False
+        n_segs = len(cue_segments)
+        for idx, (scue, s0, s1) in enumerate(cue_segments):
+            if s0 <= ts_val <= s1 and scue == cue_val:
+                dur = max(0.0, s1 - s0)
+                eff_trim = min(trim_ms, dur * 0.20) if cue_val == "press" else trim_ms
+                near_start = (idx > 0) and ((ts_val - s0) < eff_trim)
+                near_end = (idx < n_segs - 1) and ((s1 - ts_val) < eff_trim)
+                return near_start or near_end
+        return False
 
     samples: List[Dict[str, Any]] = []
     stats = {
@@ -155,10 +177,10 @@ def convert_gesturectl_file(
         pose = PoseName.IDLE
 
         if is_cadence_pinch:
-            if trim_ms > 0.0 and any(abs(ts_ms - t_tr) <= trim_ms for t_tr in transition_ts):
+            cue = str(fr.get("cue_phase") or "").strip().lower()
+            if _is_in_trim_zone(float(ts_ms), cue):
                 stats["dropped_edge_trim"] += 1
                 continue
-            cue = str(fr.get("cue_phase") or "").strip().lower()
             if cue == "press":
                 dist = _thumb_index_3d_dist(lms3d, is_left=(handed == "Left"))
                 if dist is None or dist >= float(pinch_on_dist):

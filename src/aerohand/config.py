@@ -189,6 +189,13 @@ SAFE_NUMERIC_RANGES: Dict[str, Tuple[float, float]] = {
     "cursor.drag_lookback_ms": (0.0, 200.0),
     "cursor.drag_dwell_lock_ms": (0.0, 300.0),
     "collector.negative_window_s": (0.5, 10.0),
+    "classifier.heuristic_3d.approach_window_ms": (0.0, 5000.0),
+    "classifier.heuristic_3d.approach_open_margin": (0.0, 0.40),
+    "classifier.heuristic_3d.index_ext_min": (0.5, 2.0),
+    "classifier.heuristic_3d.max_wrist_speed": (0.05, 2.0),
+    "classifier.heuristic_3d.max_wrist_ang_speed_deg_s": (20.0, 600.0),
+    "classifier.heuristic_3d.grip_half_curled_min": (2.0, 4.0),
+    "classifier.heuristic_3d.grip_loose_ratio": (0.7, 1.5),
 }
 
 

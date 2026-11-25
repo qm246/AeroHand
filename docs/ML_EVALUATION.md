@@ -1,4 +1,4 @@
-# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.4.0)
+# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.0)
 
 Tài liệu này quy định quy trình thu thập dữ liệu, huấn luyện Causal 1D-TCN, đánh giá A/B giữa hai tập đặc trưng (`invariant348` và `airmouse885`), kiểm thử hồi quy ngoại tuyến (`replay_eval.py`) và triển khai an toàn qua Shadow Mode.
 

@@ -8,7 +8,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-teal.svg)](LICENSE)
 [![Platform: macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)](#cài-đặt--chạy-nhanh-macos-apple-silicon)
-[![Version: v0.4.0](https://img.shields.io/badge/Version-0.4.0-emerald.svg)](#)
+[![Version: v0.5.0](https://img.shields.io/badge/Version-0.5.0-emerald.svg)](#)
 
 </div>
 
@@ -22,7 +22,7 @@
 
 ---
 
-## Tính năng nổi bật (v0.4.0)
+## Tính năng nổi bật (v0.5.0)
 
 - **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác* kèm **Wizard hiệu chỉnh cá nhân 7 bước** có bước **Chụm lỏng 1–2 cm**), dòng trạng thái trực tiếp **"Vì sao không kích hoạt?"**, **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì, tải nhẹ 5 Hz khi ẩn cửa sổ và lưu cấu hình có debounce 500 ms.
 - **4 lớp Overlay nổi đa màn hình tự phục hồi (`ScreenGeometry` + `WKNavigationDelegate` reload)**:
@@ -32,9 +32,9 @@
   - **Toast gợi ý cử chỉ tự đồng bộ gesture map sống**, sóng âm & thông báo lọc **Voice Dictation**, và **cảnh báo thông minh**.
 - **Con trỏ & click chính xác, chống "dính chuột"**: Nội suy **Adaptive 60 Hz Lerp** (40→70) đồng bộ neo sau click, **Click Lookback 90 ms** có chốt tốc độ (`<= 250 px/s`) và giới hạn lệch (`<= 24 px`), **Dwell Lock đơn lần kèm cooldown 400 ms**, mở rộng **neo pre-pinch cho cả Drag Start & Chuột phải**, tách độc lập tay trỏ và tay click/drag.
 - **Chia cửa sổ chuẩn bằng Accessibility API (`AXUIElement`)**: hoạt động mọi ứng dụng macOS, hỗ trợ đa màn hình (Multi-Monitor) và hiệu ứng animation mượt.
-- **Voice Dictation cục bộ an toàn không kích hoạt nhầm**: Phân xử chặt **Zoom 2 tay vs Đọc giọng nói 1 tay** (`dictation_arm_ms: 350 ms`, `zoom_arbitration_ms: 300 ms`, hủy micro ngay không nhận diện khi tay thứ 2 chụm), **cổng lọc năng lượng VAD** (`min_duration_s: 0.6s`, `min_rms: 0.01`, `min_voiced_ms: 250 ms`), **chặn chữ ảo im lặng (hallucination blocklist)**, nhật ký 50 sự kiện trong `aerohand vitals`, và **snapshot/khôi phục toàn bộ kiểu clipboard** (delay 0.35s cho Electron/Chromium).
+- **Voice Dictation cục bộ an toàn không kích hoạt nhầm**: Phân xử chặt **Zoom 2 tay vs Đọc giọng nói 1 tay** (`dictation_arm_ms: 350 ms`, `zoom_arbitration_ms: 300 ms`, `dictation_priority_ms: 1000 ms` ưu tiên đọc giọng nói đang chạy > 1 giây trước Zoom tay phụ vô tình), **cổng lọc năng lượng VAD** (`min_duration_s: 0.6s`, `min_rms: 0.01`, `min_voiced_ms: 250 ms`), **chặn chữ ảo im lặng (hallucination blocklist)**, nhật ký 50 sự kiện trong `aerohand vitals`, và **snapshot/khôi phục toàn bộ kiểu clipboard** (delay 0.35s cho Electron/Chromium).
 - **Bảo mật & Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`) bảo vệ bằng `Host` + chặn `Origin` + `X-AeroHand-Token` (`0600`) + giới hạn 64 KiB + whitelist key; `aerohand` CLI; URL Scheme `aerohand://`; Per-App Profiles; phím tắt tùy biến (gồm `Cmd+Shift+N` gắn nhãn âm tính khó); Launch at Login.
-- **ML Studio, Khai thác Âm tính Khó & Đánh giá Ngoại tuyến**: Nút **"Không phải tôi muốn"** (`Cmd+Shift+N`) lưu clip ±1,5 s vào `data/negatives/`; ma trận phủ điều kiện 26.000 khung hình + **Quality Gate chặn lưu** dữ liệu kém chất lượng; script **`scripts/replay_eval.py`** đo false triggers/giờ ngoại tuyến; **`train_tcn.py --ab-compare`** so sánh đa seed `invariant348` vs `airmouse885`; runtime có **Shadow Mode** và **Auto-Fallback** về Heuristic 3D khi p95 > 8 ms hoặc lỗi liên tiếp.
+- **Cổng ý định 3D, ML Studio lọc sạch & Triển khai ONNX 4 giai đoạn**: `Heuristic3DPinchClassifier` tích hợp **4 cổng ý định dựa trên dữ liệu** (`approach`, `motion`, `posture`, `grip` — giảm **75% FT** trên `D-dev`); Quality Gate mặc định chế độ **Clean Mode** (lọc khung xấu, tự tách phân đoạn ở khoảng trống > 100 ms, tự lưu nháp `_drafts/`); chuyển đổi kho 3D GestureCtl (`scripts/convert_gesturectl.py` + kiểm tra lệch miền KS `scripts/domain_check.py`); niêm phong held-out 1 lần chạm (`scripts/seal_heldout.py` + `replay_eval.py --heldout` tính **cận trên 95% Poisson UCB** + xuất JSONL chẩn đoán); cân bằng kịch bản `idle` ≤ 15%; và 4 chế độ phân loại an toàn **`heuristic` → `shadow` → `veto` → `onnx`** kiểm duyệt qua `scripts/check_onnx_promotion.py`.
 - **Ổn định 24/7 trên macOS**: MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS) + `objc.autorelease_pool()` + **watchdog chống kẹt chuột level-triggered**.
 
 ---

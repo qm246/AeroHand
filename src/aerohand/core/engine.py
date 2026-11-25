@@ -312,6 +312,9 @@ class _PerHandState:
     prev_click_prob: float = 0.0
     dwell_lock_until_ms: float = 0.0
     dwell_lock_pos: Optional[Tuple[float, float]] = None
+    dwell_lock_used_in_attempt: bool = False
+    dwell_lock_cooldown_until_ms: float = 0.0
+    last_low_click_prob_ms: Optional[float] = None
 
     def reset(self) -> None:
         self.kinematics.reset()
@@ -333,6 +336,9 @@ class _PerHandState:
         self.prev_click_prob = 0.0
         self.dwell_lock_until_ms = 0.0
         self.dwell_lock_pos = None
+        self.dwell_lock_used_in_attempt = False
+        self.dwell_lock_cooldown_until_ms = 0.0
+        self.last_low_click_prob_ms = None
 
 
 class HandCursorEngine:
@@ -357,7 +363,15 @@ class HandCursorEngine:
         self.last_zoom: ZoomOutput = ZoomOutput()
         self.last_timing: PipelineTiming = PipelineTiming()
         self.last_warning: Optional[TrackingWarning] = None
+        self.dwell_lock_activations: int = 0
+        self.dwell_unlock_without_click: int = 0
         self.update_config(config)
+
+    def engine_telemetry(self) -> Dict[str, Any]:
+        return {
+            "dwell_lock_activations": self.dwell_lock_activations,
+            "dwell_unlock_without_click": self.dwell_unlock_without_click,
+        }
 
     def _make_hand_state(self, hand: Handedness) -> _PerHandState:
         return _PerHandState(
@@ -415,6 +429,9 @@ class HandCursorEngine:
         self.pointing_gate_hysteresis: float = float(cur_cfg.get("pointing_gate_hysteresis", 0.04))
         self.click_lookback_ms: float = max(0.0, float(cur_cfg.get("click_lookback_ms", 90.0)))
         self.click_dwell_lock_ms: float = max(0.0, float(cur_cfg.get("click_dwell_lock_ms", 120.0)))
+        self.click_dwell_lock_cooldown_ms: float = max(
+            0.0, float(cur_cfg.get("click_dwell_lock_cooldown_ms", 400.0))
+        )
 
         psm_cfg = config.get("pose_state_machine") or {}
         self.enable_click_debounce: bool = bool(psm_cfg.get("enable_click_debounce", True))
@@ -711,7 +728,7 @@ class HandCursorEngine:
             else:
                 hs.zoom_pose_enter_ms = None
 
-            # 6. Pre-click dwell lock & Pose State Machine
+            # 6. Pre-click dwell lock (V031-03 single-arm + cooldown limiter) & Pose State Machine
             tg1 = time.perf_counter()
             click_poses = [
                 pose_k
@@ -725,22 +742,49 @@ class HandCursorEngine:
                 and not hs.is_grabbing
                 and not pw_active
             ):
-                if (
-                    click_prob > 0.40
-                    and click_prob > hs.prev_click_prob
-                    and timestamp_ms >= hs.dwell_lock_until_ms
-                ):
-                    hs.dwell_lock_until_ms = timestamp_ms + self.click_dwell_lock_ms
-                    hs.dwell_lock_pos = (cursor_out.x, cursor_out.y)
-                elif click_prob < 0.20 and hs.pose_sm.active_pose is None:
-                    hs.dwell_lock_until_ms = 0.0
+                # Expire active dwell lock cleanly & enforce cooldown if no click fired
+                if hs.dwell_lock_pos is not None and timestamp_ms >= hs.dwell_lock_until_ms:
                     hs.dwell_lock_pos = None
+                    hs.dwell_lock_until_ms = 0.0
+                    hs.dwell_lock_cooldown_until_ms = timestamp_ms + self.click_dwell_lock_cooldown_ms
+                    self.dwell_unlock_without_click += 1
+
+                if click_prob < 0.20:
+                    hs.last_low_click_prob_ms = timestamp_ms
+                    if hs.pose_sm.active_pose is None:
+                        hs.dwell_lock_used_in_attempt = False
+                        hs.dwell_lock_until_ms = 0.0
+                        hs.dwell_lock_pos = None
+                else:
+                    rising_from_low = (
+                        hs.last_low_click_prob_ms is not None
+                        and (timestamp_ms - hs.last_low_click_prob_ms) <= 250.0
+                    ) or (hs.last_low_click_prob_ms is None and hs.prev_click_prob < 0.20)
+                    if (
+                        (not hs.dwell_lock_used_in_attempt)
+                        and (hs.dwell_lock_pos is None)
+                        and (timestamp_ms >= hs.dwell_lock_cooldown_until_ms)
+                        and click_prob > 0.40
+                        and click_prob > hs.prev_click_prob
+                        and rising_from_low
+                    ):
+                        hs.dwell_lock_until_ms = timestamp_ms + self.click_dwell_lock_ms
+                        hs.dwell_lock_pos = (cursor_out.x, cursor_out.y)
+                        hs.dwell_lock_used_in_attempt = True
+                        self.dwell_lock_activations += 1
 
                 if timestamp_ms < hs.dwell_lock_until_ms and hs.dwell_lock_pos is not None:
                     cursor_out.x, cursor_out.y = hs.dwell_lock_pos
                     cursor_out.delta_x = 0.0
                     cursor_out.delta_y = 0.0
                     hs.cursor_delta = (0.0, 0.0)
+            else:
+                if click_prob < 0.20:
+                    hs.last_low_click_prob_ms = timestamp_ms
+                    if hs.pose_sm.active_pose is None:
+                        hs.dwell_lock_used_in_attempt = False
+                hs.dwell_lock_until_ms = 0.0
+                hs.dwell_lock_pos = None
             hs.prev_click_prob = click_prob
 
             if hs.pose_sm.active_pose is not None:

@@ -2169,3 +2169,152 @@ def test_dictation_event_ring_buffer_capped_at_50():
     evs = ctrl.recent_events()
     assert len(evs) == 50
     assert ctrl.status_dict()["stats"]["discarded"] == 75
+
+
+def test_dwell_lock_does_not_rearm_while_probability_hovers():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["click_dwell_lock_ms"] = 120.0
+    cfg["cursor"]["click_dwell_lock_cooldown_ms"] = 400.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _HoverClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _HoverClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 500.0, 500.0)
+
+    # Frame 0: clean idle (< 0.20)
+    clf.p = 0.05
+    h = _make_open_hand(forward_z=-0.25)
+    eng.process_frame([HandInput("Right", h, h)], 0.0, 1920.0, 1080.0)
+
+    # Oscillate between 0.42 and 0.68 for 2000ms (never dropping below 0.20) while hand moves smoothly
+    pattern = [0.45, 0.62, 0.42, 0.65, 0.44, 0.68, 0.41, 0.66]
+    xs = []
+    for i in range(40):
+        ts = 50.0 + i * 50.0
+        clf.p = pattern[i % len(pattern)]
+        shifted = [Landmark(p.x + 0.002 * i, p.y, p.z) for p in h]
+        o = eng.process_frame([HandInput("Right", shifted, shifted)], ts, 1920.0, 1080.0)[0]
+        xs.append(o.cursor.x)
+
+    # Lock must activate AT MOST ONCE and never re-arm during continuous hovering
+    assert eng.dwell_lock_activations == 1
+    assert eng.dwell_unlock_without_click == 1
+    # Pointer continues moving freely after the initial 120ms lock expires
+    assert xs[-1] > xs[6] + 40.0
+
+
+def test_dwell_lock_arms_once_per_pinch_attempt():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["click_dwell_lock_ms"] = 120.0
+    cfg["cursor"]["click_dwell_lock_cooldown_ms"] = 400.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _RampClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(
+                PoseName.THUMB_MIDDLE_PINCH if self.p >= 0.75 else PoseName.IDLE, probs, "high"
+            )
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _RampClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 600.0, 400.0)
+    h = _make_open_hand(forward_z=-0.25)
+
+    # Idle -> rising pinch -> tap click -> return to idle
+    seq = [
+        (0.0, 0.05, 0.0),
+        (33.0, 0.50, 0.005),   # arms lock once
+        (66.0, 0.85, 0.010),   # enters pose (locked)
+        (99.0, 0.90, 0.015),   # active pose (locked)
+        (132.0, 0.10, 0.020),  # release 1
+        (165.0, 0.05, 0.025),  # release 2 -> tap fires
+    ]
+    clicked = False
+    for ts, prob, dx in seq:
+        clf.p = prob
+        shifted = [Landmark(p.x + dx, p.y, p.z) for p in h]
+        o = eng.process_frame([HandInput("Right", shifted, shifted)], ts, 1920.0, 1080.0)[0]
+        if o.pose.is_clicking:
+            clicked = True
+    assert clicked is True
+    assert eng.dwell_lock_activations == 1
+
+
+def test_dwell_lock_cooldown_enforced():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["click_dwell_lock_ms"] = 120.0
+    cfg["cursor"]["click_dwell_lock_cooldown_ms"] = 400.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _StepClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _StepClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    h = _make_open_hand(forward_z=-0.25)
+
+    # Attempt 1: arm at t=100ms, let it expire at t=220ms -> cooldown active until 620ms
+    for ts, prob in [(0.0, 0.05), (100.0, 0.55), (230.0, 0.50)]:
+        clf.p = prob
+        eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)
+    assert eng.dwell_lock_activations == 1
+    assert eng.dwell_unlock_without_click == 1
+
+    # Drop below 0.20 at t=260ms, then try re-arming at t=300ms (inside 400ms cooldown) -> MUST NOT arm
+    for ts, prob in [(260.0, 0.05), (300.0, 0.55)]:
+        clf.p = prob
+        eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)
+    assert eng.dwell_lock_activations == 1
+
+    # Drop below 0.20 at t=640ms (after 620ms cooldown) and rise cleanly at t=680ms -> MUST arm again!
+    for ts, prob in [(640.0, 0.05), (680.0, 0.55)]:
+        clf.p = prob
+        eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)
+    assert eng.dwell_lock_activations == 2

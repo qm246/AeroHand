@@ -660,6 +660,7 @@ class AeroHandRuntime:
             v["timing"] = self.get_snapshot().timing
             v["classifier"] = self.classifier_telemetry()
             v["dictation"] = self.dictation.status_dict()
+            v["engine"] = self.engine.engine_telemetry()
             return v
 
         def _set_tracking(enabled: bool) -> bool:

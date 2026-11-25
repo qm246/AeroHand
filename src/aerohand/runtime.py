@@ -224,6 +224,7 @@ class AeroHandRuntime:
         self.dictation = VoiceDictationController(
             config.get("dictation"),
             on_text_ready=self._on_dictation_text,
+            on_discard=self._on_dictation_discard,
         )
         self.vitals_mon = SystemVitalsMonitor()
         col_cfg = config.get("collector") or {}
@@ -332,6 +333,9 @@ class AeroHandRuntime:
         if text:
             self._last_action_text = f"Dictated: {text[:36]}"
             self.input_ctl.paste_text_utf8(text)
+
+    def _on_dictation_discard(self, reason: str, _ev: Dict[str, Any]) -> None:
+        self._last_action_text = f"Dictation discarded ({reason})"
 
     def _on_classifier_error(self) -> None:
         self._force_release_held_inputs("Classifier inference error")
@@ -655,6 +659,7 @@ class AeroHandRuntime:
             v = self.vitals_mon.read(force=True).to_dict()
             v["timing"] = self.get_snapshot().timing
             v["classifier"] = self.classifier_telemetry()
+            v["dictation"] = self.dictation.status_dict()
             return v
 
         def _set_tracking(enabled: bool) -> bool:
@@ -1030,7 +1035,17 @@ class AeroHandRuntime:
         elif p.dictation_just_started:
             self.audio.play_wheel_tick()
             self._practice["dictation"] = True
-            self.dictation.start()
+            pose_key = p.active_pose or p.pose
+            self.dictation.start(
+                trigger_meta={
+                    "source": "gesture",
+                    "hand": primary.hand,
+                    "pose": pose_key.value,
+                    "pose_prob": float(p.pose_probabilities.get(pose_key, 0.0)),
+                    "dir_z": float(c.pointing_dir_z),
+                    "palm_size": float(c.palm_size),
+                }
+            )
             self._last_action_text = "Dictation listening..."
         elif p.dictation_just_ended:
             self.audio.play_click_up()

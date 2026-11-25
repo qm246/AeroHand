@@ -297,20 +297,31 @@
       hintEl.classList.remove("visible");
     }
 
-    // 4. Dictation live waveform pill
+    // 4. Dictation live waveform pill (or brief discard toast)
     const dictEl = document.getElementById("dict-toast");
+    const dictBars = document.getElementById("dict-bars");
     const d = snap.dictation || {};
     if (d.recording || d.transcribing) {
       const txt = d.recording
         ? ((i18n.hints && i18n.hints.dictation) || "Listening...") + ` (${d.language || "vi-VN"})`
         : (lang === "en" ? "Transcribing speech..." : "Đang chuyển giọng nói thành văn bản...");
       document.getElementById("dict-text").textContent = txt;
+      if (dictBars) dictBars.style.display = "flex";
       const lvl = Math.max(0.15, Math.min(1, d.audio_level || 0.2));
-      const bars = document.getElementById("dict-bars").children;
+      const bars = dictBars.children;
       const mults = [0.6, 1.0, 0.85, 0.5];
       for (let i = 0; i < bars.length; i++) {
         bars[i].style.height = Math.round(4 + 12 * lvl * mults[i]) + "px";
       }
+      dictEl.classList.add("visible");
+    } else if (d.discard_active && d.last_discard_reason) {
+      const notices = (i18n && i18n.dictation_notices) || {};
+      const reasonKey = d.last_discard_reason === "two_hand_zoom"
+        ? "cancelled_zoom"
+        : ("discarded_" + d.last_discard_reason);
+      const fallbackTxt = lang === "en" ? "Discarded (too short / silent)" : "Đã bỏ (quá ngắn / không có tiếng)";
+      document.getElementById("dict-text").textContent = notices[reasonKey] || fallbackTxt;
+      if (dictBars) dictBars.style.display = "none";
       dictEl.classList.add("visible");
     } else {
       dictEl.classList.remove("visible");

@@ -1032,6 +1032,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
             or (snap.window_tile_preview is not None)
             or bool(snap.dictation.get("recording"))
             or bool(snap.dictation.get("transcribing"))
+            or bool(snap.dictation.get("discard_active"))
             or (snap.active_hint is not None)
             or (snap.warning is not None)
         )

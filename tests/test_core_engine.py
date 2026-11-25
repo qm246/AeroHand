@@ -2049,3 +2049,123 @@ def test_dictation_cancel_discards_audio():
     assert ctrl.is_recording is False
     assert ctrl._chunks == []
     assert pasted == []
+
+
+def test_dictation_discards_short_recording(monkeypatch):
+    from aerohand.platform import dictation as dict_mod
+    from aerohand.platform.dictation import VoiceDictationController
+
+    called = {"recognize": 0}
+    pasted: List[str] = []
+    monkeypatch.setattr(
+        dict_mod, "_transcribe_apple_speech", lambda *_a, **_kw: (called.__setitem__("recognize", called["recognize"] + 1) or "hello")
+    )
+    monkeypatch.setattr(
+        dict_mod, "_transcribe_mlx_whisper", lambda *_a, **_kw: (called.__setitem__("recognize", called["recognize"] + 1) or "hello")
+    )
+
+    ctrl = VoiceDictationController(
+        {"enabled": True, "min_duration_s": 0.6, "min_rms": 0.01, "min_voiced_ms": 250},
+        on_text_ready=lambda t: pasted.append(t),
+    )
+    # 0.30s loud audio -> shorter than 0.6s -> MUST discard without calling recognizer or pasting
+    ctrl._recording = True
+    ctrl._chunks = [np.ones(int(16000 * 0.30), dtype=np.float32) * 0.25]
+    ctrl.stop_and_transcribe(sync=True)
+
+    assert called["recognize"] == 0
+    assert pasted == []
+    st = ctrl.status_dict()
+    assert st["last_discard_reason"] == "too_short"
+    assert st["stats"]["discarded"] == 1
+    assert st["discard_active"] is True
+
+
+def test_dictation_discards_silent_recording(monkeypatch):
+    from aerohand.platform import dictation as dict_mod
+    from aerohand.platform.dictation import VoiceDictationController
+
+    called = {"recognize": 0}
+    pasted: List[str] = []
+    monkeypatch.setattr(
+        dict_mod, "_transcribe_apple_speech", lambda *_a, **_kw: (called.__setitem__("recognize", called["recognize"] + 1) or "hello")
+    )
+
+    ctrl = VoiceDictationController(
+        {"enabled": True, "min_duration_s": 0.6, "min_rms": 0.01, "min_voiced_ms": 250},
+        on_text_ready=lambda t: pasted.append(t),
+    )
+    # 1.2s near-silence (rms=0.001 < 0.01) -> MUST discard as silent
+    ctrl._recording = True
+    ctrl._chunks = [np.ones(int(16000 * 1.2), dtype=np.float32) * 0.001]
+    ctrl.stop_and_transcribe(sync=True)
+
+    assert called["recognize"] == 0
+    assert pasted == []
+    assert ctrl.status_dict()["last_discard_reason"] == "silent"
+
+    # Also test brief single click spike (100ms loud, 1.1s silent -> voiced_ms=100 < 250) -> MUST discard as silent
+    spike = np.zeros(int(16000 * 1.2), dtype=np.float32)
+    spike[: int(16000 * 0.10)] = 0.2
+    ctrl._recording = True
+    ctrl._chunks = [spike]
+    ctrl.stop_and_transcribe(sync=True)
+    assert called["recognize"] == 0
+    assert ctrl.status_dict()["last_discard_reason"] == "silent"
+
+
+def test_dictation_blocklist_drops_hallucination(monkeypatch):
+    from aerohand.platform import dictation as dict_mod
+    from aerohand.platform.dictation import VoiceDictationController
+
+    pasted: List[str] = []
+    monkeypatch.setattr(
+        dict_mod,
+        "_transcribe_mlx_whisper",
+        lambda *_a, **_kw: "  Cảm ơn các bạn đã theo dõi và hẹn gặp lại!  ",
+    )
+
+    ctrl = VoiceDictationController(
+        {
+            "enabled": True,
+            "engine": "mlx_whisper",
+            "language": "vi-VN",
+            "min_duration_s": 0.6,
+            "min_rms": 0.01,
+            "min_voiced_ms": 250,
+        },
+        on_text_ready=lambda t: pasted.append(t),
+    )
+    # 1.0s voiced audio passes VAD, then recognizer returns known Whisper silence hallucination -> dropped!
+    t = np.linspace(0.0, 1.0, 16000, dtype=np.float32)
+    voiced = 0.15 * np.sin(2.0 * math.pi * 440.0 * t)
+    ctrl._recording = True
+    ctrl._chunks = [voiced]
+    ctrl.stop_and_transcribe(sync=True)
+
+    assert pasted == []
+    st = ctrl.status_dict()
+    assert st["last_discard_reason"] == "hallucination"
+    assert st["stats"]["committed"] == 0
+
+    # Genuine Vietnamese phrase passes blocklist and pastes cleanly
+    monkeypatch.setattr(dict_mod, "_transcribe_mlx_whisper", lambda *_a, **_kw: "Xin chào AeroHand")
+    ctrl._recording = True
+    ctrl._chunks = [voiced]
+    ctrl.stop_and_transcribe(sync=True)
+    assert pasted == ["Xin chào AeroHand"]
+    assert ctrl.status_dict()["stats"]["committed"] == 1
+
+
+def test_dictation_event_ring_buffer_capped_at_50():
+    from aerohand.platform.dictation import VoiceDictationController
+
+    ctrl = VoiceDictationController({"enabled": True, "min_duration_s": 0.6})
+    for i in range(75):
+        ctrl._recording = True
+        ctrl._chunks = [np.zeros(1600, dtype=np.float32)]  # 0.1s -> discarded
+        ctrl.stop_and_transcribe(sync=True)
+
+    evs = ctrl.recent_events()
+    assert len(evs) == 50
+    assert ctrl.status_dict()["stats"]["discarded"] == 75

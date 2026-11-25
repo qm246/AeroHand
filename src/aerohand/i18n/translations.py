@@ -146,6 +146,11 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "on_device_ok": "✓ Apple Speech On-Device sẵn sàng 100% cục bộ (không gửi âm thanh ra ngoài).",
             "fallback_mlx_whisper": "ℹ Apple Speech On-Device chưa hỗ trợ ngôn ngữ này — đang tự động dùng mlx_whisper cục bộ.",
             "on_device_unavailable": "⚠ Apple Speech On-Device chưa có cho ngôn ngữ này & chưa cài mlx_whisper. Hãy tải gói giọng nói Offline trong Cài đặt macOS hoặc cài `mlx-whisper`.",
+            "discarded_too_short": "Đã bỏ (quá ngắn / không có tiếng)",
+            "discarded_silent": "Đã bỏ (quá ngắn / không có tiếng)",
+            "discarded_hallucination": "Đã chặn chữ ảo từ đoạn im lặng",
+            "cancelled_zoom": "Đã hủy ghi âm (đang phóng to 2 tay)",
+            "recent_events_title": "Nhật ký kích hoạt Giọng nói (50 sự kiện gần nhất)",
         },
         "collector": {
             "guided_start": "🎬 Quay theo kịch bản hướng dẫn",
@@ -302,6 +307,11 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "on_device_ok": "✓ Apple Speech On-Device ready 100% locally (no audio leaves your Mac).",
             "fallback_mlx_whisper": "ℹ On-device Apple Speech unavailable for this locale — automatically using local mlx_whisper fallback.",
             "on_device_unavailable": "⚠ On-device Apple Speech unavailable for this locale and mlx_whisper is not installed. Download offline dictation in macOS Settings or install `mlx-whisper`.",
+            "discarded_too_short": "Discarded (too short / silent)",
+            "discarded_silent": "Discarded (too short / silent)",
+            "discarded_hallucination": "Blocked silence hallucination transcript",
+            "cancelled_zoom": "Dictation cancelled (two-hand zoom)",
+            "recent_events_title": "Recent Dictation Trigger Telemetry (Last 50)",
         },
         "collector": {
             "guided_start": "🎬 Start Guided Recording",

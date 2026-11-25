@@ -291,6 +291,23 @@ dictation:
   language: "vi-VN"                    # "vi-VN" | "en-US"
   paste_mode: "clipboard"              # UTF-8 safe clipboard paste & restore (no Telex corruption)
   max_duration_s: 30.0
+  min_duration_s: 0.6                  # Discard accidental clips shorter than 0.6s
+  min_rms: 0.01                        # Discard silent clips with peak frame RMS < 0.01
+  min_voiced_ms: 250                   # Require >= 250 ms of voiced frames above min_rms
+  hallucination_blocklist:             # Common local Whisper silence hallucinations (exact normalized match)
+    vi-VN:
+      - "hãy subscribe cho kênh ghiền mì gõ để không bỏ lỡ những video hấp dẫn"
+      - "cảm ơn các bạn đã theo dõi và hẹn gặp lại"
+      - "cảm ơn đã xem video"
+      - "đăng ký kênh"
+      - "nhớ đăng ký kênh nhé"
+      - "phụ đề bởi"
+    en-US:
+      - "thank you for watching"
+      - "thanks for watching"
+      - "please subscribe"
+      - "subtitles by"
+      - "you"
 
 audio:
   enabled: true

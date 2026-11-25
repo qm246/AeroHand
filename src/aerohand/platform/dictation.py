@@ -13,18 +13,120 @@ Supports:
 from __future__ import annotations
 
 import logging
+import re
 import tempfile
 import threading
 import time
 import wave
+from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 
 logger = logging.getLogger(__name__)
 
 SAMPLE_RATE = 16000
+
+DEFAULT_HALLUCINATION_BLOCKLIST: Dict[str, List[str]] = {
+    "vi-VN": [
+        "hãy subscribe cho kênh ghiền mì gõ để không bỏ lỡ những video hấp dẫn",
+        "cảm ơn các bạn đã theo dõi và hẹn gặp lại",
+        "cảm ơn đã xem video",
+        "đăng ký kênh",
+        "nhớ đăng ký kênh nhé",
+        "phụ đề bởi",
+    ],
+    "en-US": [
+        "thank you for watching",
+        "thanks for watching",
+        "please subscribe",
+        "subtitles by",
+        "you",
+    ],
+}
+
+_PUNCT_STRIP_RE = re.compile(r"^[\s\.,!?;:\"'`~…\-–—()\[\]]+|[\s\.,!?;:\"'`~…\-–—()\[\]]+$")
+_WS_COLLAPSE_RE = re.compile(r"\s+")
+
+
+def normalize_transcript_for_blocklist(text: str) -> str:
+    """Normalize a recognized transcript for exact-phrase hallucination blocklist matching."""
+    cleaned = _WS_COLLAPSE_RE.sub(" ", str(text or "").strip().lower())
+    return _PUNCT_STRIP_RE.sub("", cleaned).strip()
+
+
+def is_hallucinated_transcript(
+    text: str,
+    language: str,
+    blocklist: Optional[Dict[str, List[str]]] = None,
+) -> bool:
+    """Return True if the entire normalized transcript matches a known silence-hallucination phrase."""
+    norm = normalize_transcript_for_blocklist(text)
+    if not norm:
+        return True
+    bl = blocklist if blocklist is not None else DEFAULT_HALLUCINATION_BLOCKLIST
+    candidates: List[str] = []
+    if language in bl and isinstance(bl[language], list):
+        candidates.extend(bl[language])
+    lang_prefix = (language or "").split("-")[0].lower()
+    if lang_prefix:
+        for k, vals in bl.items():
+            if k != language and k.split("-")[0].lower() == lang_prefix and isinstance(vals, list):
+                candidates.extend(vals)
+    for phrase in candidates:
+        if normalize_transcript_for_blocklist(phrase) == norm:
+            return True
+    return False
+
+
+def evaluate_audio_vad(
+    audio: np.ndarray,
+    *,
+    sample_rate: int = SAMPLE_RATE,
+    min_duration_s: float = 0.6,
+    min_rms: float = 0.01,
+    min_voiced_ms: float = 250.0,
+    frame_ms: float = 20.0,
+) -> Tuple[bool, str, Dict[str, float]]:
+    """
+    Pure energy-based speech VAD gate (V031-02).
+    Returns `(accepted, reason, metrics)` where reason is `"ok"`, `"too_short"`, or `"silent"`.
+    """
+    arr = np.asarray(audio, dtype=np.float32).reshape(-1)
+    sr = max(1, int(sample_rate))
+    duration_s = float(arr.size) / float(sr)
+    if arr.size == 0:
+        return False, "too_short", {"duration_s": 0.0, "overall_rms": 0.0, "peak_rms": 0.0, "voiced_ms": 0.0}
+
+    overall_rms = float(np.sqrt(np.mean(arr * arr)))
+    frame_len = max(1, int(round(sr * (frame_ms / 1000.0))))
+    n_full = arr.size // frame_len
+    peak_rms = 0.0
+    voiced_ms = 0.0
+    if n_full > 0:
+        frames = arr[: n_full * frame_len].reshape(n_full, frame_len)
+        frame_rms = np.sqrt(np.mean(frames * frames, axis=1))
+        peak_rms = float(np.max(frame_rms))
+        voiced_ms = float(np.sum(frame_rms >= min_rms)) * frame_ms
+    rem = arr[n_full * frame_len :]
+    if rem.size >= max(1, frame_len // 2):
+        rem_rms = float(np.sqrt(np.mean(rem * rem)))
+        peak_rms = max(peak_rms, rem_rms)
+        if rem_rms >= min_rms:
+            voiced_ms += (float(rem.size) / float(sr)) * 1000.0
+
+    metrics = {
+        "duration_s": round(duration_s, 3),
+        "overall_rms": round(overall_rms, 5),
+        "peak_rms": round(peak_rms, 5),
+        "voiced_ms": round(voiced_ms, 1),
+    }
+    if duration_s < float(min_duration_s):
+        return False, "too_short", metrics
+    if peak_rms < float(min_rms) or voiced_ms < float(min_voiced_ms):
+        return False, "silent", metrics
+    return True, "ok", metrics
 
 
 def _write_pcm16_wav(path: Path, audio_f32: np.ndarray, sr: int = SAMPLE_RATE) -> None:
@@ -171,8 +273,10 @@ class VoiceDictationController:
         cfg: Optional[Dict[str, Any]] = None,
         *,
         on_text_ready: Optional[Callable[[str], None]] = None,
+        on_discard: Optional[Callable[[str, Dict[str, Any]], None]] = None,
     ) -> None:
         self._on_text_ready = on_text_ready
+        self._on_discard = on_discard
         self._lock = threading.Lock()
         self._recording: bool = False
         self._transcribing: bool = False
@@ -185,6 +289,12 @@ class VoiceDictationController:
         self._on_device_info: Dict[str, Any] = {}
         self._notice_code: str = "on_device_ok"
         self._active_backend: str = "apple_speech"
+        self._events: Deque[Dict[str, Any]] = deque(maxlen=50)
+        self._stats: Dict[str, int] = {"started": 0, "committed": 0, "discarded": 0, "cancelled": 0}
+        self._current_trigger_meta: Dict[str, Any] = {}
+        self._last_discard_reason: Optional[str] = None
+        self._last_discard_seq: int = 0
+        self._last_discard_wall: float = 0.0
         self.update_config(cfg)
 
     def update_config(self, cfg: Optional[Dict[str, Any]]) -> None:
@@ -192,8 +302,22 @@ class VoiceDictationController:
         self.enabled: bool = bool(c.get("enabled", True))
         self.engine: str = str(c.get("engine", "auto")).lower()
         self.language: str = str(c.get("language", "vi-VN"))
-        self.max_duration_s: float = float(c.get("max_duration_s", 30.0))
+        self.max_duration_s: float = max(2.0, float(c.get("max_duration_s", 30.0)))
+        self.min_duration_s: float = max(0.1, min(10.0, float(c.get("min_duration_s", 0.6))))
+        self.min_rms: float = max(0.0005, min(0.5, float(c.get("min_rms", 0.01))))
+        self.min_voiced_ms: float = max(50.0, min(5000.0, float(c.get("min_voiced_ms", 250.0))))
+        bl = c.get("hallucination_blocklist")
+        if isinstance(bl, dict):
+            self.hallucination_blocklist: Dict[str, List[str]] = {
+                str(k): [str(x) for x in v] for k, v in bl.items() if isinstance(v, list)
+            }
+        else:
+            self.hallucination_blocklist = {k: list(v) for k, v in DEFAULT_HALLUCINATION_BLOCKLIST.items()}
         self._refresh_on_device_status()
+
+    def _record_event(self, event: Dict[str, Any]) -> None:
+        with self._lock:
+            self._events.append(event)
 
     def _refresh_on_device_status(self) -> None:
         info = check_apple_speech_on_device(self.language)
@@ -219,7 +343,15 @@ class VoiceDictationController:
     def is_transcribing(self) -> bool:
         return self._transcribing
 
+    def recent_events(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._events)
+
     def status_dict(self) -> Dict[str, Any]:
+        discard_active = (
+            self._last_discard_reason is not None
+            and (time.monotonic() - self._last_discard_wall) < 2.8
+        )
         return {
             "enabled": self.enabled,
             "recording": self._recording,
@@ -233,17 +365,26 @@ class VoiceDictationController:
             "notice_code": self._notice_code,
             "last_transcript": self._last_transcript,
             "last_error": self._last_error,
+            "last_discard_reason": self._last_discard_reason,
+            "last_discard_seq": self._last_discard_seq,
+            "discard_active": discard_active,
+            "stats": dict(self._stats),
+            "recent_events": self.recent_events(),
         }
 
-    def start(self) -> bool:
+    def start(self, trigger_meta: Optional[Dict[str, Any]] = None) -> bool:
         if not self.enabled:
             return False
+        meta = dict(trigger_meta or {})
         with self._lock:
             if self._recording:
                 return True
             self._chunks = []
             self._audio_level = 0.0
             self._last_error = None
+            self._current_trigger_meta = meta
+            # Initialize wall timestamp BEFORE stream.start() so audio callback never sees stale 0.0
+            self._started_wall = time.monotonic()
             try:
                 import sounddevice as sd
 
@@ -264,19 +405,36 @@ class VoiceDictationController:
                 stream.start()
                 self._stream = stream
                 self._recording = True
-                self._started_wall = time.monotonic()
-                logger.info(f"[DICTATION] Recording started ({self.language})")
+                self._stats["started"] += 1
+                ev = {
+                    "ts": round(time.time(), 2),
+                    "event": "start",
+                    "language": self.language,
+                    "source": str(meta.get("source", "gesture")),
+                    "hand": meta.get("hand"),
+                    "pose": meta.get("pose"),
+                    "pose_prob": round(float(meta.get("pose_prob", 0.0)), 3),
+                    "dir_z": round(float(meta.get("dir_z", 0.0)), 3),
+                    "palm_size": round(float(meta.get("palm_size", 0.0)), 4),
+                }
+                self._events.append(ev)
+                logger.info(
+                    f"[DICTATION] start lang={self.language} src={ev['source']} "
+                    f"hand={ev['hand']} pose={ev['pose']} prob={ev['pose_prob']:.2f} "
+                    f"dir_z={ev['dir_z']:+.2f} palm={ev['palm_size']:.3f}"
+                )
                 return True
             except Exception as exc:
                 self._last_error = str(exc)
                 logger.warning(f"[DICTATION] Failed to start microphone stream: {exc}")
                 return False
 
-    def toggle(self) -> bool:
+    def toggle(self, trigger_meta: Optional[Dict[str, Any]] = None) -> bool:
         if self._recording:
             self.stop_and_transcribe()
             return False
-        return self.start()
+        meta = dict(trigger_meta or {"source": "toggle"})
+        return self.start(trigger_meta=meta)
 
     def cancel(self, reason: str = "cancelled") -> bool:
         """Stop microphone stream immediately and DISCARD audio (no transcription, no paste)."""
@@ -287,6 +445,24 @@ class VoiceDictationController:
             stream = self._stream
             self._stream = None
             self._chunks = []
+            dur = round(max(0.0, time.monotonic() - self._started_wall), 3) if self._started_wall > 0 else 0.0
+            meta = dict(self._current_trigger_meta)
+            self._current_trigger_meta = {}
+            if was_recording:
+                self._stats["cancelled"] += 1
+                self._last_discard_reason = reason
+                self._last_discard_seq += 1
+                self._last_discard_wall = time.monotonic()
+                self._events.append(
+                    {
+                        "ts": round(time.time(), 2),
+                        "event": "cancelled",
+                        "reason": reason,
+                        "duration_s": dur,
+                        "source": meta.get("source", "gesture"),
+                        "hand": meta.get("hand"),
+                    }
+                )
         if stream is not None:
             try:
                 stream.stop()
@@ -294,10 +470,36 @@ class VoiceDictationController:
             except Exception:
                 pass
         if was_recording:
-            logger.info(f"[DICTATION] Recording cancelled ({reason}); audio discarded.")
+            logger.info(f"[DICTATION] cancelled reason={reason} duration_s={dur:.2f}")
         return was_recording
 
-    def stop_and_transcribe(self) -> None:
+    def _emit_discard(self, reason: str, metrics: Dict[str, Any], meta: Dict[str, Any]) -> None:
+        ev = {
+            "ts": round(time.time(), 2),
+            "event": "discarded",
+            "reason": reason,
+            "language": self.language,
+            "source": meta.get("source", "gesture"),
+            "hand": meta.get("hand"),
+            **metrics,
+        }
+        with self._lock:
+            self._stats["discarded"] += 1
+            self._last_discard_reason = reason
+            self._last_discard_seq += 1
+            self._last_discard_wall = time.monotonic()
+            self._events.append(ev)
+        logger.info(
+            f"[DICTATION] discarded reason={reason} dur={metrics.get('duration_s', 0.0):.2f}s "
+            f"peak_rms={metrics.get('peak_rms', 0.0):.4f} voiced_ms={metrics.get('voiced_ms', 0.0):.0f}"
+        )
+        if self._on_discard is not None:
+            try:
+                self._on_discard(reason, ev)
+            except Exception:
+                pass
+
+    def stop_and_transcribe(self, *, sync: bool = False) -> None:
         with self._lock:
             if not self._recording:
                 return
@@ -307,6 +509,8 @@ class VoiceDictationController:
             self._stream = None
             chunks = list(self._chunks)
             self._chunks = []
+            meta = dict(self._current_trigger_meta)
+            self._current_trigger_meta = {}
 
         if stream is not None:
             try:
@@ -316,22 +520,46 @@ class VoiceDictationController:
                 pass
 
         if not chunks:
+            self._emit_discard(
+                "too_short",
+                {"duration_s": 0.0, "overall_rms": 0.0, "peak_rms": 0.0, "voiced_ms": 0.0},
+                meta,
+            )
             return
+
         audio = np.concatenate(chunks, axis=0)
-        # Skip ultra-short or silent accidental pinches (< 0.35s or below speech noise floor)
-        if audio.size < int(SAMPLE_RATE * 0.35):
-            return
-        peak = float(np.max(np.abs(audio)))
-        rms = float(np.sqrt(np.mean(audio * audio)))
-        if peak < 0.015 or rms < 0.003:
-            logger.debug(f"[DICTATION] Skipped silent clip (peak={peak:.4f}, rms={rms:.4f})")
+        ok, reason, metrics = evaluate_audio_vad(
+            audio,
+            sample_rate=SAMPLE_RATE,
+            min_duration_s=self.min_duration_s,
+            min_rms=self.min_rms,
+            min_voiced_ms=self.min_voiced_ms,
+        )
+        if not ok:
+            self._emit_discard(reason, metrics, meta)
             return
 
-        threading.Thread(target=self._run_transcription, args=(audio,), daemon=True).start()
+        if sync:
+            self._run_transcription(audio, metrics=metrics, meta=meta)
+        else:
+            threading.Thread(
+                target=self._run_transcription,
+                args=(audio,),
+                kwargs={"metrics": metrics, "meta": meta},
+                daemon=True,
+            ).start()
 
-    def _run_transcription(self, audio: np.ndarray) -> None:
+    def _run_transcription(
+        self,
+        audio: np.ndarray,
+        *,
+        metrics: Optional[Dict[str, float]] = None,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._transcribing = True
         tmp_path: Optional[Path] = None
+        m = dict(metrics or {})
+        tr_meta = dict(meta or {})
         try:
             with tempfile.NamedTemporaryFile(suffix=".wav", prefix="aerohand_dict_", delete=False) as tf:
                 tmp_path = Path(tf.name)
@@ -362,14 +590,45 @@ class VoiceDictationController:
                         self._notice_code = "on_device_unavailable"
                         raise exc_sp
 
-            if text:
-                self._last_transcript = text
-                self._last_error = None
-                logger.info(f"[DICTATION] Transcribed ({self.language}): {text!r}")
-                if self._on_text_ready is not None:
-                    self._on_text_ready(text)
+            if not text or not text.strip():
+                self._emit_discard("silent", m, tr_meta)
+                return
+
+            if is_hallucinated_transcript(text, self.language, self.hallucination_blocklist):
+                self._emit_discard("hallucination", {**m, "blocked_text": text[:64]}, tr_meta)
+                return
+
+            self._last_transcript = text
+            self._last_error = None
+            with self._lock:
+                self._stats["committed"] += 1
+                self._events.append(
+                    {
+                        "ts": round(time.time(), 2),
+                        "event": "committed",
+                        "language": self.language,
+                        "backend": self._active_backend,
+                        "chars": len(text),
+                        "source": tr_meta.get("source", "gesture"),
+                        **m,
+                    }
+                )
+            logger.info(
+                f"[DICTATION] committed lang={self.language} backend={self._active_backend} "
+                f"chars={len(text)} dur={m.get('duration_s', 0.0):.2f}s"
+            )
+            if self._on_text_ready is not None:
+                self._on_text_ready(text)
         except Exception as exc:
             self._last_error = str(exc)
+            self._record_event(
+                {
+                    "ts": round(time.time(), 2),
+                    "event": "error",
+                    "error": str(exc)[:120],
+                    "language": self.language,
+                }
+            )
             logger.warning(f"[DICTATION] Transcription failed: {exc}")
         finally:
             self._transcribing = False

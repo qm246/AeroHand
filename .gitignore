@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+*.app/
+
+# Local user data & recordings (privacy: never commit personal recordings or trained weights by accident)
+recordings/
+data/
+runs/
+*.onnx
+*.pt
+*.pth
+!models/.gitkeep
+
+# Local config overrides & secrets
+config/user_overrides.yaml
+.env
+.env.*

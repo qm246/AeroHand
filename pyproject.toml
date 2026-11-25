@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aerohand"
+version = "0.1.0"
+description = "Low-latency, touchless macOS hand controller combining Airpoint ergonomics with GestureCtl native safety"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.11"
+authors = [{ name = "Minh" }]
+keywords = ["macos", "hand-tracking", "gesture-control", "mediapipe", "onnx", "touchless"]
+dependencies = [
+    "mediapipe>=0.10.21",
+    "opencv-contrib-python>=4.10.0",
+    "numpy>=2.0.0",
+    "PyYAML>=6.0.2",
+    "pyobjc-core>=11.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=11.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=11.0; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+ml = [
+    "onnxruntime>=1.20.0",
+]
+train = [
+    "torch>=2.5.0",
+    "onnx>=1.17.0",
+    "onnxruntime>=1.20.0",
+    "scikit-learn>=1.5.0",
+]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.8.0",
+]
+
+[project.scripts]
+aerohand = "aerohand.__main__:main"
+
+[tool.setuptools.package-dir]
+"" = "src"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 115
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]

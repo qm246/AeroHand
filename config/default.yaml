@@ -1,0 +1,176 @@
+# AeroHand — Default Configuration
+# User customizations should live in `config/user_overrides.yaml` (override-only merge).
+
+camera:
+  index: 0
+  width: 640
+  height: 480
+  fps_cap: 60
+  mirror: true
+
+tracker:
+  model_path: "models/hand_landmarker.task"
+  delegate: "GPU"                    # Auto-falls back to CPU if GPU delegate is unavailable
+  num_hands: 1                       # Single-hand default (set 2 only if benchmarking dual-hand)
+  min_hand_detection_confidence: 0.55
+  min_hand_presence_confidence: 0.55
+  min_tracking_confidence: 0.55
+
+hand:
+  cursor_hand: "Right"               # "Right" | "Left" | "Both"
+  click_hand: "Right"                # "Right" | "Left" | "Both"
+
+smoothing:
+  enable_landmark_smoothing: true
+  landmark_min_cutoff: 2.0           # Fast Stage-1 OneEuro (Airpoint default)
+  landmark_beta: 45.0                # Low lag during rapid finger movement
+  landmark_d_cutoff: 1.0
+  landmark_exclude_joints: []        # Optional landmark indices to bypass smoothing
+  gap_reset_ms: 100.0                # Reset filters on camera hiccup >= 100ms
+
+cursor:
+  enable_filter: true
+  filter_min_cutoff: 1.0             # Stage-2 OneEuro on cursor output
+  filter_beta: 0.01
+  filter_d_cutoff: 1.0
+  pointer_sensitivity: 2.2           # Relative gain multiplier
+  pointer_acceleration: 1.4          # Speed-adaptive acceleration boost
+  enable_distance_compensation: true
+  reference_palm_size: 0.10          # Normalized wrist->middle_mcp reference
+  max_jump_ratio: 0.15               # Reject single-frame jump > 15% screen width
+  enable_lerp_60hz: true             # Interpolate 30Hz webcam to smooth 60Hz cursor
+  lerp_speed: 55.0
+  lerp_rate_hz: 60.0
+  deadzone_px: 0.35                  # Micro-jitter floor
+  reacquire_skip_frames: 2           # Ignore first 2 frames after hand reappears
+  enable_pointing_gate: true
+  pointing_forward_z_threshold: -0.15 # (LM8 - LM0).z / len must point toward screen
+  pointing_gate_hysteresis: 0.04     # Exit threshold = threshold + hysteresis (-0.11)
+
+classifier:
+  backend: "heuristic_3d"            # "heuristic_3d" (zero-setup MVP) | "onnx_tcn" (self-trained)
+  onnx_model_path: null              # Path to self-trained causal TCN .onnx
+  onnx_normalizer_path: null         # Path to JSON {"mean": [...], "scale": [...]}
+  sequence_length: 5
+  heuristic_3d:
+    # Normalized 3D distances in palm-width units (LM5-LM17 = 1.0)
+    pinch_on_dist: 0.34              # Strong contact distance (~1.0 probability)
+    pinch_off_dist: 0.62             # Clearly open distance (~0.0 probability)
+    pinky_base_on_dist: 0.42         # Thumb tip (LM4) to pinky MCP (LM17)
+    pinky_base_off_dist: 0.72
+    dual_pinch_on_dist: 0.38         # Both index (LM8) & middle (LM12) near thumb (LM4)
+    dual_pinch_off_dist: 0.65
+    min_margin: 0.08                 # Winner must beat runner-up by margin to suppress ambiguity
+    require_pointing_gate_for_actions: true
+
+pose_state_machine:
+  pose_hold_threshold_ms: 180
+  pose_hold_motion_threshold_px: 15.0
+  click_debounce_ms: 200
+  enable_click_debounce: true
+  enable_click_hold: false           # Drag uses dedicated thumb_index_middle_pinch
+  double_click_window_ms: 350
+  thresholds:
+    thumb_index_pinch:
+      enter_threshold: 0.65
+      exit_threshold: 0.30
+      enter_frames: 2
+      exit_frames: 2
+    thumb_middle_pinch:
+      enter_threshold: 0.75
+      exit_threshold: 0.25
+      enter_frames: 2
+      exit_frames: 2
+    thumb_ring_pinch:
+      enter_threshold: 0.75
+      exit_threshold: 0.45
+      enter_frames: 2
+      exit_frames: 5
+    thumb_index_middle_pinch:
+      enter_threshold: 0.75
+      exit_threshold: 0.45
+      enter_frames: 2
+      exit_frames: 4
+    thumb_pinky_pinch:
+      enter_threshold: 0.75
+      exit_threshold: 0.30
+      enter_frames: 2
+      exit_frames: 2
+    thumb_pinky_base:
+      enter_threshold: 0.75
+      exit_threshold: 0.30
+      enter_frames: 2
+      exit_frames: 2
+  tap_actions:
+    thumb_middle_pinch: "left_click"
+  hold_actions:
+    thumb_ring_pinch: "scroll"       # Still (< 15px) on release -> right_click; move -> scroll
+    thumb_index_middle_pinch: "drag"
+    thumb_pinky_pinch: "window_tile"
+    thumb_pinky_base: "spaces_nav"
+
+scroll:
+  enabled: true
+  speed: 1.0
+  deadzone: 1.0
+  enable_axis_lock: true
+  axis_lock_distance: 15.0
+  axis_lock_ratio: 2.0
+  breakout_threshold: 8.0
+  inertia_friction: 0.95
+  min_inertia_speed: 5.0
+  natural_scrolling: true
+  use_phases: true
+
+spaces_nav:
+  enabled: true
+  lock_threshold_px: 8.0
+  sensitivity_px: 20.0
+  invert: true                       # Natural direction (swipe left -> next space right)
+  cooldown_ms: 450
+
+window_tile:
+  enabled: true
+  lock_threshold_px: 8.0
+  sensitivity_px: 20.0
+  cooldown_ms: 450
+
+palm_wheel:
+  enabled: true
+  activation_hold_ms: 200
+  press_down_threshold: 0.95         # Distance / cylinder_radius (< 1.0 = inside cylinder)
+  press_up_threshold: 1.10
+  cylinder_radius_multiplier: 0.50   # R = 0.5 * palm_length
+  palm_facing_dot_threshold: 0.50
+  palm_facing_dot_hysteresis: 0.05
+  open_palm_grace_ms: 100
+  confirmation_hold_ms: 200
+  cooldown_ms: 350
+  slots:
+    thumb: "toggle_pause"
+    index: "mission_control"
+    middle: "recenter"
+    ring: "spotlight"
+    pinky: "media_play_pause"
+
+audio:
+  enabled: true
+  volume: 0.45
+  click_down_sound: "Tink"           # Native macOS system sound fallback if no .wav
+  click_up_sound: "Pop"
+
+runtime:
+  idle_throttle_enabled: true
+  idle_timeout_s: 3.0
+  idle_fps: 8.0
+  max_drag_duration_ms: 20000
+  hand_lost_release_ms: 350
+
+typing_guard:
+  enabled: true
+  source: "counter"                  # Zero Input Monitoring permission required!
+  own_post_margin_ms: 50
+  keyboard_ms: 1500
+  mouse_ms: 1000
+  keyboard_blocks: ["pointer", "click", "drag", "scroll", "swipe", "window_tile"]
+  mouse_blocks: ["pointer", "click", "drag", "scroll"]

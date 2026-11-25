@@ -625,6 +625,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
             <button class="btn" id="btn-col-undo" onclick="post('collector_undo',{seconds:5})">↩ Hủy 5 giây vừa quay</button>
             <button class="btn" onclick="post('collector_save')" id="btn-col-save">💾 Lưu JSON</button>
+            <button class="btn" onclick="post('collector_save',{allow_low_quality:true})" id="btn-col-save-anyway" style="display:none">⚠ Vẫn lưu (bỏ Strict)</button>
             <button class="btn" onclick="post('mark_not_intended')" id="btn-not-intended-ml">🚫 Không phải tôi muốn</button>
             <button class="btn danger" onclick="post('collector_clear')" id="btn-col-clear">🗑 Xóa tạm</button>
           </div>
@@ -1319,14 +1320,25 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
 
       const qBan = document.getElementById("col-quality-banner");
       const q = col.quality || {};
+      const cp = col.cleaned_preview || {};
       const blocked = col.last_save_blocked_warnings || [];
+      const saveAnywayBtn = document.getElementById("btn-col-save-anyway");
+      if (saveAnywayBtn) {
+        saveAnywayBtn.style.display = blocked.length ? "inline-flex" : "none";
+        saveAnywayBtn.textContent = colI18n.save_anyway || "⚠ Save anyway (strict off)";
+      }
       if (qBan) {
         if (blocked.length) {
           qBan.style.color = "var(--rose)";
           qBan.textContent = (colI18n.save_blocked || "⛔ Save blocked: ") + blocked.map(w => colI18n["warn_" + w] || w).join(" • ");
         } else if (col.total > 0 && q.warnings && q.warnings.length) {
           qBan.style.color = "var(--amber)";
-          qBan.textContent = q.warnings.map(w => colI18n["warn_" + w] || w).join(" • ");
+          const cleanNote = (colI18n.clean_summary || "Clean mode: keeping {kept}/{total} • dropped {dropped} • {segs} segs")
+            .replace("{kept}", String(cp.kept_count ?? col.total))
+            .replace("{total}", String(col.total))
+            .replace("{dropped}", String(cp.dropped_total ?? 0))
+            .replace("{segs}", String(cp.segments_count ?? 1));
+          qBan.textContent = q.warnings.map(w => colI18n["warn_" + w] || w).join(" • ") + " | " + cleanNote;
         } else if (col.total > 0) {
           qBan.style.color = "var(--green)";
           qBan.textContent = (colI18n.quality_ok || "OK") + ` (conf=${q.mean_confidence || 1.0})`;

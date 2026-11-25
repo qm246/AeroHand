@@ -44,6 +44,7 @@ from aerohand.ml.collector import (
     FrameRingBuffer,
     PinchDataCollector,
     QualityGateError,
+    clean_recording_samples,
     compute_corpus_condition_matrix,
 )
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
@@ -248,6 +249,7 @@ class AeroHandRuntime:
             trim_edge_ms=float(col_cfg.get("trim_edge_ms", 300.0)),
             countdown_s=float(col_cfg.get("countdown_s", 3.0)),
             step_duration_s=float(col_cfg.get("step_duration_s", 5.0)),
+            quality_gate_mode=str(col_cfg.get("quality_gate_mode", "clean")),
         )
         self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
@@ -515,12 +517,17 @@ class AeroHandRuntime:
         return self._cached_saved_sessions
 
     def collector_toggle_recording(self) -> Dict[str, Any]:
-        self.collector.toggle_recording()
+        active = self.collector.toggle_recording()
+        if not active:
+            self.collector.autosave_draft(self.collect_dir)
         self._refresh_saved_sessions_cache()
         return self.collector_status()
 
     def collector_set_recording(self, active: bool) -> Dict[str, Any]:
+        was_rec = self.collector.is_recording
         self.collector.set_recording(active)
+        if was_rec and not active:
+            self.collector.autosave_draft(self.collect_dir)
         return self.collector_status()
 
     def collector_set_pose(self, pose_name: str) -> Dict[str, Any]:
@@ -545,6 +552,7 @@ class AeroHandRuntime:
 
     def collector_stop_guided(self) -> Dict[str, Any]:
         self.collector.stop_guided()
+        self.collector.autosave_draft(self.collect_dir)
         return self.collector_status()
 
     def collector_save(self, *, allow_low_quality: bool = False) -> Dict[str, Any]:
@@ -614,6 +622,7 @@ class AeroHandRuntime:
                 "Left": base["Left"] + cur_l,
                 "target": COLLECTOR_CLASS_TARGETS[pk]["total"],
             }
+        _, clean_preview = clean_recording_samples(self.collector._samples)
         return {
             "recording": self.collector.is_recording,
             "current_pose": self.collector.current_pose.value,
@@ -624,6 +633,9 @@ class AeroHandRuntime:
             "session_meta": self.collector.session_meta,
             "guided": self.collector.guided_status(),
             "quality": self.collector.evaluate_quality(),
+            "quality_gate_mode": self.collector.quality_gate_mode,
+            "cleaned_preview": clean_preview,
+            "draft_path": str(self.collector._last_draft_path) if self.collector._last_draft_path else None,
             "record_hand": self.collector_record_hand,
             "sessions_dir": str(self.collect_dir),
             "negatives_dir": str(self.negatives_dir),
@@ -685,6 +697,11 @@ class AeroHandRuntime:
 
     def stop(self) -> None:
         self._stop_event.set()
+        if sum(self.collector.counts().values()) > 0 or self.collector._segment_buf:
+            try:
+                self.collector.autosave_draft(self.collect_dir)
+            except Exception:
+                pass
         if self._api_server is not None:
             self._api_server.stop()
             self._api_server = None

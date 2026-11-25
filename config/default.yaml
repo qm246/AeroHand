@@ -127,6 +127,7 @@ classifier:
 
 collector:
   record_hand: "primary"               # "primary" | "both"
+  quality_gate_mode: "clean"           # "clean" (drop bad frames, split gaps, always save) | "strict"
   trim_edge_ms: 300                    # Trim first/last 300 ms of guided recording segments
   countdown_s: 3.0                     # Pre-step countdown for guided protocol
   step_duration_s: 5.0                 # Default capture duration per guided step

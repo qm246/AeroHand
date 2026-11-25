@@ -223,6 +223,80 @@ def trim_segment_edges(samples: Sequence[Dict[str, Any]], trim_ms: float = 300.0
     return [s for s in samples if lo <= float(s.get("timestamp_ms", 0)) <= hi]
 
 
+def clean_recording_samples(
+    samples: Sequence[Dict[str, Any]],
+    *,
+    min_confidence: float = 0.58,
+    max_gap_ms: float = 100.0,
+    edge_margin: float = 0.03,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Annotate & clean a recorded session instead of discarding it (V041-01):
+      - Drops frames with `confidence < min_confidence`.
+      - Drops frames with hand landmarks clipped within `edge_margin` of frame borders.
+      - Splits samples into separate `segment_id`s whenever a same-hand timestamp gap > `max_gap_ms`.
+    """
+    cleaned: List[Dict[str, Any]] = []
+    dropped_low_conf = 0
+    dropped_edge = 0
+    gap_splits = 0
+    last_ts_by_hand: Dict[str, int] = {}
+    seg_id_by_hand: Dict[str, int] = {}
+    next_seg_id = 0
+    cleaned_counts: Dict[str, int] = {p.value: 0 for p in ALL_POSE_NAMES}
+
+    for raw in samples:
+        if not isinstance(raw, dict):
+            continue
+        conf = float(raw.get("confidence", 1.0))
+        if conf < min_confidence:
+            dropped_low_conf += 1
+            continue
+        lms = raw.get("landmarks_2d") or []
+        if len(lms) >= 63:
+            xs = lms[0:63:3]
+            ys = lms[1:63:3]
+            if (
+                min(xs) < edge_margin
+                or max(xs) > (1.0 - edge_margin)
+                or min(ys) < edge_margin
+                or max(ys) > (1.0 - edge_margin)
+            ):
+                dropped_edge += 1
+                continue
+
+        hid = str(raw.get("hand_id") or raw.get("handedness") or "Right")
+        ts = int(raw.get("timestamp_ms", 0))
+        if hid not in seg_id_by_hand:
+            seg_id_by_hand[hid] = next_seg_id
+            next_seg_id += 1
+        elif hid in last_ts_by_hand and ((ts - last_ts_by_hand[hid]) > max_gap_ms or ts < last_ts_by_hand[hid]):
+            gap_splits += 1
+            seg_id_by_hand[hid] = next_seg_id
+            next_seg_id += 1
+        last_ts_by_hand[hid] = ts
+
+        item = dict(raw)
+        item["segment_id"] = seg_id_by_hand[hid]
+        cleaned.append(item)
+        pname = str(item.get("label_name", ""))
+        if pname in cleaned_counts:
+            cleaned_counts[pname] += 1
+
+    unique_segments = len({s["segment_id"] for s in cleaned}) if cleaned else 0
+    report = {
+        "input_count": len(samples),
+        "kept_count": len(cleaned),
+        "dropped_low_confidence": dropped_low_conf,
+        "dropped_edge_clipped": dropped_edge,
+        "dropped_total": dropped_low_conf + dropped_edge,
+        "gap_splits": gap_splits,
+        "segments_count": unique_segments,
+        "cleaned_counts": cleaned_counts,
+    }
+    return cleaned, report
+
+
 class PinchDataCollector:
     """Interactive & guided landmarks-only session recorder with metadata, trimming, undo & quality gate."""
 
@@ -233,6 +307,7 @@ class PinchDataCollector:
         trim_edge_ms: float = 300.0,
         countdown_s: float = 3.0,
         step_duration_s: float = 5.0,
+        quality_gate_mode: str = "clean",
     ) -> None:
         self._samples: List[Dict[str, Any]] = []
         self._segment_buf: List[Dict[str, Any]] = []
@@ -242,6 +317,10 @@ class PinchDataCollector:
         self._trim_edge_ms: float = max(0.0, float(trim_edge_ms))
         self._countdown_s: float = max(0.5, float(countdown_s))
         self._step_duration_s: float = max(1.0, float(step_duration_s))
+        mode = str(quality_gate_mode or "clean").strip().lower()
+        self.quality_gate_mode: str = mode if mode in ("clean", "strict") else "clean"
+        self._draft_id: str = time.strftime("%Y%m%d_%H%M%S")
+        self._last_draft_path: Optional[Path] = None
 
         self._session_meta: Dict[str, Any] = {
             "subject": "user",
@@ -293,7 +372,46 @@ class PinchDataCollector:
         self._samples.clear()
         self._segment_buf.clear()
         self._started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._draft_id = time.strftime("%Y%m%d_%H%M%S")
+        self.clear_draft()
         self.stop_guided()
+
+    def clear_draft(self) -> None:
+        if self._last_draft_path is not None:
+            try:
+                self._last_draft_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._last_draft_path = None
+
+    def autosave_draft(self, sessions_dir: str | Path) -> Optional[Path]:
+        """Persist unsaved samples to `<sessions_dir>/_drafts/` so sessions are never lost."""
+        all_samples = list(self._samples) + list(self._segment_buf)
+        if not all_samples:
+            return None
+        drafts_dir = Path(sessions_dir) / "_drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        meta = dict(self._session_meta)
+        meta["subject"] = str(meta.get("subject") or "").strip() or "user"
+        meta["condition_id"] = compute_condition_id(meta)
+        draft_fp = drafts_dir / f"draft_{_slugify(meta['subject'], 'user')}_{self._draft_id}.json"
+        cleaned, clean_report = clean_recording_samples(all_samples)
+        payload = {
+            "schema": "aerohand_pinch_v2",
+            "schema_version": 2,
+            "is_draft": True,
+            "collected_at": self._started_at_iso,
+            "session_meta": meta,
+            "quality_report": clean_report,
+            "total_samples": len(cleaned),
+            "counts": clean_report["cleaned_counts"],
+            "samples": cleaned,
+        }
+        tmp_fp = draft_fp.with_suffix(".json.tmp")
+        tmp_fp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_fp.replace(draft_fp)
+        self._last_draft_path = draft_fp
+        return draft_fp
 
     def undo_last(self, seconds: float = 5.0) -> int:
         """Remove samples recorded within the last `seconds` of the latest timestamp."""
@@ -495,10 +613,33 @@ class PinchDataCollector:
             "gap_count": gap_count,
         }
 
-    def save(self, out_dir: str | Path, *, allow_low_quality: bool = False) -> Path:
-        quality = self.evaluate_quality()
-        if not allow_low_quality and not quality["ok"]:
-            raise QualityGateError(quality["warnings"], quality)
+    def save(
+        self,
+        out_dir: str | Path,
+        *,
+        allow_low_quality: bool = False,
+        quality_gate_mode: Optional[str] = None,
+    ) -> Path:
+        raw_quality = self.evaluate_quality()
+        eff_mode = str(quality_gate_mode or self.quality_gate_mode or "clean").strip().lower()
+        if eff_mode == "strict" and (not allow_low_quality) and (not raw_quality["ok"]):
+            raise QualityGateError(raw_quality["warnings"], raw_quality)
+
+        if eff_mode == "clean":
+            saved_samples, clean_report = clean_recording_samples(self._samples)
+            quality_report = {**raw_quality, **clean_report, "mode": "clean"}
+        else:
+            saved_samples = [dict(s) for s in self._samples]
+            quality_report = {
+                **raw_quality,
+                "mode": "strict",
+                "kept_count": len(saved_samples),
+                "dropped_low_confidence": 0,
+                "dropped_edge_clipped": 0,
+                "dropped_total": 0,
+                "gap_splits": raw_quality.get("gap_count", 0),
+                "segments_count": 1 if saved_samples else 0,
+            }
 
         meta = dict(self._session_meta)
         meta["subject"] = str(meta.get("subject") or "").strip() or "user"
@@ -513,18 +654,29 @@ class PinchDataCollector:
         dist = _slugify(meta.get("distance", "mid"), "mid")
         light = _slugify(meta.get("lighting", "bright"), "bright")
         out_fp = out_root / f"aerohand_pinch_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}.json"
+
+        saved_counts = {p.value: 0 for p in ALL_POSE_NAMES}
+        saved_by_hand = {p.value: {"Right": 0, "Left": 0} for p in ALL_POSE_NAMES}
+        for s in saved_samples:
+            pname = str(s.get("label_name", ""))
+            if pname in saved_counts:
+                saved_counts[pname] += 1
+                h = "Left" if s.get("handedness") == "Left" else "Right"
+                saved_by_hand[pname][h] += 1
+
         payload = {
             "schema": "aerohand_pinch_v2",
             "schema_version": 2,
             "collected_at": self._started_at_iso,
             "session_meta": meta,
-            "quality_report": quality,
-            "total_samples": len(self._samples),
-            "counts": self.counts(),
-            "counts_by_hand": self.counts_by_hand(),
-            "samples": self._samples,
+            "quality_report": quality_report,
+            "total_samples": len(saved_samples),
+            "counts": saved_counts,
+            "counts_by_hand": saved_by_hand,
+            "samples": saved_samples,
         }
         out_fp.write_text(json.dumps(payload), encoding="utf-8")
+        self.clear_draft()
         return out_fp
 
 

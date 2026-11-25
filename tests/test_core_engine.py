@@ -1266,6 +1266,7 @@ def test_adaptive_lerp_speed_monotonic():
 
 
 def test_override_save_is_debounced():
+    pytest.importorskip("AppKit")
     import time
 
     from aerohand.ui.app import DebouncedConfigPersister, detect_hotkey_conflicts, parse_hotkey_spec
@@ -1290,6 +1291,7 @@ def test_override_save_is_debounced():
 
 
 def test_ui_tick_payload_excludes_static_i18n():
+    pytest.importorskip("AppKit")
     from aerohand.i18n import get_lang_pack
     from aerohand.ui.app import OverlayPayloadBuilder
 
@@ -1878,6 +1880,7 @@ def test_buffers_cleared_on_hand_loss(tmp_path: Path, monkeypatch):
 
 
 def test_overlay_hydration_reset_and_screen_signature():
+    pytest.importorskip("AppKit")
     from aerohand.i18n import get_lang_pack
     from aerohand.ui.app import OverlayPayloadBuilder, screen_frames_signature
 
@@ -2748,7 +2751,10 @@ def test_save_blocked_by_quality_gate(tmp_path: Path):
     from aerohand.ml.collector import QualityGateError
     from aerohand.runtime import AeroHandRuntime
 
-    col = PinchDataCollector(session_meta={"subject": "minh", "wrist_angle": "0", "distance": "mid", "lighting": "dim"})
+    col = PinchDataCollector(
+        session_meta={"subject": "minh", "wrist_angle": "0", "distance": "mid", "lighting": "dim"},
+        quality_gate_mode="strict",
+    )
     col.set_pose(PoseName.THUMB_RING_PINCH)
     col.set_recording(True)
     h = _make_open_hand()
@@ -2756,7 +2762,7 @@ def test_save_blocked_by_quality_gate(tmp_path: Path):
     col.add_frame(clipped, h, "Right", 0.40, 1000)
     col.add_frame(h, h, "Right", 0.45, 1300)  # gap > 100ms, low confidence, clipped
 
-    # Default save MUST block and raise QualityGateError (subclass of ValueError)
+    # Strict mode save MUST block and raise QualityGateError (subclass of ValueError)
     with pytest.raises(QualityGateError) as exc_info:
         col.save(tmp_path)
     assert "low_confidence" in exc_info.value.warnings
@@ -2767,6 +2773,7 @@ def test_save_blocked_by_quality_gate(tmp_path: Path):
     # Runtime wrapper catches cleanly without crashing and reports saved=False + blocked_warnings
     cfg = load_config()
     cfg["audio"]["enabled"] = False
+    cfg["collector"]["quality_gate_mode"] = "strict"
     rt = AeroHandRuntime(cfg, dry_run=True, collect_dir=tmp_path)
     rt.collector = col
     st = rt.collector_save()
@@ -2910,3 +2917,116 @@ def test_calibration_includes_loose_pinch_step():
     assert wiz.suggestion is not None
     assert SAFE_PINCH_ON_BOUNDS[0] <= wiz.suggestion["pinch_on_dist"] <= SAFE_PINCH_ON_BOUNDS[1]
     assert SAFE_PINCH_OFF_BOUNDS[0] <= wiz.suggestion["pinch_off_dist"] <= SAFE_PINCH_OFF_BOUNDS[1]
+
+
+def test_quality_gate_clean_mode_saves_session_with_gaps(tmp_path: Path):
+    import json
+
+    col = PinchDataCollector(session_meta={"subject": "minh", "wrist_angle": "0", "distance": "mid", "lighting": "bright"})
+    assert col.quality_gate_mode == "clean"
+    col.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+    col.set_recording(True)
+    h = _make_open_hand()
+    clipped = [Landmark(0.01 if i == 0 else p.x, p.y, p.z) for i, p in enumerate(h)]
+
+    # Segment 0: 10 clean frames + 1 low-conf + 1 clipped edge
+    for i in range(10):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    col.add_frame(h, h, "Right", 0.40, 1330)       # dropped low confidence
+    col.add_frame(clipped, h, "Right", 0.95, 1363) # dropped clipped edge
+    # Gap of 200ms (>100ms) -> Segment 1: 10 clean frames
+    for i in range(10):
+        col.add_frame(h, h, "Right", 0.94, 1563 + i * 33)
+
+    fp = col.save(tmp_path)
+    assert fp.is_file()
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    qr = data["quality_report"]
+    assert qr["mode"] == "clean"
+    assert qr["kept_count"] == 20
+    assert qr["dropped_low_confidence"] == 1
+    assert qr["dropped_edge_clipped"] == 1
+    assert qr["segments_count"] == 2
+
+
+def test_session_split_at_time_gaps():
+    from aerohand.ml.collector import clean_recording_samples
+
+    h = _make_open_hand()
+    flat = [c for lm in h for c in (lm.x, lm.y, lm.z)]
+    raw = [
+        {"timestamp_ms": 1000, "label_name": "idle", "handedness": "Right", "confidence": 0.95, "landmarks_2d": flat},
+        {"timestamp_ms": 1033, "label_name": "idle", "handedness": "Right", "confidence": 0.95, "landmarks_2d": flat},
+        {"timestamp_ms": 1200, "label_name": "idle", "handedness": "Right", "confidence": 0.95, "landmarks_2d": flat},
+        {"timestamp_ms": 1233, "label_name": "idle", "handedness": "Right", "confidence": 0.95, "landmarks_2d": flat},
+    ]
+    cleaned, rep = clean_recording_samples(raw)
+    assert rep["gap_splits"] == 1
+    assert rep["segments_count"] == 2
+    assert [s["segment_id"] for s in cleaned] == [0, 0, 1, 1]
+
+
+def test_autosave_draft_written_on_stop(tmp_path: Path):
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=True, collect_dir=tmp_path)
+    h = _make_open_hand()
+    rt.collector_set_recording(True)
+    rt.collector.add_frame(h, h, "Right", 0.95, 1000)
+    rt.collector.add_frame(h, h, "Right", 0.95, 1033)
+    # Stopping recording MUST write a draft under _drafts/
+    rt.collector_set_recording(False)
+    drafts = list((tmp_path / "_drafts").glob("draft_*.json"))
+    assert len(drafts) == 1
+
+    # Saving formally MUST clean up the draft file
+    st = rt.collector_save()
+    assert st["saved"] is True
+    assert list((tmp_path / "_drafts").glob("draft_*.json")) == []
+
+
+def test_upper_bound_zero_events_is_three_over_t():
+    mod = _load_replay_eval_module("replay_eval_ucb")
+    # 24.62 minutes ~= 0.410333 hours -> 0 events gives ~2.9957 / 0.410333 ~= 7.30 FT/h (Rule of Three: 3/T)
+    t_h = 24.62 / 60.0
+    ucb = mod.poisson_upper_bound_rate(0, t_h, ci_level=0.95)
+    assert ucb == pytest.approx(3.0 / t_h, rel=0.01)
+    assert ucb > 7.0
+    # Over 1.5 hours, 0 events gives ~1.997 <= 2.0 FT/h
+    assert mod.poisson_upper_bound_rate(0, 1.5, ci_level=0.95) <= 2.0
+
+
+def test_replay_eval_fails_when_exposure_insufficient(tmp_path: Path):
+    from aerohand.ml.base import PinchPrediction
+
+    mod = _load_replay_eval_module("replay_eval_exp")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    for i in range(30):  # ~1 second of idle -> way below 1.5h exposure!
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    neg_fp = col.save(tmp_path)
+
+    class _AlwaysIdle:
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
+
+        def reset(self, hand=None):
+            pass
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        classifier=_AlwaysIdle(),
+        max_ft_per_hour=2.0,
+        min_exposure_hours_for_claim=1.5,
+    )
+    assert rep["false_triggers"]["total"] == 0
+    assert rep["false_triggers"]["exposure_sufficient"] is False
+    assert "insufficient exposure" in rep["false_triggers"]["exposure_notice"]
+    assert rep["passed"] is False

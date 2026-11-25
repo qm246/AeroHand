@@ -1013,7 +1013,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 self.runtime.collector_stop_guided()
         elif act == "collector_save":
             if self.runtime is not None:
-                self.runtime.collector_save()
+                self.runtime.collector_save(allow_low_quality=bool(msg.get("allow_low_quality", False)))
         elif act == "collector_clear":
             if self.runtime is not None:
                 self.runtime.collector_clear()

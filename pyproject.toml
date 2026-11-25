@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "aerohand"
-version = "0.1.0"
+version = "0.2.0"
 description = "Low-latency, touchless macOS hand controller combining Airpoint ergonomics with GestureCtl native safety"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -19,6 +19,12 @@ dependencies = [
     "pyobjc-core>=11.0; sys_platform == 'darwin'",
     "pyobjc-framework-Cocoa>=11.0; sys_platform == 'darwin'",
     "pyobjc-framework-Quartz>=11.0; sys_platform == 'darwin'",
+    "pyobjc-framework-webkit>=11.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-avfoundation>=11.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-applicationservices>=11.0 ; sys_platform == 'darwin'",
+    "pyobjc-framework-speech>=11.0 ; sys_platform == 'darwin'",
+    "psutil>=6.0.0",
+    "onnxruntime>=1.20.0",
 ]
 
 [project.optional-dependencies]

@@ -1,18 +1,63 @@
 """
-Override-only configuration loader and deep-merge utilities.
+Override-only configuration loader, dot-path accessors, presets, and Per-App Profiles.
 Adapted from Airpoint SDK's `config-core.ts` design (Apache-2.0):
   - `config/default.yaml` holds canonical defaults.
-  - Optional `config/user_overrides.yaml` (or CLI `--config`) stores ONLY user deltas.
-  - Defaults can evolve without breaking user customizations.
+  - `config/user_overrides.yaml` stores ONLY user deltas.
+  - Per-App Profiles under `profiles.apps.<bundle_id>` overlay cleanly on top of active config.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 import yaml
+
+# Friendly CLI / Airpoint aliases -> canonical AeroHand dotted keys
+SETTING_KEY_ALIASES: Dict[str, str] = {
+    "cursor.sensitivity": "cursor.pointer_sensitivity",
+    "cursor.acceleration": "cursor.pointer_acceleration",
+    "scroll.sensitivity": "scroll.speed",
+    "scroll.inertia": "scroll.enable_inertia",
+    "language": "ui.language",
+    "dictation.lang": "dictation.language",
+}
+
+GESTURE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "airpoint": {
+        "hand": {"gesture_preset": "airpoint"},
+        "pose_state_machine": {
+            "enable_click_hold": False,
+            "tap_actions": {
+                "thumb_middle_pinch": "left_click",
+            },
+            "hold_actions": {
+                "thumb_ring_pinch": "scroll",
+                "thumb_index_middle_pinch": "drag",
+                "thumb_index_pinch": "dictation",
+                "thumb_pinky_pinch": "window_tile",
+                "thumb_pinky_base": "spaces_nav",
+            },
+        },
+    },
+    "classic": {
+        "hand": {"gesture_preset": "classic"},
+        "pose_state_machine": {
+            "enable_click_hold": True,
+            "tap_actions": {
+                "thumb_index_pinch": "left_click",
+            },
+            "hold_actions": {
+                "thumb_index_pinch": "drag",
+                "thumb_middle_pinch": "dictation",
+                "thumb_ring_pinch": "scroll",
+                "thumb_pinky_pinch": "window_tile",
+                "thumb_pinky_base": "spaces_nav",
+            },
+        },
+    },
+}
 
 
 def repo_root() -> Path:
@@ -58,6 +103,70 @@ def extract_overrides(
         elif val != base_val:
             out[key] = deepcopy(val)
     return out
+
+
+def resolve_setting_key(key: str) -> str:
+    cleaned = key.strip()
+    return SETTING_KEY_ALIASES.get(cleaned, cleaned)
+
+
+def get_nested_key(cfg: Dict[str, Any], dotted_key: str) -> Tuple[bool, Any]:
+    """Read a dot-separated key from config. Returns `(found, value)`."""
+    resolved = resolve_setting_key(dotted_key)
+    cur: Any = cfg
+    for part in resolved.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+
+def set_nested_key(cfg: Dict[str, Any], dotted_key: str, value: Any) -> str:
+    """Set a dot-separated key inside `cfg` (creating intermediate dicts if needed)."""
+    resolved = resolve_setting_key(dotted_key)
+    parts = resolved.split(".")
+    cur: Dict[str, Any] = cfg
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+    return resolved
+
+
+def apply_gesture_preset(cfg: Dict[str, Any], preset_name: str) -> Dict[str, Any]:
+    """Apply `'airpoint'` or `'classic'` preset cleanly (replacing tap/hold maps)."""
+    preset = GESTURE_PRESETS.get(preset_name)
+    if preset is None:
+        return cfg
+    out = deepcopy(cfg)
+    out.setdefault("hand", {})["gesture_preset"] = preset_name
+    psm = out.setdefault("pose_state_machine", {})
+    p_psm = preset["pose_state_machine"]
+    psm["enable_click_hold"] = bool(p_psm["enable_click_hold"])
+    psm["tap_actions"] = deepcopy(p_psm["tap_actions"])
+    psm["hold_actions"] = deepcopy(p_psm["hold_actions"])
+    return out
+
+
+def resolve_profile_config(base_cfg: Dict[str, Any], bundle_id: Optional[str]) -> Dict[str, Any]:
+    """Overlay active frontmost-app profile settings on top of `base_cfg`."""
+    if not bundle_id:
+        return base_cfg
+    prof_root = base_cfg.get("profiles") or {}
+    if not prof_root.get("enabled", True):
+        return base_cfg
+    apps = prof_root.get("apps") or {}
+    app_ov = apps.get(bundle_id)
+    if not isinstance(app_ov, dict):
+        return base_cfg
+    filtered = {k: v for k, v in app_ov.items() if k != "name"}
+    if not filtered:
+        return base_cfg
+    return deep_merge(base_cfg, filtered)
 
 
 def load_config(

@@ -193,7 +193,7 @@ def write_info_plist(plist_path: Path) -> None:
 <plist version="1.0">
 <dict>
     <key>CFBundleDevelopmentRegion</key>
-    <string>en</string>
+    <string>vi</string>
     <key>CFBundleDisplayName</key>
     <string>AeroHand</string>
     <key>CFBundleExecutable</key>
@@ -209,15 +209,34 @@ def write_info_plist(plist_path: Path) -> None:
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.1.0</string>
+    <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>2</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleTypeRole</key>
+            <string>Editor</string>
+            <key>CFBundleURLName</key>
+            <string>com.qm246.aerohand</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>aerohand</string>
+            </array>
+        </dict>
+    </array>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>AeroHand cần quyền Trợ năng (Accessibility) để điều khiển con trỏ, cuộn và cửa sổ.</string>
     <key>NSCameraUsageDescription</key>
-    <string>AeroHand uses your local webcam strictly on-device for touchless hand tracking.</string>
+    <string>AeroHand sử dụng webcam cục bộ 100% trên thiết bị để nhận diện bàn tay không chạm.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>AeroHand cần quyền Microphone để ghi âm cho tính năng Đọc giọng nói thành văn bản.</string>
+    <key>NSSpeechRecognitionUsageDescription</key>
+    <string>AeroHand sử dụng Apple Speech trên thiết bị để chuyển giọng nói Tiếng Việt và Tiếng Anh thành văn bản.</string>
 </dict>
 </plist>
 """

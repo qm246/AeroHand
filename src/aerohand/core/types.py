@@ -1,10 +1,10 @@
-"""Core data types shared across AeroHand engine, ML classifiers, and macOS platform."""
+"""Core data types shared across AeroHand engine, ML classifiers, UI overlays, and macOS platform."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 
 class PoseName(str, Enum):
@@ -31,7 +31,7 @@ ALL_POSE_NAMES: Tuple[PoseName, ...] = (
 
 PoseProbabilities = Dict[PoseName, float]
 Handedness = Literal["Left", "Right"]
-SlideDirection = Optional[Literal["left", "right", "top", "bottom"]]
+SlideDirection = Optional[Literal["left", "right", "top", "bottom", "fill"]]
 
 
 def idle_probabilities() -> PoseProbabilities:
@@ -74,6 +74,56 @@ class PoseThresholds:
 
 
 @dataclass
+class PipelineTiming:
+    """Per-stage frame latency telemetry matching Airpoint's PipelineTiming."""
+
+    mediapipe_ms: float = 0.0
+    pre_filters_ms: float = 0.0
+    cursor_ms: float = 0.0
+    gesture_ms: float = 0.0
+    feature_extraction_ms: float = 0.0
+    gesture_ml_ms: float = 0.0
+    render_ms: float = 0.0
+    total_ms: float = 0.0
+    frame_budget_ms: float = 33.33
+    headroom_ms: float = 33.33
+    utilization_pct: float = 0.0
+
+    def to_dict(self) -> Dict[str, float]:
+        return {
+            "mediapipe_ms": round(self.mediapipe_ms, 2),
+            "pre_filters_ms": round(self.pre_filters_ms, 2),
+            "cursor_ms": round(self.cursor_ms, 2),
+            "gesture_ms": round(self.gesture_ms, 2),
+            "feature_extraction_ms": round(self.feature_extraction_ms, 2),
+            "gesture_ml_ms": round(self.gesture_ml_ms, 2),
+            "render_ms": round(self.render_ms, 2),
+            "total_ms": round(self.total_ms, 2),
+            "frame_budget_ms": round(self.frame_budget_ms, 2),
+            "headroom_ms": round(self.headroom_ms, 2),
+            "utilization_pct": round(self.utilization_pct, 1),
+        }
+
+
+@dataclass(frozen=True)
+class TrackingWarning:
+    """Smart environment/posture warning emitted for toast overlay."""
+
+    level: Literal["warning", "error"]
+    code: str
+
+
+@dataclass(frozen=True)
+class ZoomOutput:
+    """Two-hand pinch-to-zoom frame output."""
+
+    is_zooming: bool = False
+    delta: float = 0.0
+    step: int = 0
+    distance: float = 0.0
+
+
+@dataclass
 class HandInput:
     """Per-frame tracker hand payload consumed by HandCursorEngine."""
 
@@ -102,6 +152,7 @@ class CursorOutput:
     pointing_dir_z: float = 0.0
     is_valid: bool = False
     handedness_score: float = 1.0
+    palm_size: float = 0.0
 
 
 @dataclass
@@ -119,18 +170,28 @@ class PoseOutput:
     is_grabbing: bool = False
     grab_just_started: bool = False
     grab_just_ended: bool = False
+    is_dictating: bool = False
+    dictation_just_started: bool = False
+    dictation_just_ended: bool = False
     is_scrolling: bool = False
     is_scroll_inertia: bool = False
     scroll_dx: float = 0.0
     scroll_dy: float = 0.0
     is_window_tiling: bool = False
     window_tile_direction: SlideDirection = None
+    window_tile_preview_direction: SlideDirection = None
     is_spaces_nav: bool = False
     spaces_nav_direction: SlideDirection = None
+    spaces_nav_preview_direction: SlideDirection = None
     palm_wheel_state: str = "inactive"
     palm_wheel_action: Optional[str] = None
     palm_wheel_progress: float = 0.0
     palm_wheel_selected_finger: Optional[str] = None
+    palm_wheel_press_event: Optional[str] = None
+    palm_wheel_menu_path: List[str] = field(default_factory=list)
+    palm_wheel_menu_label: Optional[str] = None
+    palm_wheel_slots: List[Dict[str, Any]] = field(default_factory=list)
+    palm_wheel_finger_positions: Optional[Dict[str, Tuple[float, float]]] = None
     click_timestamp_ms: int = 0
 
 

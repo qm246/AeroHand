@@ -1,11 +1,15 @@
 """
-AeroHand Unified Runtime (CLI + Native macOS Background Worker):
-  - AVFoundation ThreadedCamera + 8 FPS Idle Throttle (GestureCtl)
-  - MediaPipe HandLandmarker with GPU Metal -> CPU auto-fallback (Airpoint)
-  - HandCursorEngine + pluggable Classifier (3D Heuristic MVP / self-trained ONNX TCN)
-  - 60 Hz CursorLerpInterpolator thread for silky cursor motion from 30 Hz webcam
-  - Zero-permission Session-Tap Typing Guard + Failsafe release_all()
-  - Thread-safe `RuntimeSnapshot` for the native macOS Control Center & Floating Camera HUD
+AeroHand Unified Runtime (v0.2.0 — Full Airpoint Stage 1–3 Parity + GestureCtl Safety):
+  - Multi-camera AVFoundation capture + luminance monitoring + 8 FPS Idle Throttle
+  - MediaPipe 2-Hand GPU Metal -> CPU auto-fallback
+  - HandCursorEngine: Dual OneEuro, 60 Hz Lerp, 3D Pointing Gate, Two-Hand Zoom,
+    Left & Right Palm Wheel with nested Submenus, Window Tile Ghost Preview, Momentum Scroll
+  - Native macOS AXUIElement Window Tiling + Session-Tap 0-Permission Typing Guard
+  - Local macOS Voice Dictation (Vietnamese `vi-VN` & English `en-US`)
+  - Per-App Dynamic Config Profiles (frontmost app bundle ID detection)
+  - Local HTTP Control API (`127.0.0.1:17420`) for CLI & Apple Shortcuts
+  - Built-in Interactive Data Collector Studio & Onboarding Practice Tracker
+  - Thread-safe `RuntimeSnapshot` + screen overlay event stream for WKWebView UI & Overlays
 """
 
 from __future__ import annotations
@@ -13,29 +17,41 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import cv2
 import numpy as np
 
+from aerohand import __version__
+from aerohand.config import (
+    repo_root,
+    resolve_profile_config,
+)
 from aerohand.core.engine import HandCursorEngine
 from aerohand.core.kinematics import CursorLerpInterpolator
-from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName, idle_probabilities
+from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.collector import PinchDataCollector
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import ONNXPinchClassifier
 from aerohand.platform.audio import AudioFeedback
-from aerohand.platform.camera import ThreadedCamera
+from aerohand.platform.camera import ThreadedCamera, list_cameras
+from aerohand.platform.control_api import LocalControlAPIServer
+from aerohand.platform.dictation import VoiceDictationController
 from aerohand.platform.input_macos import (
     MacOSInputController,
+    compute_tile_rect,
     get_current_cursor_position,
+    get_frontmost_app_bundle_id,
     get_main_display_bounds,
+    get_virtual_display_bounds,
 )
-from aerohand.platform.permissions import is_accessibility_trusted, verify_permissions
+from aerohand.platform.permissions import check_all_permissions, verify_permissions
 from aerohand.platform.tracker import MediaPipeHandTracker
+from aerohand.platform.vitals import SystemVitalsMonitor
 from aerohand.ui.overlay_renderer import render_camera_hud
 
 logger = logging.getLogger("aerohand.runtime")
@@ -43,7 +59,7 @@ logger = logging.getLogger("aerohand.runtime")
 
 @dataclass
 class RuntimeSnapshot:
-    """Thread-safe snapshot consumed by the native macOS UI on the main thread."""
+    """Thread-safe snapshot consumed by the native macOS UI, Screen Overlay, and Control API."""
 
     running: bool = False
     paused: bool = False
@@ -51,15 +67,36 @@ class RuntimeSnapshot:
     is_idle: bool = False
     fps: float = 0.0
     delegate: str = "CPU"
+    classifier_name: str = "Heuristic3DPinchClassifier"
     accessibility_ok: bool = True
+    permissions: Dict[str, bool] = field(default_factory=dict)
     guard_reason: str = ""
+    active_app: Optional[str] = None
     hand: Optional[str] = None
+    hands_count: int = 0
     is_pointing: bool = False
     dir_z: float = 0.0
+    cursor_x: float = 0.0
+    cursor_y: float = 0.0
     pose: str = "idle"
     active_pose: Optional[str] = None
+    is_scrolling: bool = False
+    is_grabbing: bool = False
+    is_zooming: bool = False
     palm_wheel_state: str = "inactive"
     palm_wheel_progress: float = 0.0
+    palm_wheels: List[Dict[str, Any]] = field(default_factory=list)
+    window_tile_preview: Optional[Dict[str, Any]] = None
+    spaces_nav_preview: Optional[str] = None
+    active_hint: Optional[str] = None
+    warning: Optional[Dict[str, str]] = None
+    dictation: Dict[str, Any] = field(default_factory=dict)
+    timing: Dict[str, float] = field(default_factory=dict)
+    vitals: Dict[str, Any] = field(default_factory=dict)
+    collector: Dict[str, Any] = field(default_factory=dict)
+    practice: Dict[str, bool] = field(default_factory=dict)
+    click_event_seq: int = 0
+    click_event: Optional[Dict[str, Any]] = None
     last_action: str = "Ready"
     probabilities: Dict[str, float] = field(
         default_factory=lambda: {p.value: (1.0 if p == PoseName.IDLE else 0.0) for p in ALL_POSE_NAMES}
@@ -75,17 +112,29 @@ def build_classifier(config: Dict[str, Any]) -> PinchClassifier:
         mpath = cls_cfg.get("onnx_model_path")
         npath = cls_cfg.get("onnx_normalizer_path")
         if mpath and npath:
-            return ONNXPinchClassifier(
-                model_path=mpath,
-                normalizer_path=npath,
-                sequence_length=int(cls_cfg.get("sequence_length", 5)),
-            )
-        logger.warning("[ML] onnx_tcn selected without model/normalizer paths; falling back to heuristic_3d.")
+            mp = Path(mpath)
+            np_ = Path(npath)
+            if not mp.is_file():
+                mp = repo_root() / mpath
+            if not np_.is_file():
+                np_ = repo_root() / npath
+            if mp.is_file() and np_.is_file():
+                try:
+                    return ONNXPinchClassifier(
+                        model_path=mp,
+                        normalizer_path=np_,
+                        sequence_length=int(cls_cfg.get("sequence_length", 5)),
+                        feature_set=str(cls_cfg.get("feature_set", "auto")),
+                    )
+                except Exception as exc:
+                    logger.warning(f"[ML] Failed loading ONNX TCN ({exc}); falling back to heuristic_3d.")
+            else:
+                logger.info("[ML] ONNX model not trained yet; using heuristic_3d until model is exported.")
     return Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
 
 
 class AeroHandRuntime:
-    """End-to-end live camera -> engine -> macOS Quartz runtime."""
+    """End-to-end live camera -> 2-hand engine -> macOS Quartz/AX/Dictation runtime."""
 
     def __init__(
         self,
@@ -96,17 +145,28 @@ class AeroHandRuntime:
         camera_index: Optional[int] = None,
         collect_dir: Optional[str | Path] = None,
         render_hud_frames: bool = False,
+        on_show_window: Optional[Callable[[], None]] = None,
+        on_toggle_camera_hud: Optional[Callable[[], None]] = None,
+        on_config_updated: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> None:
-        self.config = config
+        self.base_config: Dict[str, Any] = deepcopy(config)
+        self.config: Dict[str, Any] = deepcopy(config)
         self.dry_run = bool(dry_run)
         self.preview = bool(preview or (collect_dir is not None))
         self.render_hud_frames = bool(render_hud_frames or self.preview)
-        self.collect_dir = Path(collect_dir) if collect_dir else None
+        self.collect_dir = Path(collect_dir) if collect_dir else (repo_root() / "data" / "sessions")
+        self._cli_collect_mode = collect_dir is not None
+
+        self._on_show_window = on_show_window
+        self._on_toggle_camera_hud = on_toggle_camera_hud
+        self._on_config_updated = on_config_updated
 
         cam_cfg = config.get("camera") or {}
         self.camera_index = int(camera_index if camera_index is not None else cam_cfg.get("index", 0))
+        self.camera_device_id = str(cam_cfg.get("device_id", ""))
         self.cam_width = int(cam_cfg.get("width", 640))
         self.cam_height = int(cam_cfg.get("height", 480))
+        self.cam_aspect = str(cam_cfg.get("aspect_ratio", "4:3"))
         self.fps_cap = int(cam_cfg.get("fps_cap", 60))
         self.mirror = bool(cam_cfg.get("mirror", True))
 
@@ -128,9 +188,17 @@ class AeroHandRuntime:
         self.engine = HandCursorEngine(config, classifier=self.classifier)
         self.input_ctl = MacOSInputController(config.get("typing_guard"), dry_run=self.dry_run)
         self.audio = AudioFeedback(config.get("audio"))
-        self.collector: Optional[PinchDataCollector] = PinchDataCollector() if self.collect_dir else None
+        self.dictation = VoiceDictationController(
+            config.get("dictation"),
+            on_text_ready=self._on_dictation_text,
+        )
+        self.vitals_mon = SystemVitalsMonitor()
+        self.collector: PinchDataCollector = PinchDataCollector()
 
+        self._api_server: Optional[LocalControlAPIServer] = None
         self._stop_event = threading.Event()
+        self._restart_camera_event = threading.Event()
+        self._restart_tracker_event = threading.Event()
         self._bg_thread: Optional[threading.Thread] = None
         self._snapshot_lock = threading.Lock()
         self._snapshot = RuntimeSnapshot(dry_run=self.dry_run)
@@ -139,14 +207,30 @@ class AeroHandRuntime:
         self._drag_started_ms: Optional[float] = None
         self._last_hand_ms: float = 0.0
         self._hand_present_prev: bool = False
+        self._screen_ox: float = 0.0
+        self._screen_oy: float = 0.0
         self._screen_w: float = 1920.0
         self._screen_h: float = 1080.0
         self._scroll_acc_x: float = 0.0
         self._scroll_acc_y: float = 0.0
         self._last_action_text: str = "Ready"
+        self._active_bundle_id: Optional[str] = None
+        self._click_seq: int = 0
+        self._last_click_event: Optional[Dict[str, Any]] = None
+        self._practice: Dict[str, bool] = {
+            "move": False,
+            "click": False,
+            "right_click": False,
+            "drag": False,
+            "scroll": False,
+            "window_tile": False,
+            "spaces_nav": False,
+            "palm_wheel": False,
+        }
+        self._move_accum_px: float = 0.0
 
     # ------------------------------------------------------------------
-    # Live Controls (safe to call from macOS UI main thread)
+    # Live Controls (Thread-safe for WKWebView UI, Menu Bar & HTTP API)
     # ------------------------------------------------------------------
 
     @property
@@ -159,6 +243,7 @@ class AeroHandRuntime:
             with self._lerp_lock:
                 self._lerp_active = False
             self._drag_started_ms = None
+            self.dictation.stop_and_transcribe()
             self.input_ctl.release_all()
             self._last_action_text = "Paused"
         else:
@@ -172,7 +257,8 @@ class AeroHandRuntime:
         self._last_action_text = "Mode: Dry-Run" if self.dry_run else "Mode: Live Control"
 
     def trigger_recenter(self) -> None:
-        cx, cy = self._screen_w * 0.5, self._screen_h * 0.5
+        ox, oy, mw, mh = get_main_display_bounds()
+        cx, cy = ox + mw * 0.5, oy + mh * 0.5
         self.engine.recenter(self._screen_w, self._screen_h)
         with self._lerp_lock:
             self._lerp.reset((cx, cy))
@@ -180,51 +266,204 @@ class AeroHandRuntime:
             self.input_ctl.mouse_move(cx, cy)
         self._last_action_text = "Cursor recentered"
 
-    def apply_live_settings(self, config: Dict[str, Any]) -> None:
-        """Apply slider/checkbox tweaks in realtime without restarting the camera."""
-        self.config = config
-        cur = config.get("cursor") or {}
+    def toggle_dictation(self) -> bool:
+        active = self.dictation.toggle()
+        self._last_action_text = "Dictation ON" if active else "Dictation transcribing..."
+        return active
+
+    def _on_dictation_text(self, text: str) -> None:
+        if text:
+            self._last_action_text = f"Dictated: {text[:36]}"
+            self.input_ctl.paste_text_utf8(text)
+
+    def _emit_click_pulse(self, kind: str, x: float, y: float) -> None:
+        self._click_seq += 1
+        self._last_click_event = {"seq": self._click_seq, "kind": kind, "x": round(x, 1), "y": round(y, 1)}
+
+    def apply_live_settings(self, config: Dict[str, Any], *, from_profile: bool = False) -> None:
+        """Apply any config update in realtime; restarts camera/tracker only when hardware params change."""
+        if not from_profile:
+            self.base_config = deepcopy(config)
+        effective = (
+            config
+            if from_profile
+            else resolve_profile_config(self.base_config, self._active_bundle_id)
+        )
+        old_cam = self.config.get("camera") or {}
+        old_trk = self.config.get("tracker") or {}
+        old_cls = self.config.get("classifier") or {}
+        self.config = deepcopy(effective)
+
+        cur = effective.get("cursor") or {}
         self.enable_lerp_60hz = bool(cur.get("enable_lerp_60hz", True))
         self._lerp.lerp_speed = float(cur.get("lerp_speed", 55.0))
-        self.engine.enable_pointing_gate = bool(cur.get("enable_pointing_gate", True))
-        self.engine.pointing_forward_z_threshold = float(cur.get("pointing_forward_z_threshold", -0.15))
 
-        scr = config.get("scroll") or {}
-        pw = config.get("palm_wheel") or {}
-        for hs in self.engine._hands.values():
-            hs.kinematics.pointer_sensitivity = float(cur.get("pointer_sensitivity", 2.2))
-            hs.kinematics.pointer_acceleration = float(cur.get("pointer_acceleration", 1.4))
-            hs.scroll.speed = float(scr.get("speed", 1.0))
-            hs.scroll.inertia_friction = float(scr.get("inertia_friction", 0.95))
-            hs.scroll.min_inertia_speed = (
-                float(scr.get("min_inertia_speed", 5.0)) if scr.get("enable_inertia", True) else 1e9
-            )
-            hs.palm_wheel.enabled = bool(pw.get("enabled", True))
+        self.engine.update_config(effective)
 
-        tg = config.get("typing_guard") or {}
+        tg = effective.get("typing_guard") or {}
         self.input_ctl.typing_guard_enabled = bool(tg.get("enabled", True))
+        self.input_ctl.keyboard_guard_s = float(tg.get("keyboard_ms", 1500)) / 1000.0
+        self.input_ctl.mouse_guard_s = float(tg.get("mouse_ms", 1000)) / 1000.0
 
-        aud = config.get("audio") or {}
-        self.audio.enabled = bool(aud.get("enabled", True))
+        self.audio.update_config(effective.get("audio"))
+        self.dictation.update_config(effective.get("dictation"))
+
+        new_cam = effective.get("camera") or {}
+        cam_changed = (
+            str(new_cam.get("device_id", "")) != str(old_cam.get("device_id", ""))
+            or int(new_cam.get("index", 0)) != int(old_cam.get("index", 0))
+            or int(new_cam.get("width", 640)) != int(old_cam.get("width", 640))
+            or int(new_cam.get("height", 480)) != int(old_cam.get("height", 480))
+            or str(new_cam.get("aspect_ratio", "4:3")) != str(old_cam.get("aspect_ratio", "4:3"))
+            or bool(new_cam.get("mirror", True)) != bool(old_cam.get("mirror", True))
+        )
+        if cam_changed:
+            self.camera_device_id = str(new_cam.get("device_id", ""))
+            self.camera_index = int(new_cam.get("index", 0))
+            self.cam_width = int(new_cam.get("width", 640))
+            self.cam_height = int(new_cam.get("height", 480))
+            self.cam_aspect = str(new_cam.get("aspect_ratio", "4:3"))
+            self.mirror = bool(new_cam.get("mirror", True))
+            self._restart_camera_event.set()
+
+        new_trk = effective.get("tracker") or {}
+        if (
+            int(new_trk.get("num_hands", 2)) != int(old_trk.get("num_hands", 2))
+            or str(new_trk.get("delegate", "GPU")) != str(old_trk.get("delegate", "GPU"))
+        ):
+            self._restart_tracker_event.set()
+
+        new_cls = effective.get("classifier") or {}
+        if (
+            str(new_cls.get("backend", "heuristic_3d")) != str(old_cls.get("backend", "heuristic_3d"))
+            or str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
+        ):
+            self.classifier = build_classifier(effective)
+            self.engine.classifier = self.classifier
+
+    # ------------------------------------------------------------------
+    # Data Collector Studio Controls (callable from WKWebView UI)
+    # ------------------------------------------------------------------
+
+    def collector_toggle_recording(self) -> Dict[str, Any]:
+        self.collector.toggle_recording()
+        return self.collector_status()
+
+    def collector_set_pose(self, pose_name: str) -> Dict[str, Any]:
+        try:
+            self.collector.set_pose(PoseName(pose_name))
+        except ValueError:
+            pass
+        return self.collector_status()
+
+    def collector_save(self) -> Dict[str, Any]:
+        out = self.collector.save(self.collect_dir)
+        self._last_action_text = f"Saved dataset: {out.name}"
+        st = self.collector_status()
+        st["saved_path"] = str(out)
+        return st
+
+    def collector_clear(self) -> Dict[str, Any]:
+        self.collector.clear()
+        return self.collector_status()
+
+    def collector_status(self) -> Dict[str, Any]:
+        counts = self.collector.counts()
+        sessions = sorted(self.collect_dir.glob("*.json")) if self.collect_dir.is_dir() else []
+        return {
+            "recording": self.collector.is_recording,
+            "current_pose": self.collector.current_pose.value,
+            "counts": counts,
+            "total": sum(counts.values()),
+            "sessions_dir": str(self.collect_dir),
+            "saved_sessions": [fp.name for fp in sessions[-10:]],
+        }
+
+    def reset_practice(self) -> Dict[str, bool]:
+        for k in self._practice:
+            self._practice[k] = False
+        self._move_accum_px = 0.0
+        return dict(self._practice)
 
     def get_snapshot(self) -> RuntimeSnapshot:
         with self._snapshot_lock:
             return self._snapshot
 
+    def list_available_cameras(self) -> List[Dict[str, Any]]:
+        return [d.to_dict() for d in list_cameras()]
+
     def start_background(self) -> None:
         if self._bg_thread is not None and self._bg_thread.is_alive():
             return
         self._stop_event.clear()
-        self.preview = False  # Native AppKit displays frames on main thread; never call cv2.imshow in thread
+        self.preview = False
         self.render_hud_frames = True
+        self._start_api_if_enabled()
         self._bg_thread = threading.Thread(target=self._run_loop, name="AeroHandRuntime", daemon=True)
         self._bg_thread.start()
 
     def stop(self) -> None:
         self._stop_event.set()
+        if self._api_server is not None:
+            self._api_server.stop()
+            self._api_server = None
+        self.dictation.close()
         if self._bg_thread is not None and self._bg_thread.is_alive():
-            self._bg_thread.join(timeout=2.0)
+            self._bg_thread.join(timeout=2.5)
         self._bg_thread = None
+
+    def _start_api_if_enabled(self) -> None:
+        api_cfg = self.config.get("api") or {}
+        if not api_cfg.get("enabled", True):
+            return
+        if self._api_server is not None:
+            return
+
+        def _get_status() -> Dict[str, Any]:
+            s = self.get_snapshot()
+            return {
+                "ok": True,
+                "version": __version__,
+                "running": s.running,
+                "tracking": not s.paused,
+                "paused": s.paused,
+                "dry_run": s.dry_run,
+                "fps": round(s.fps, 1),
+                "delegate": s.delegate,
+                "active_app": s.active_app,
+                "hand": s.hand,
+                "pose": s.active_pose or s.pose,
+                "language": (self.base_config.get("ui") or {}).get("language", "vi"),
+                "dictation_active": bool(s.dictation.get("recording", False)),
+            }
+
+        def _get_vitals() -> Dict[str, Any]:
+            v = self.vitals_mon.read(force=True).to_dict()
+            v["timing"] = self.get_snapshot().timing
+            return v
+
+        def _set_tracking(enabled: bool) -> bool:
+            self.set_paused(not enabled)
+            return not self._paused
+
+        def _apply_from_api(new_cfg: Dict[str, Any]) -> None:
+            self.apply_live_settings(new_cfg)
+            if self._on_config_updated is not None:
+                self._on_config_updated(self.base_config)
+
+        self._api_server = LocalControlAPIServer(
+            host=str(api_cfg.get("host", "127.0.0.1")),
+            port=int(api_cfg.get("port", 17420)),
+            get_status=_get_status,
+            get_vitals=_get_vitals,
+            get_config=lambda: deepcopy(self.base_config),
+            apply_config=_apply_from_api,
+            set_tracking_enabled=_set_tracking,
+            trigger_recenter=self.trigger_recenter,
+            set_dry_run=self.set_dry_run,
+            show_window=self._on_show_window,
+        )
+        self._api_server.start()
 
     # ------------------------------------------------------------------
     # Internal loops
@@ -268,37 +507,114 @@ class AeroHandRuntime:
     def _dispatch_palm_wheel_action(self, action: str) -> None:
         logger.info(f"[PALM WHEEL] Triggered action: {action}")
         self._last_action_text = f"PalmWheel: {action}"
-        if action == "toggle_pause":
+        self._practice["palm_wheel"] = True
+
+        if action in ("toggle_pause", "tracking_toggle"):
             self.set_paused(not self._paused)
+        elif action == "stop_tracking":
+            self.set_paused(True)
         elif action == "recenter":
             self.trigger_recenter()
+        elif action == "show_main_window":
+            if self._on_show_window is not None:
+                self._on_show_window()
+        elif action == "toggle_camera_hud":
+            if self._on_toggle_camera_hud is not None:
+                self._on_toggle_camera_hud()
         elif action == "mission_control":
             self.input_ctl.toggle_mission_control()
         elif action == "spotlight":
             self.input_ctl.open_spotlight()
+        elif action in ("dictation_toggle", "dictation"):
+            self.toggle_dictation()
+        elif action == "siri_listen":
+            self.input_ctl.siri_listen()
         elif action == "media_play_pause":
             self.input_ctl.media_play_pause()
+        elif action == "media_next":
+            self.input_ctl.media_next()
+        elif action == "media_prev":
+            self.input_ctl.media_prev()
+        elif action == "volume_up":
+            self.input_ctl.volume_up()
+        elif action == "volume_down":
+            self.input_ctl.volume_down()
+        elif action == "volume_mute":
+            self.input_ctl.volume_mute()
+        elif action == "window_hide":
+            self.input_ctl.window_hide()
+        elif action == "window_fullscreen":
+            self.input_ctl.window_fullscreen()
+        elif action == "window_minimize":
+            self.input_ctl.window_minimize()
+        elif action == "window_close":
+            self.input_ctl.window_close()
+        elif action == "edit_copy":
+            self.input_ctl.edit_copy()
+        elif action == "edit_paste":
+            self.input_ctl.edit_paste()
+        elif action == "edit_cut":
+            self.input_ctl.edit_cut()
+        elif action == "edit_undo":
+            self.input_ctl.edit_undo()
+        elif action == "edit_redo":
+            self.input_ctl.edit_redo()
+        elif action == "keyboard_emoji":
+            self.input_ctl.keyboard_emoji()
+        elif action.startswith("open_app:"):
+            self.input_ctl.open_app(action.split(":", 1)[1].strip())
 
-    def _dispatch_actions(self, out: HandOutput, ts_ms: float) -> None:
-        p = out.pose
-        c = out.cursor
+    def _dispatch_actions(self, outputs: List[HandOutput], primary: Optional[HandOutput], ts_ms: float) -> Optional[str]:
+        """Dispatch OS events for Palm Wheels (both hands), Zoom, and primary cursor/gestures."""
+        active_hint: Optional[str] = None
 
-        if p.palm_wheel_action:
-            self.audio.play_click_up()
-            self._dispatch_palm_wheel_action(p.palm_wheel_action)
-            return
+        # 1. Process Palm Wheel audio & actions across BOTH hands (even when paused, so user can unpause!)
+        any_pw_active = False
+        for ho in outputs:
+            p = ho.pose
+            if p.palm_wheel_press_event == "down":
+                self.audio.play_wheel_tick()
+            elif p.palm_wheel_press_event == "up":
+                self.audio.play_click_up()
+            if p.palm_wheel_state in ("active", "confirmed"):
+                any_pw_active = True
+            if p.palm_wheel_action:
+                self._dispatch_palm_wheel_action(p.palm_wheel_action)
+                return "palm_wheel"
 
         if self._paused:
-            return
+            return None
 
-        suppress_cursor = p.is_scrolling or p.is_spaces_nav or p.is_window_tiling
+        # 2. Two-Hand Pinch-to-Zoom takes priority when both hands actively zoom
+        z_out = self.engine.last_zoom
+        if z_out.is_zooming:
+            with self._lerp_lock:
+                self._lerp_active = False
+            if z_out.step != 0:
+                self.audio.play_wheel_tick()
+                self._last_action_text = "Zoom In" if z_out.step > 0 else "Zoom Out"
+                self.input_ctl.zoom_step(z_out.step)
+            return "zoom"
+
+        if primary is None:
+            return None
+
+        p = primary.pose
+        c = primary.cursor
+        abs_x = self._screen_ox + c.x
+        abs_y = self._screen_oy + c.y
+
+        suppress_cursor = p.is_scrolling or p.is_spaces_nav or p.is_window_tiling or any_pw_active
         if c.is_pointing and c.is_valid and not suppress_cursor:
+            self._move_accum_px += abs(c.delta_x) + abs(c.delta_y)
+            if self._move_accum_px > 180.0:
+                self._practice["move"] = True
             if self.enable_lerp_60hz:
                 with self._lerp_lock:
-                    self._lerp.set_target(c.x, c.y)
+                    self._lerp.set_target(abs_x, abs_y)
                     self._lerp_active = True
             else:
-                self.input_ctl.mouse_move(c.x, c.y, delta_x=c.delta_x, delta_y=c.delta_y)
+                self.input_ctl.mouse_move(abs_x, abs_y, delta_x=c.delta_x, delta_y=c.delta_y)
         else:
             with self._lerp_lock:
                 self._lerp_active = False
@@ -310,30 +626,55 @@ class AeroHandRuntime:
             self.audio.play_click_up()
             cnt = max(1, p.click_count)
             self._last_action_text = "Double Click" if cnt == 2 else "Left Click"
-            self.input_ctl.mouse_click(c.x, c.y, button="left", click_count=cnt)
+            self._practice["click"] = True
+            self._emit_click_pulse("double_click" if cnt == 2 else "left_click", abs_x, abs_y)
+            self.input_ctl.mouse_click(abs_x, abs_y, button="left", click_count=cnt)
+            active_hint = "click"
 
         if p.is_right_clicking:
             self.audio.play_click_up()
             self._last_action_text = "Right Click"
-            self.input_ctl.mouse_click(c.x, c.y, button="right", click_count=1)
+            self._practice["right_click"] = True
+            self._emit_click_pulse("right_click", abs_x, abs_y)
+            self.input_ctl.mouse_click(abs_x, abs_y, button="right", click_count=1)
+            active_hint = "right_click"
 
         if p.grab_just_started:
             self.audio.play_click_down()
             self._drag_started_ms = ts_ms
             self._last_action_text = "Drag Start"
-            self.input_ctl.mouse_down(c.x, c.y, button="left")
+            self._practice["drag"] = True
+            self._emit_click_pulse("grab", abs_x, abs_y)
+            self.input_ctl.mouse_down(abs_x, abs_y, button="left")
         elif p.grab_just_ended:
             self.audio.play_click_up()
             self._drag_started_ms = None
             self._last_action_text = "Drag Release"
-            self.input_ctl.mouse_up(c.x, c.y, button="left")
+            self.input_ctl.mouse_up(abs_x, abs_y, button="left")
         elif self._drag_started_ms is not None and (ts_ms - self._drag_started_ms) > self.max_drag_duration_ms:
             logger.warning("[SAFETY] Max drag duration exceeded; auto-releasing mouse button.")
             self._drag_started_ms = None
-            self.input_ctl.mouse_up(c.x, c.y, button="left")
+            self.input_ctl.mouse_up(abs_x, abs_y, button="left")
+        if p.is_grabbing:
+            active_hint = "grab"
 
+        # Voice Dictation hold gesture (`thumb_index_pinch`)
+        if p.dictation_just_started:
+            self.audio.play_wheel_tick()
+            self.dictation.start()
+            self._last_action_text = "Dictation listening..."
+        elif p.dictation_just_ended:
+            self.audio.play_click_up()
+            self.dictation.stop_and_transcribe()
+            self._last_action_text = "Dictation transcribing..."
+        if p.is_dictating or self.dictation.is_recording:
+            active_hint = "dictation"
+
+        # 2D Scroll with Momentum Phase
         scroll_use_phases = bool((self.config.get("scroll") or {}).get("use_phases", True))
         if p.is_scrolling:
+            self._practice["scroll"] = True
+            active_hint = "scroll"
             self._scroll_acc_x += p.scroll_dx
             self._scroll_acc_y += p.scroll_dy
             sx = int(self._scroll_acc_x)
@@ -342,35 +683,77 @@ class AeroHandRuntime:
                 self._scroll_acc_x -= sx
                 self._scroll_acc_y -= sy
                 self._last_action_text = f"Scroll ({sx:+d}, {sy:+d})"
-                self.input_ctl.scroll_pixels(sy, sx, use_phases=scroll_use_phases)
+                self.input_ctl.scroll_pixels(
+                    sy, sx, use_phases=scroll_use_phases, is_inertia=p.is_scroll_inertia
+                )
         else:
             self._scroll_acc_x = 0.0
             self._scroll_acc_y = 0.0
             self.input_ctl.end_scroll_phase()
 
+        if p.is_spaces_nav:
+            active_hint = "spaces_nav"
         if p.spaces_nav_direction == "left":
             self._last_action_text = "Space Left"
+            self._practice["spaces_nav"] = True
             self.input_ctl.switch_space("left")
         elif p.spaces_nav_direction == "right":
             self._last_action_text = "Space Right"
+            self._practice["spaces_nav"] = True
             self.input_ctl.switch_space("right")
         elif p.spaces_nav_direction == "top":
             self._last_action_text = "Mission Control"
+            self._practice["spaces_nav"] = True
             self.input_ctl.toggle_mission_control()
         elif p.spaces_nav_direction == "bottom":
             self._last_action_text = "App Exposé"
+            self._practice["spaces_nav"] = True
             self.input_ctl.exit_mission_control()
 
+        if p.is_window_tiling:
+            active_hint = "window_tile"
         if p.window_tile_direction is not None:
+            wt_animate = bool((self.config.get("window_tile") or {}).get("animate", True))
             self._last_action_text = f"Tile Window: {p.window_tile_direction}"
-            self.input_ctl.tile_focused_window(p.window_tile_direction)
+            self._practice["window_tile"] = True
+            self.input_ctl.tile_focused_window(p.window_tile_direction, animate=wt_animate)
+
+        return active_hint
+
+    def _create_tracker(self) -> MediaPipeHandTracker:
+        trk_cfg = self.config.get("tracker") or {}
+        return MediaPipeHandTracker(
+            model_path=str(trk_cfg.get("model_path", "models/hand_landmarker.task")),
+            num_hands=int(trk_cfg.get("num_hands", 2)),
+            min_hand_detection_confidence=float(trk_cfg.get("min_hand_detection_confidence", 0.55)),
+            min_hand_presence_confidence=float(trk_cfg.get("min_hand_presence_confidence", 0.55)),
+            min_tracking_confidence=float(trk_cfg.get("min_tracking_confidence", 0.55)),
+            delegate=str(trk_cfg.get("delegate", "GPU")),
+            mirror_handedness=self.mirror,
+        )
+
+    def _create_camera(self) -> ThreadedCamera:
+        return ThreadedCamera(
+            camera_index=self.camera_index,
+            width=self.cam_width,
+            height=self.cam_height,
+            fps_cap=self.fps_cap,
+            mirror=self.mirror,
+            aspect_ratio=self.cam_aspect,
+            device_id=self.camera_device_id,
+        )
+
+    def _refresh_display_bounds(self) -> None:
+        multi = bool((self.config.get("system") or {}).get("multi_monitor", True))
+        self._screen_ox, self._screen_oy, self._screen_w, self._screen_h = get_virtual_display_bounds(multi)
 
     def _run_loop(self) -> None:
-        acc_ok = True if self.dry_run else is_accessibility_trusted(prompt_user=False)
-        _, _, self._screen_w, self._screen_h = get_main_display_bounds()
+        perms = check_all_permissions()
+        acc_ok = True if self.dry_run else perms.get("accessibility", False)
+        self._refresh_display_bounds()
         cur_x, cur_y = get_current_cursor_position()
-        self.engine.anchor_cursor("Right", cur_x, cur_y)
-        self.engine.anchor_cursor("Left", cur_x, cur_y)
+        self.engine.anchor_cursor("Right", cur_x - self._screen_ox, cur_y - self._screen_oy)
+        self.engine.anchor_cursor("Left", cur_x - self._screen_ox, cur_y - self._screen_oy)
         with self._lerp_lock:
             self._lerp.reset((cur_x, cur_y))
 
@@ -379,46 +762,60 @@ class AeroHandRuntime:
         lerp_thread: Optional[threading.Thread] = None
 
         try:
-            trk_cfg = self.config.get("tracker") or {}
-            tracker = MediaPipeHandTracker(
-                model_path=str(trk_cfg.get("model_path", "models/hand_landmarker.task")),
-                num_hands=int(trk_cfg.get("num_hands", 1)),
-                min_hand_detection_confidence=float(trk_cfg.get("min_hand_detection_confidence", 0.55)),
-                min_hand_presence_confidence=float(trk_cfg.get("min_hand_presence_confidence", 0.55)),
-                min_tracking_confidence=float(trk_cfg.get("min_tracking_confidence", 0.55)),
-                delegate=str(trk_cfg.get("delegate", "GPU")),
-                mirror_handedness=self.mirror,
-            )
-            camera = ThreadedCamera(
-                camera_index=self.camera_index,
-                width=self.cam_width,
-                height=self.cam_height,
-                fps_cap=self.fps_cap,
-                mirror=self.mirror,
-            )
+            tracker = self._create_tracker()
+            camera = self._create_camera()
 
             lerp_thread = threading.Thread(target=self._lerp_worker, name="AeroHandLerp60Hz", daemon=True)
             lerp_thread.start()
 
             logger.info(
-                f"[AeroHand] Started ({'DRY-RUN' if self.dry_run else 'LIVE'} | "
-                f"delegate={tracker.delegate_used} | screen={int(self._screen_w)}x{int(self._screen_h)})"
+                f"[AeroHand] Started v{__version__} ({'DRY-RUN' if self.dry_run else 'LIVE'} | "
+                f"delegate={tracker.delegate_used} | display={int(self._screen_w)}x{int(self._screen_h)})"
             )
 
             camera.start()
             last_hand_wall = time.monotonic()
             fps_ema = 30.0
             prev_wall = time.monotonic()
-            last_acc_check = time.monotonic()
+            last_slow_poll = time.monotonic()
 
             while not self._stop_event.is_set():
+                # Handle hot camera / tracker switches cleanly
+                if self._restart_camera_event.is_set():
+                    self._restart_camera_event.clear()
+                    try:
+                        camera.stop()
+                        camera = self._create_camera()
+                        camera.start()
+                        logger.info("[CAMERA] Hot-restarted camera stream.")
+                    except Exception as exc:
+                        logger.error(f"[CAMERA] Hot-restart failed: {exc}")
+
+                if self._restart_tracker_event.is_set():
+                    self._restart_tracker_event.clear()
+                    try:
+                        tracker.close()
+                        tracker = self._create_tracker()
+                        logger.info("[TRACKER] Hot-restarted MediaPipe tracker.")
+                    except Exception as exc:
+                        logger.error(f"[TRACKER] Hot-restart failed: {exc}")
+
                 now_wall = time.monotonic()
-                if now_wall - last_acc_check >= 2.0:
-                    acc_ok = True if self.dry_run else is_accessibility_trusted(prompt_user=False)
-                    last_acc_check = now_wall
+                if now_wall - last_slow_poll >= 1.0:
+                    last_slow_poll = now_wall
+                    perms = check_all_permissions()
+                    acc_ok = True if self.dry_run else perms.get("accessibility", False)
+                    self._refresh_display_bounds()
+
+                    # Per-App Profile switching
+                    bid = get_frontmost_app_bundle_id()
+                    if bid != self._active_bundle_id:
+                        self._active_bundle_id = bid
+                        merged = resolve_profile_config(self.base_config, bid)
+                        self.apply_live_settings(merged, from_profile=True)
 
                 is_idle = self.idle_throttle_enabled and ((now_wall - last_hand_wall) >= self.idle_timeout_s)
-                if is_idle:
+                if is_idle and not self.collector.is_recording:
                     time.sleep(max(0.01, 1.0 / max(1.0, self.idle_fps) - 0.015))
 
                 cf = camera.read(timeout_s=0.04)
@@ -429,19 +826,24 @@ class AeroHandRuntime:
                 prev_wall = time.monotonic()
                 fps_ema = 0.85 * fps_ema + 0.15 * (1.0 / dt_wall)
 
+                t_mp0 = time.perf_counter()
                 hands = tracker.process_frame(cf.frame, cf.timestamp_ms)
+                mp_ms = (time.perf_counter() - t_mp0) * 1000.0
+
                 if hands:
                     last_hand_wall = time.monotonic()
                     self._last_hand_ms = float(cf.timestamp_ms)
                     if not self._hand_present_prev:
                         cx, cy = get_current_cursor_position()
                         for h_inp in hands:
-                            self.engine.anchor_cursor(h_inp.handedness, cx, cy)
+                            self.engine.anchor_cursor(
+                                h_inp.handedness, cx - self._screen_ox, cy - self._screen_oy
+                            )
                         with self._lerp_lock:
                             self._lerp.reset((cx, cy))
                     self._hand_present_prev = True
 
-                    if self.collector is not None:
+                    if self.collector.is_recording:
                         h0 = hands[0]
                         self.collector.add_frame(
                             h0.landmarks, h0.world_landmarks, h0.handedness, h0.confidence, cf.timestamp_ms
@@ -458,30 +860,97 @@ class AeroHandRuntime:
                         self._drag_started_ms = None
                         self.input_ctl.release_all()
 
-                outputs = self.engine.process_frame(hands, float(cf.timestamp_ms), self._screen_w, self._screen_h)
+                outputs = self.engine.process_frame(
+                    hands,
+                    float(cf.timestamp_ms),
+                    self._screen_w,
+                    self._screen_h,
+                    frame_brightness=cf.brightness,
+                )
                 primary = self._select_primary_hand(outputs)
-                if primary is not None:
-                    self._dispatch_actions(primary, float(cf.timestamp_ms))
+                active_hint = self._dispatch_actions(outputs, primary, float(cf.timestamp_ms))
 
+                t_ren0 = time.perf_counter()
                 vis_frame: Optional[np.ndarray] = None
                 if self.render_hud_frames:
+                    hud_cfg = (self.config.get("ui") or {}).get("camera_hud") or {}
                     vis_frame = render_camera_hud(
                         cf.frame,
                         hands,
+                        outputs,
                         primary,
                         fps=fps_ema,
                         paused=self._paused,
                         dry_run=self.dry_run,
                         is_idle=is_idle,
                         guard_reason=self.input_ctl.last_guard_reason,
+                        dictating=self.dictation.is_recording,
+                        zooming=self.engine.last_zoom.is_zooming,
+                        show_connections=bool(hud_cfg.get("show_connections", True)),
+                        show_landmarks=bool(hud_cfg.get("show_landmarks", True)),
                         compact=not self.preview,
                     )
+                ren_ms = (time.perf_counter() - t_ren0) * 1000.0
 
-                probs_map = (
-                    {k.value: float(v) for k, v in primary.pose.pose_probabilities.items()}
-                    if primary is not None
-                    else {k.value: float(v) for k, v in idle_probabilities().items()}
+                timing = self.engine.last_timing
+                timing.mediapipe_ms = mp_ms
+                timing.render_ms = ren_ms
+                timing.total_ms = mp_ms + timing.pre_filters_ms + timing.cursor_ms + timing.gesture_ms + timing.gesture_ml_ms + ren_ms
+                timing.headroom_ms = max(0.0, timing.frame_budget_ms - timing.total_ms)
+                timing.utilization_pct = min(100.0, (timing.total_ms / timing.frame_budget_ms) * 100.0)
+
+                # Build Palm Wheel payloads for On-Screen Radial Overlay
+                pw_payloads: List[Dict[str, Any]] = []
+                for ho in outputs:
+                    po = ho.pose
+                    if po.palm_wheel_state != "inactive":
+                        pw_payloads.append(
+                            {
+                                "hand": ho.hand,
+                                "state": po.palm_wheel_state,
+                                "progress": round(po.palm_wheel_progress, 3),
+                                "selected_finger": po.palm_wheel_selected_finger,
+                                "menu_path": po.palm_wheel_menu_path,
+                                "menu_label": po.palm_wheel_menu_label,
+                                "slots": po.palm_wheel_slots,
+                                "palm_center": (
+                                    po.palm_wheel_finger_positions.get("palmCenter")
+                                    if po.palm_wheel_finger_positions
+                                    else None
+                                ),
+                                "cursor_x": round(self._screen_ox + ho.cursor.x, 1),
+                                "cursor_y": round(self._screen_oy + ho.cursor.y, 1),
+                            }
+                        )
+
+                # Build Window Tile Ghost Preview payload
+                wt_preview: Optional[Dict[str, Any]] = None
+                if primary is not None and primary.pose.window_tile_preview_direction:
+                    _, _, mw, mh = get_main_display_bounds()
+                    rect = compute_tile_rect(
+                        primary.pose.window_tile_preview_direction,
+                        (0.0, 28.0, mw, max(200.0, mh - 28.0)),
+                    )
+                    if rect is not None:
+                        wt_preview = {
+                            "direction": primary.pose.window_tile_preview_direction,
+                            "x": round(rect[0], 1),
+                            "y": round(rect[1], 1),
+                            "w": round(rect[2], 1),
+                            "h": round(rect[3], 1),
+                        }
+
+                warn_dict = (
+                    {"level": self.engine.last_warning.level, "code": self.engine.last_warning.code}
+                    if self.engine.last_warning is not None
+                    else None
                 )
+                probs_map = (
+                    {k.value: round(float(v), 3) for k, v in primary.pose.pose_probabilities.items()}
+                    if primary is not None
+                    else {k.value: (1.0 if k == PoseName.IDLE else 0.0) for k in ALL_POSE_NAMES}
+                )
+
                 snap = RuntimeSnapshot(
                     running=True,
                     paused=self._paused,
@@ -489,19 +958,42 @@ class AeroHandRuntime:
                     is_idle=is_idle,
                     fps=fps_ema,
                     delegate=tracker.delegate_used,
+                    classifier_name=type(self.classifier).__name__,
                     accessibility_ok=acc_ok,
+                    permissions=perms,
                     guard_reason=self.input_ctl.last_guard_reason,
+                    active_app=self._active_bundle_id,
                     hand=primary.hand if primary is not None else None,
+                    hands_count=len(outputs),
                     is_pointing=primary.cursor.is_pointing if primary is not None else False,
                     dir_z=primary.cursor.pointing_dir_z if primary is not None else 0.0,
+                    cursor_x=round(self._screen_ox + primary.cursor.x, 1) if primary is not None else 0.0,
+                    cursor_y=round(self._screen_oy + primary.cursor.y, 1) if primary is not None else 0.0,
                     pose=primary.pose.pose.value if primary is not None else "idle",
                     active_pose=(
                         primary.pose.active_pose.value
                         if (primary is not None and primary.pose.active_pose is not None)
                         else None
                     ),
+                    is_scrolling=primary.pose.is_scrolling if primary is not None else False,
+                    is_grabbing=primary.pose.is_grabbing if primary is not None else False,
+                    is_zooming=self.engine.last_zoom.is_zooming,
                     palm_wheel_state=primary.pose.palm_wheel_state if primary is not None else "inactive",
                     palm_wheel_progress=primary.pose.palm_wheel_progress if primary is not None else 0.0,
+                    palm_wheels=pw_payloads,
+                    window_tile_preview=wt_preview,
+                    spaces_nav_preview=(
+                        primary.pose.spaces_nav_preview_direction if primary is not None else None
+                    ),
+                    active_hint=active_hint,
+                    warning=warn_dict,
+                    dictation=self.dictation.status_dict(),
+                    timing=timing.to_dict(),
+                    vitals=self.vitals_mon.read().to_dict(),
+                    collector=self.collector_status(),
+                    practice=dict(self._practice),
+                    click_event_seq=self._click_seq,
+                    click_event=self._last_click_event,
                     last_action=self._last_action_text,
                     probabilities=probs_map,
                     frame_bgr=vis_frame,
@@ -510,7 +1002,7 @@ class AeroHandRuntime:
                     self._snapshot = snap
 
                 if self.preview and vis_frame is not None:
-                    if self.collector is not None:
+                    if self._cli_collect_mode:
                         rec_tag = "REC ON" if self.collector.is_recording else "REC OFF"
                         col_col = (60, 80, 255) if self.collector.is_recording else (180, 180, 180)
                         cv2.putText(
@@ -526,11 +1018,11 @@ class AeroHandRuntime:
                     key = cv2.waitKey(1) & 0xFF
                     if key == ord("q"):
                         break
-                    if self.collector is not None:
+                    if self._cli_collect_mode:
                         if key == ord("r"):
                             st = self.collector.toggle_recording()
                             print(f"[COLLECT] recording={'ON' if st else 'OFF'} counts={self.collector.counts()}")
-                        elif key == ord("s") and self.collect_dir is not None:
+                        elif key == ord("s"):
                             fp = self.collector.save(self.collect_dir)
                             print(f"[COLLECT] Saved -> {fp} ({self.collector.counts()})")
                         elif ord("0") <= key <= ord("6"):
@@ -547,6 +1039,7 @@ class AeroHandRuntime:
             self._stop_event.set()
             if lerp_thread is not None and lerp_thread.is_alive():
                 lerp_thread.join(timeout=0.5)
+            self.dictation.close()
             self.input_ctl.release_all()
             if camera is not None:
                 camera.stop()
@@ -557,11 +1050,7 @@ class AeroHandRuntime:
                     cv2.destroyAllWindows()
                 except Exception:
                     pass
-            if (
-                self.collector is not None
-                and self.collect_dir is not None
-                and sum(self.collector.counts().values()) > 0
-            ):
+            if self._cli_collect_mode and sum(self.collector.counts().values()) > 0:
                 fp = self.collector.save(self.collect_dir)
                 print(f"[COLLECT] Auto-saved on exit -> {fp}")
             with self._snapshot_lock:
@@ -574,4 +1063,10 @@ class AeroHandRuntime:
             logger.error(msg)
             print(msg)
             return
-        self._run_loop()
+        self._start_api_if_enabled()
+        try:
+            self._run_loop()
+        finally:
+            if self._api_server is not None:
+                self._api_server.stop()
+                self._api_server = None

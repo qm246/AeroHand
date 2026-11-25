@@ -272,3 +272,164 @@ def test_data_collector_save(tmp_path: Path):
     fp = col.save(tmp_path)
     assert fp.is_file()
     assert col.counts()[PoseName.THUMB_MIDDLE_PINCH.value] == 1
+
+
+def test_palm_wheel_nested_submenu_back_and_fist_dismiss():
+    lms = _make_open_hand(forward_z=-0.06)
+    pw = PalmWheelDetector({"activation_hold_ms": 200.0, "cooldown_ms": 50.0}, hand="Right")
+    assert pw.process(lms, 0.0, "Right").state == "activating"
+    act = pw.process(lms, 220.0, "Right")
+    assert act.state == "active"
+    assert len(act.slots) == 5
+
+    # Curl pinky (slot R5 = Player submenu) and release -> enters Player submenu!
+    cx = 0.5 * (lms[0].x + lms[9].x)
+    cy = 0.5 * (lms[0].y + lms[9].y)
+    cz = 0.5 * (lms[0].z + lms[9].z)
+    curled_pinky = list(lms)
+    curled_pinky[20] = Landmark(cx, cy, cz)
+    pw.process(curled_pinky, 260.0, "Right")
+    entered = pw.process(lms, 300.0, "Right")
+    assert entered.menu_label == "Player"
+    assert entered.menu_path == ["Player"]
+
+    # After confirmation_hold_ms (200ms) with open palm -> stays active inside Player submenu!
+    stay = pw.process(lms, 550.0, "Right")
+    assert stay.state == "active"
+    assert stay.menu_label == "Player"
+
+    # Curl thumb (submenu_back in Player) -> returns to root
+    curled_thumb = list(lms)
+    curled_thumb[4] = Landmark(cx, cy, cz)
+    pw.process(curled_thumb, 590.0, "Right")
+    back = pw.process(lms, 630.0, "Right")
+    assert back.menu_path == []
+    assert back.menu_label is None
+
+    # Stay active again, then close fist (>1 finger down) -> rapid dismiss to inactive
+    pw.process(lms, 860.0, "Right")
+    fist = list(lms)
+    fist[8] = Landmark(cx, cy, cz)
+    fist[12] = Landmark(cx, cy, cz)
+    dismissed = pw.process(fist, 900.0, "Right")
+    assert dismissed.state == "inactive"
+
+
+def test_two_hand_zoom_controller():
+    from aerohand.core.zoom_controller import ZoomController
+
+    zc = ZoomController({"enable_zoom": True, "zoom_speed": 1.0})
+    o0 = zc.process((0.35, 0.5), (0.65, 0.5), True, 0.0)
+    assert o0.is_zooming and o0.step == 0
+    steps = []
+    for k in range(1, 10):
+        d = 0.02 * k
+        o = zc.process((0.35 - d, 0.5), (0.65 + d, 0.5), True, k * 120.0)
+        if o.step != 0:
+            steps.append(o.step)
+    assert any(s > 0 for s in steps)
+    assert not zc.process((0.35, 0.5), (0.65, 0.5), False, 2000.0).is_zooming
+
+
+def test_presets_profiles_and_nested_config_keys():
+    from aerohand.config import (
+        apply_gesture_preset,
+        get_nested_key,
+        resolve_profile_config,
+        set_nested_key,
+    )
+
+    cfg = load_config()
+    classic = apply_gesture_preset(cfg, "classic")
+    assert classic["pose_state_machine"]["enable_click_hold"] is True
+    assert classic["pose_state_machine"]["tap_actions"]["thumb_index_pinch"] == "left_click"
+
+    # Alias resolution
+    found, val = get_nested_key(cfg, "cursor.sensitivity")
+    assert found and val == cfg["cursor"]["pointer_sensitivity"]
+    set_nested_key(cfg, "cursor.sensitivity", 2.95)
+    assert cfg["cursor"]["pointer_sensitivity"] == 2.95
+
+    # Per-app profile merge
+    prof = resolve_profile_config(cfg, "com.microsoft.VSCode")
+    assert prof["scroll"]["speed"] == 1.2
+
+
+def test_airmouse_885_features_and_left_hand_mirror():
+    from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
+
+    right = _make_open_hand()
+    f_r = extract_airmouse_885_features(right, right, "Right")
+    assert f_r.shape == (AIRMOUSE_885_DIM,)
+    assert np.all(np.isfinite(f_r))
+
+    # Construct exact X-mirrored left hand
+    left_2d = [Landmark(1.0 - p.x, p.y, p.z) for p in right]
+    left_3d = [Landmark(-p.x, p.y, p.z) for p in right]
+    f_l = extract_airmouse_885_features(left_2d, left_3d, "Left")
+    assert np.allclose(f_r, f_l, atol=1e-5)
+
+
+def test_ax_tile_rects_i18n_audio_and_local_control_api(tmp_path: Path):
+    import json
+    import urllib.request
+
+    from aerohand.i18n import TRANSLATIONS
+    from aerohand.platform.audio import ensure_default_sound_assets
+    from aerohand.platform.control_api import LocalControlAPIServer, handle_aerohand_url
+    from aerohand.platform.input_macos import compute_tile_rect
+
+    # 1. Tile rect calculations
+    vis = (0.0, 28.0, 1440.0, 872.0)
+    left = compute_tile_rect("left", vis)
+    right = compute_tile_rect("right", vis)
+    top = compute_tile_rect("top", vis)
+    bottom = compute_tile_rect("bottom", vis)
+    assert left and right and top and bottom
+    assert left[2] == pytest.approx(right[2])
+    assert top[2] > left[2] * 1.8
+
+    # 2. Bilingual vi / en translation completeness
+    assert set(TRANSLATIONS["vi"].keys()) == set(TRANSLATIONS["en"].keys())
+    assert set(TRANSLATIONS["vi"]["tabs"].keys()) == set(TRANSLATIONS["en"]["tabs"].keys())
+
+    # 3. Clean-room WAV click synthesis
+    wavs = ensure_default_sound_assets(tmp_path)
+    assert all(p.is_file() and p.stat().st_size > 200 for p in wavs.values())
+
+    # 4. URL scheme handler
+    hit = []
+    assert handle_aerohand_url("aerohand://tracking/off", on_tracking=lambda v: hit.append(v))
+    assert hit == [False]
+
+    # 5. Local Control HTTP API roundtrip on ephemeral port
+    state = {"tracking": True, "cfg": load_config()}
+    srv = LocalControlAPIServer(
+        host="127.0.0.1",
+        port=0,
+        get_status=lambda: {"ok": True, "tracking": state["tracking"]},
+        get_vitals=lambda: {"cpu_usage": 5.0, "ram_used_gb": 4.0, "ram_total_gb": 16.0},
+        get_config=lambda: state["cfg"],
+        apply_config=lambda c: state.__setitem__("cfg", c),
+        set_tracking_enabled=lambda en: (state.__setitem__("tracking", en) or en),
+        trigger_recenter=lambda: None,
+    )
+    assert srv.start()
+    try:
+        actual_port = srv._server.server_address[1]
+        with urllib.request.urlopen(f"http://127.0.0.1:{actual_port}/api/status", timeout=3) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["ok"] is True and body["tracking"] is True
+
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{actual_port}/api/tracking",
+            data=json.dumps({"enabled": False}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            body2 = json.loads(resp.read().decode("utf-8"))
+        assert body2["enabled"] is False
+        assert state["tracking"] is False
+    finally:
+        srv.stop()

@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AeroHand Overlay</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+  html, body {
+    width: 100vw; height: 100vh; overflow: hidden;
+    background: transparent !important;
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    color: #f8fafc;
+    pointer-events: none;
+  }
+
+  /* 1. Window Tile Frosted Glass Ghost Preview */
+  #tile-preview {
+    position: fixed;
+    border-radius: 16px;
+    background: rgba(56, 189, 248, 0.16);
+    border: 2px solid rgba(96, 165, 250, 0.78);
+    box-shadow: 0 0 36px rgba(56, 189, 248, 0.25), inset 0 0 24px rgba(45, 212, 191, 0.14);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    display: flex; align-items: center; justify-content: center;
+    opacity: 0; transform: scale(0.97);
+    transition: opacity 120ms ease, transform 120ms ease, left 100ms ease, top 100ms ease, width 100ms ease, height 100ms ease;
+  }
+  #tile-preview.visible { opacity: 1; transform: scale(1); }
+  #tile-preview .tile-badge {
+    padding: 8px 18px; border-radius: 999px;
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(96, 165, 250, 0.55);
+    font-size: 14px; font-weight: 600; letter-spacing: 0.2px; color: #e0f2fe;
+  }
+
+  /* 2. Click Pulse Ripples */
+  .pulse-ring {
+    position: fixed;
+    width: 34px; height: 34px;
+    border-radius: 9999px;
+    border: 2.5px solid #2dd4bf;
+    box-shadow: 0 0 14px rgba(45, 212, 191, 0.55);
+    transform: translate(-50%, -50%) scale(0.5);
+    opacity: 0.92;
+    animation: pulseExpand 360ms cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+  .pulse-ring.right_click { border-color: #fbbf24; box-shadow: 0 0 14px rgba(251, 191, 36, 0.55); }
+  .pulse-ring.grab { border-color: #60a5fa; box-shadow: 0 0 14px rgba(96, 165, 250, 0.55); }
+  .pulse-ring.double_click { border-color: #34d399; border-width: 3px; }
+  @keyframes pulseExpand {
+    to { transform: translate(-50%, -50%) scale(2.15); opacity: 0; }
+  }
+
+  /* 3. Top Glass Toast (Gesture Hints, Dictation Waveform & Tracking Warnings) */
+  #toast-stack {
+    position: fixed; top: 44px; left: 50%; transform: translateX(-50%);
+    display: flex; flex-direction: column; align-items: center; gap: 8px;
+  }
+  .toast-pill {
+    display: inline-flex; align-items: center; gap: 10px;
+    padding: 8px 16px; border-radius: 9999px;
+    background: rgba(12, 17, 28, 0.86);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 10px 30px rgba(0, 0, 0, 0.38);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    font-size: 13px; font-weight: 500; color: #f1f5f9;
+    opacity: 0; transform: translateY(-6px);
+    transition: opacity 140ms ease, transform 140ms ease;
+  }
+  .toast-pill.visible { opacity: 1; transform: translateY(0); }
+  .toast-pill.warning { border-color: rgba(251, 191, 36, 0.55); color: #fef3c7; }
+  .toast-pill.dictation { border-color: rgba(192, 132, 252, 0.65); color: #f3e8ff; }
+  .dot { width: 8px; height: 8px; border-radius: 999px; background: #2dd4bf; }
+  .toast-pill.warning .dot { background: #fbbf24; }
+  .toast-pill.dictation .dot { background: #c084fc; animation: blink 0.9s infinite; }
+  @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+  .wave-bar {
+    width: 3px; border-radius: 2px; background: #c084fc;
+    transition: height 60ms linear;
+  }
+
+  /* 4. On-Screen 5-Petal Palm Wheel Radial Menu */
+  #palm-wheel-layer { position: fixed; inset: 0; }
+  .pw-root {
+    position: fixed;
+    transform: translate(-50%, -50%);
+    width: 320px; height: 320px;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .pw-ring-svg {
+    position: absolute; width: 104px; height: 104px;
+    filter: drop-shadow(0 6px 20px rgba(0,0,0,0.45));
+  }
+  .pw-center {
+    position: relative; z-index: 2;
+    width: 82px; height: 82px; border-radius: 999px;
+    background: rgba(12, 18, 30, 0.88);
+    border: 1.5px solid rgba(45, 212, 191, 0.55);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    text-align: center; padding: 4px;
+    box-shadow: 0 12px 32px rgba(0,0,0,0.45);
+  }
+  .pw-hand-tag { font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.8px; color: #2dd4bf; }
+  .pw-crumb { font-size: 11px; font-weight: 600; color: #f8fafc; margin-top: 2px; max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pw-petal {
+    position: absolute;
+    min-width: 104px; max-width: 126px;
+    padding: 8px 11px; border-radius: 14px;
+    background: rgba(14, 20, 34, 0.88);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.42);
+    display: flex; flex-direction: column; align-items: center; gap: 3px;
+    transform: translate(-50%, -50%) scale(0.95);
+    transition: transform 90ms ease, border-color 90ms ease, background 90ms ease;
+  }
+  .pw-petal.selected {
+    transform: translate(-50%, -50%) scale(1.1);
+    background: rgba(45, 212, 191, 0.24);
+    border-color: #2dd4bf;
+    box-shadow: 0 0 24px rgba(45, 212, 191, 0.45);
+  }
+  .pw-petal.confirmed {
+    transform: translate(-50%, -50%) scale(1.16);
+    background: rgba(52, 211, 153, 0.36);
+    border-color: #34d399;
+  }
+  .pw-petal.empty { opacity: 0.35; }
+  .pw-finger-tag { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: #94a3b8; }
+  .pw-slot-label { font-size: 12px; font-weight: 600; color: #f8fafc; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
+  .pw-sub-badge { font-size: 9px; color: #60a5fa; font-weight: 600; }
+</style>
+</head>
+<body>
+  <div id="tile-preview"><div class="tile-badge" id="tile-badge"></div></div>
+  <div id="toast-stack">
+    <div id="hint-toast" class="toast-pill"><span class="dot"></span><span id="hint-text"></span></div>
+    <div id="dict-toast" class="toast-pill dictation">
+      <span class="dot"></span>
+      <span id="dict-text"></span>
+      <div style="display:flex;align-items:center;gap:2px;height:16px" id="dict-bars">
+        <div class="wave-bar" style="height:4px"></div>
+        <div class="wave-bar" style="height:8px"></div>
+        <div class="wave-bar" style="height:12px"></div>
+        <div class="wave-bar" style="height:6px"></div>
+      </div>
+    </div>
+    <div id="warn-toast" class="toast-pill warning"><span class="dot"></span><span id="warn-text"></span></div>
+  </div>
+  <div id="palm-wheel-layer"></div>
+
+<script>
+  let lastClickSeq = 0;
+
+  const FINGER_NAMES_VI = { thumb: "Ngón cái", index: "Ngón trỏ", middle: "Ngón giữa", ring: "Áp út", pinky: "Ngón út" };
+  const FINGER_NAMES_EN = { thumb: "Thumb", index: "Index", middle: "Middle", ring: "Ring", pinky: "Pinky" };
+
+  // Fan petal angles (degrees, -90 = top) for Right and Left hands
+  const ANGLES_RIGHT = { thumb: 160, index: -135, middle: -90, ring: -45, pinky: 20 };
+  const ANGLES_LEFT  = { pinky: 160, ring: -135, middle: -90, index: -45, thumb: 20 };
+
+  function spawnPulse(ev) {
+    const el = document.createElement("div");
+    el.className = "pulse-ring " + (ev.kind || "left_click");
+    el.style.left = ev.x + "px";
+    el.style.top = ev.y + "px";
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 400);
+  }
+
+  function renderPalmWheels(wheels, cfg, i18n, lang) {
+    const layer = document.getElementById("palm-wheel-layer");
+    if (!cfg.show_palm_wheel_overlay || !wheels || wheels.length === 0) {
+      if (layer.childElementCount > 0) layer.innerHTML = "";
+      return;
+    }
+
+    const fingerMap = lang === "en" ? FINGER_NAMES_EN : FINGER_NAMES_VI;
+    const actLabels = (i18n && i18n.actions) || {};
+    let html = "";
+
+    for (const pw of wheels) {
+      let cx = window.innerWidth * 0.5;
+      let cy = window.innerHeight * 0.5;
+      if (!cfg.palm_wheel_fixed && pw.palm_center) {
+        cx = Math.max(185, Math.min(window.innerWidth - 185, pw.palm_center[0] * window.innerWidth));
+        cy = Math.max(185, Math.min(window.innerHeight - 185, pw.palm_center[1] * window.innerHeight));
+      }
+
+      const prog = Math.max(0, Math.min(1, pw.progress || 0));
+      const dash = 289.0;
+      const offset = dash * (1 - prog);
+      const ringCol = pw.state === "active" ? "#2dd4bf" : (pw.state === "confirmed" ? "#34d399" : "#fbbf24");
+      const crumb = pw.menu_label ? (actLabels[pw.menu_label] || pw.menu_label) : (pw.hand === "Left" ? (lang === "en" ? "LEFT" : "TRÁI") : (lang === "en" ? "RIGHT" : "PHẢI"));
+      const handTag = pw.hand === "Left" ? (lang === "en" ? "LEFT PALM" : "TAY TRÁI") : (lang === "en" ? "RIGHT PALM" : "TAY PHẢI");
+
+      html += `<div class="pw-root" style="left:${cx}px;top:${cy}px">`;
+      html += `<svg class="pw-ring-svg" viewBox="0 0 100 100">
+        <circle cx="50" cy="50" r="46" fill="none" stroke="rgba(255,255,255,0.12)" stroke-width="5"/>
+        <circle cx="50" cy="50" r="46" fill="none" stroke="${ringCol}" stroke-width="5"
+          stroke-linecap="round" stroke-dasharray="${dash}" stroke-dashoffset="${offset}"
+          transform="rotate(-90 50 50)"/>
+      </svg>`;
+      html += `<div class="pw-center"><div class="pw-hand-tag">${handTag}</div><div class="pw-crumb">${crumb}</div></div>`;
+
+      if (pw.state === "active" || pw.state === "confirmed") {
+        const angles = pw.hand === "Left" ? ANGLES_LEFT : ANGLES_RIGHT;
+        const radius = 122;
+        for (const slot of (pw.slots || [])) {
+          const deg = angles[slot.finger] ?? -90;
+          const rad = deg * Math.PI / 180;
+          const px = 160 + Math.cos(rad) * radius;
+          const py = 160 + Math.sin(rad) * radius;
+          const isSel = pw.selected_finger === slot.finger;
+          const cls = "pw-petal"
+            + (slot.id === "unassigned" ? " empty" : "")
+            + (isSel ? (pw.state === "confirmed" ? " confirmed" : " selected") : "");
+          const lbl = actLabels[slot.label] || actLabels[slot.id] || slot.label || "—";
+          html += `<div class="${cls}" style="left:${px}px;top:${py}px">
+            <div class="pw-finger-tag">${fingerMap[slot.finger] || slot.finger}</div>
+            <div class="pw-slot-label">${lbl}</div>
+            ${slot.is_submenu ? `<div class="pw-sub-badge">▸ ${lang === "en" ? "Submenu" : "Menu con"}</div>` : ""}
+          </div>`;
+        }
+      }
+      html += `</div>`;
+    }
+    layer.innerHTML = html;
+  }
+
+  window.updateOverlay = function(payload) {
+    const { snap, ui, i18n } = payload;
+    const lang = (ui && ui.language) || "vi";
+
+    // 1. Click pulse ripple
+    if (ui.show_click_feedback && snap.click_event && snap.click_event_seq > lastClickSeq) {
+      lastClickSeq = snap.click_event_seq;
+      spawnPulse(snap.click_event);
+    }
+
+    // 2. Window Tile Ghost Preview
+    const tileEl = document.getElementById("tile-preview");
+    const tileBadge = document.getElementById("tile-badge");
+    if (ui.show_window_tile_preview && snap.window_tile_preview) {
+      const r = snap.window_tile_preview;
+      tileEl.style.left = r.x + "px";
+      tileEl.style.top = r.y + "px";
+      tileEl.style.width = r.w + "px";
+      tileEl.style.height = r.h + "px";
+      tileBadge.textContent = (i18n.tile_dirs && i18n.tile_dirs[r.direction]) || r.direction;
+      tileEl.classList.add("visible");
+    } else {
+      tileEl.classList.remove("visible");
+    }
+
+    // 3. Gesture Hint Toast
+    const hintEl = document.getElementById("hint-toast");
+    const hintKey = snap.active_hint;
+    const hintsCfg = (ui && ui.hints) || {};
+    if (hintKey && hintKey !== "dictation" && (hintsCfg[hintKey] !== false)) {
+      document.getElementById("hint-text").textContent = (i18n.hints && i18n.hints[hintKey]) || hintKey;
+      hintEl.classList.add("visible");
+    } else {
+      hintEl.classList.remove("visible");
+    }
+
+    // 4. Dictation live waveform pill
+    const dictEl = document.getElementById("dict-toast");
+    const d = snap.dictation || {};
+    if (d.recording || d.transcribing) {
+      const txt = d.recording
+        ? ((i18n.hints && i18n.hints.dictation) || "Listening...") + ` (${d.language || "vi-VN"})`
+        : (lang === "en" ? "Transcribing speech..." : "Đang chuyển giọng nói thành văn bản...");
+      document.getElementById("dict-text").textContent = txt;
+      const lvl = Math.max(0.15, Math.min(1, d.audio_level || 0.2));
+      const bars = document.getElementById("dict-bars").children;
+      const mults = [0.6, 1.0, 0.85, 0.5];
+      for (let i = 0; i < bars.length; i++) {
+        bars[i].style.height = Math.round(4 + 12 * lvl * mults[i]) + "px";
+      }
+      dictEl.classList.add("visible");
+    } else {
+      dictEl.classList.remove("visible");
+    }
+
+    // 5. Tracking Warning Toast
+    const warnEl = document.getElementById("warn-toast");
+    if (ui.enable_tracking_warnings && snap.warning && snap.warning.code) {
+      document.getElementById("warn-text").textContent =
+        (i18n.warnings && i18n.warnings[snap.warning.code]) || snap.warning.code;
+      warnEl.classList.add("visible");
+    } else {
+      warnEl.classList.remove("visible");
+    }
+
+    // 6. On-Screen Palm Wheel Radial Menu
+    renderPalmWheels(snap.palm_wheels, ui, i18n, lang);
+  };
+</script>
+</body>
+</html>

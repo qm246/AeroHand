@@ -1,0 +1,954 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>AeroHand Control Center</title>
+<style>
+  :root {
+    --bg: #0a0f1a;
+    --sidebar: rgba(15, 22, 36, 0.88);
+    --card: rgba(255, 255, 255, 0.042);
+    --card-hover: rgba(255, 255, 255, 0.068);
+    --border: rgba(255, 255, 255, 0.09);
+    --text: #f1f5f9;
+    --muted: #94a3b8;
+    --teal: #2dd4bf;
+    --blue: #60a5fa;
+    --green: #34d399;
+    --amber: #fbbf24;
+    --rose: #fb7185;
+    --purple: #c084fc;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body {
+    height: 100%; width: 100%; overflow: hidden;
+    background: radial-gradient(circle at 12% 0%, rgba(45,212,191,0.13), transparent 45%),
+                radial-gradient(circle at 90% 100%, rgba(96,165,250,0.13), transparent 45%),
+                var(--bg);
+    color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", sans-serif;
+    font-size: 13px; line-height: 1.45;
+    -webkit-font-smoothing: antialiased;
+  }
+  .shell { display: grid; grid-template-columns: 214px 1fr; height: 100vh; }
+
+  /* Sidebar */
+  .sidebar {
+    background: var(--sidebar);
+    border-right: 1px solid var(--border);
+    padding: 36px 12px 14px;
+    display: flex; flex-direction: column; gap: 4px;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 14px; }
+  .brand-logo {
+    width: 32px; height: 32px; border-radius: 9px;
+    background: linear-gradient(135deg, #0ea5e9, #2dd4bf);
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 16px; color: #04131c;
+    box-shadow: 0 4px 14px rgba(45,212,191,0.35);
+  }
+  .brand h1 { font-size: 16px; font-weight: 700; letter-spacing: -0.2px; }
+  .brand small { font-size: 11px; color: var(--muted); display: block; }
+
+  .nav-btn {
+    display: flex; align-items: center; gap: 10px;
+    width: 100%; padding: 9px 11px; border-radius: 10px;
+    border: 1px solid transparent; background: transparent;
+    color: var(--muted); font-size: 13px; font-weight: 500;
+    cursor: pointer; text-align: left; transition: all 120ms ease;
+  }
+  .nav-btn:hover { background: rgba(255,255,255,0.05); color: var(--text); }
+  .nav-btn.active {
+    background: linear-gradient(90deg, rgba(45,212,191,0.16), rgba(96,165,250,0.08));
+    border-color: rgba(45,212,191,0.30); color: #f8fafc; font-weight: 600;
+  }
+  .nav-btn svg { width: 16px; height: 16px; flex-shrink: 0; opacity: 0.85; }
+  .nav-btn.active svg { color: var(--teal); opacity: 1; }
+
+  .sidebar-footer {
+    margin-top: auto; padding-top: 12px; border-top: 1px solid var(--border);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  .lang-switch {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 4px;
+    padding: 3px; border-radius: 9px; background: rgba(255,255,255,0.05);
+  }
+  .lang-btn {
+    border: 0; border-radius: 7px; padding: 5px 6px;
+    background: transparent; color: var(--muted); font-size: 11.5px; font-weight: 600; cursor: pointer;
+  }
+  .lang-btn.active { background: rgba(45,212,191,0.22); color: var(--teal); }
+
+  /* Main Area */
+  .main { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  .topbar {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 20px 24px 12px; border-bottom: 1px solid var(--border);
+  }
+  .topbar-title h2 { font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
+  .topbar-title p { font-size: 12px; color: var(--muted); }
+  .status-badge {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 6px 13px; border-radius: 999px;
+    font-size: 11.5px; font-weight: 700; letter-spacing: 0.4px;
+    background: rgba(52,211,153,0.14); color: var(--green);
+    border: 1px solid rgba(52,211,153,0.35);
+  }
+  .status-badge.dry { background: rgba(251,191,36,0.14); color: var(--amber); border-color: rgba(251,191,36,0.35); }
+  .status-badge.paused { background: rgba(148,163,184,0.14); color: #cbd5e1; border-color: rgba(148,163,184,0.3); }
+  .status-badge.err { background: rgba(251,113,133,0.16); color: var(--rose); border-color: rgba(251,113,133,0.35); }
+  .status-dot { width: 8px; height: 8px; border-radius: 999px; background: currentColor; }
+
+  .content { flex: 1; overflow-y: auto; padding: 18px 24px 28px; }
+  .tab-pane { display: none; flex-direction: column; gap: 14px; }
+  .tab-pane.active { display: flex; }
+
+  /* Cards & Grids */
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 14px; padding: 14px 16px;
+  }
+  .card-title {
+    font-size: 11.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.7px;
+    color: var(--teal); margin-bottom: 10px;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+  .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+
+  /* Buttons */
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+    padding: 8px 13px; border-radius: 10px;
+    border: 1px solid var(--border); background: rgba(255,255,255,0.06);
+    color: var(--text); font-size: 12.5px; font-weight: 600; cursor: pointer;
+    transition: all 120ms ease;
+  }
+  .btn:hover { background: rgba(255,255,255,0.12); border-color: rgba(255,255,255,0.18); }
+  .btn.primary { background: linear-gradient(135deg, #14b8a6, #3b82f6); border-color: transparent; color: #04131c; }
+  .btn.primary:hover { filter: brightness(1.08); }
+  .btn.danger { background: rgba(251,113,133,0.14); border-color: rgba(251,113,133,0.35); color: var(--rose); }
+  .btn.sm { padding: 5px 10px; font-size: 11.5px; border-radius: 8px; }
+
+  /* Stat Tiles */
+  .stat {
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+    border-radius: 11px; padding: 10px 12px;
+  }
+  .stat label { font-size: 11px; color: var(--muted); display: block; }
+  .stat .val { font-size: 18px; font-weight: 700; color: #f8fafc; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .stat .sub { font-size: 11px; color: var(--teal); }
+
+  /* Controls */
+  .row {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 7px 0; border-bottom: 1px solid rgba(255,255,255,0.05);
+  }
+  .row:last-child { border-bottom: 0; }
+  .row-label { display: flex; flex-direction: column; }
+  .row-label strong { font-size: 13px; font-weight: 500; }
+  .row-label span { font-size: 11px; color: var(--muted); }
+  .slider-wrap { display: flex; align-items: center; gap: 10px; min-width: 220px; }
+  input[type=range] {
+    flex: 1; -webkit-appearance: none; height: 5px; border-radius: 99px;
+    background: rgba(255,255,255,0.14); outline: none;
+  }
+  input[type=range]::-webkit-slider-thumb {
+    -webkit-appearance: none; width: 15px; height: 15px; border-radius: 50%;
+    background: var(--teal); cursor: pointer; box-shadow: 0 0 10px rgba(45,212,191,0.5);
+  }
+  .num-val { width: 46px; text-align: right; font-weight: 700; color: var(--teal); font-variant-numeric: tabular-nums; }
+
+  /* Toggle Switch */
+  .switch { position: relative; width: 38px; height: 21px; flex-shrink: 0; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .switch .track {
+    position: absolute; inset: 0; border-radius: 99px; cursor: pointer;
+    background: rgba(255,255,255,0.16); transition: background 150ms;
+  }
+  .switch .track:before {
+    content: ""; position: absolute; width: 15px; height: 15px; left: 3px; top: 3px;
+    border-radius: 50%; background: #fff; transition: transform 150ms;
+  }
+  .switch input:checked + .track { background: var(--teal); }
+  .switch input:checked + .track:before { transform: translateX(17px); }
+
+  select, input[type=text] {
+    background: rgba(10, 15, 26, 0.85); color: var(--text);
+    border: 1px solid var(--border); border-radius: 8px;
+    padding: 6px 10px; font-size: 12.5px; outline: none;
+  }
+  select:focus, input[type=text]:focus { border-color: var(--teal); }
+
+  /* Probability & Timing Bars */
+  .bar-row { display: grid; grid-template-columns: 195px 1fr 44px; align-items: center; gap: 10px; margin: 5px 0; }
+  .bar-bg { height: 7px; border-radius: 99px; background: rgba(255,255,255,0.08); overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 99px; background: linear-gradient(90deg, var(--teal), var(--blue)); transition: width 80ms linear; }
+
+  /* Preset & Practice Cards */
+  .preset-card {
+    padding: 12px; border-radius: 12px; border: 1.5px solid var(--border);
+    background: rgba(255,255,255,0.03); cursor: pointer; transition: all 140ms;
+  }
+  .preset-card:hover { border-color: rgba(45,212,191,0.4); }
+  .preset-card.selected { border-color: var(--teal); background: rgba(45,212,191,0.1); }
+  .preset-card h4 { font-size: 13.5px; margin-bottom: 4px; }
+  .preset-card p { font-size: 11.5px; color: var(--muted); }
+
+  .perm-pill {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 11px; border-radius: 10px;
+    background: rgba(255,255,255,0.03); border: 1px solid var(--border);
+  }
+  .perm-ok { color: var(--green); font-weight: 700; font-size: 11.5px; }
+  .perm-miss { color: var(--amber); font-weight: 700; font-size: 11.5px; }
+
+  .practice-card {
+    padding: 11px 13px; border-radius: 11px; border: 1px solid var(--border);
+    background: rgba(255,255,255,0.03); display: flex; align-items: center; justify-content: space-between; gap: 10px;
+  }
+  .practice-card.done { border-color: rgba(52,211,153,0.55); background: rgba(52,211,153,0.10); }
+  .practice-check { font-size: 16px; font-weight: 700; color: var(--muted); }
+  .practice-card.done .practice-check { color: var(--green); }
+
+  .code-box {
+    background: rgba(0,0,0,0.42); border: 1px solid var(--border); border-radius: 9px;
+    padding: 9px 12px; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11.5px; color: #cbd5e1; white-space: pre-wrap; word-break: break-all;
+  }
+  .pill-tag {
+    display: inline-block; padding: 2px 8px; border-radius: 99px;
+    font-size: 11px; font-weight: 600; background: rgba(96,165,250,0.16); color: var(--blue);
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-logo">✦</div>
+      <div>
+        <h1>AeroHand</h1>
+        <small id="ver-label">v0.2.0</small>
+      </div>
+    </div>
+
+    <button class="nav-btn active" data-tab="dashboard" onclick="switchTab('dashboard')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="9" rx="2"/><rect x="14" y="3" width="7" height="5" rx="2"/><rect x="14" y="12" width="7" height="9" rx="2"/><rect x="3" y="16" width="7" height="5" rx="2"/></svg>
+      <span data-t="tabs.dashboard">Tổng quan</span>
+    </button>
+    <button class="nav-btn" data-tab="gestures" onclick="switchTab('gestures')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 11V6a2 2 0 0 0-4 0v5"/><path d="M14 10V4a2 2 0 0 0-4 0v6"/><path d="M10 10.5V6a2 2 0 0 0-4 0v8"/><path d="M18 8a2 2 0 1 1 4 0v6a8 8 0 0 1-8 8h-2c-2.8 0-4.5-.86-5.99-2.34l-3.6-3.6a2 2 0 0 1 2.83-2.82L7 15"/></svg>
+      <span data-t="tabs.gestures">Cử chỉ</span>
+    </button>
+    <button class="nav-btn" data-tab="cursor" onclick="switchTab('cursor')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4l7 17 2.5-6.5L20 12 4 4z"/></svg>
+      <span data-t="tabs.cursor">Con trỏ & Cuộn</span>
+    </button>
+    <button class="nav-btn" data-tab="palm_wheel" onclick="switchTab('palm_wheel')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3"/><path d="M12 3v6M12 15v6M3 12h6M15 12h6"/></svg>
+      <span data-t="tabs.palm_wheel">Palm Wheel</span>
+    </button>
+    <button class="nav-btn" data-tab="camera" onclick="switchTab('camera')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/><circle cx="12" cy="13" r="4"/></svg>
+      <span data-t="tabs.camera">Camera & HUD</span>
+    </button>
+    <button class="nav-btn" data-tab="dictation" onclick="switchTab('dictation')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/></svg>
+      <span data-t="tabs.dictation">Giọng nói & API</span>
+    </button>
+    <button class="nav-btn" data-tab="ml" onclick="switchTab('ml')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      <span data-t="tabs.ml">Dữ liệu ML</span>
+    </button>
+    <button class="nav-btn" data-tab="onboarding" onclick="switchTab('onboarding')">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+      <span data-t="tabs.onboarding">Hướng dẫn</span>
+    </button>
+
+    <div class="sidebar-footer">
+      <div class="lang-switch">
+        <button id="lang-vi" class="lang-btn active" onclick="setLanguage('vi')">🇻🇳 Tiếng Việt</button>
+        <button id="lang-en" class="lang-btn" onclick="setLanguage('en')">🇺🇸 English</button>
+      </div>
+      <div style="display:flex;gap:6px">
+        <button class="btn sm" style="flex:1" onclick="post('reset_defaults')" id="btn-reset">Mặc định</button>
+        <button class="btn sm danger" onclick="post('quit')" id="btn-quit">Thoát</button>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN -->
+  <main class="main">
+    <header class="topbar">
+      <div class="topbar-title">
+        <h2 id="page-heading">Tổng quan</h2>
+        <p id="app-tagline">Điều khiển Mac không chạm • Tinh hoa Airpoint × An toàn GestureCtl</p>
+      </div>
+      <div id="status-badge" class="status-badge"><span class="status-dot"></span><span id="status-text">ĐANG KHỞI ĐỘNG...</span></div>
+    </header>
+
+    <section class="content">
+      <!-- 1. DASHBOARD -->
+      <div id="tab-dashboard" class="tab-pane active">
+        <div class="grid-4">
+          <button class="btn primary" id="qa-pause" onclick="post('toggle_pause')">Tạm dừng</button>
+          <button class="btn" id="qa-mode" onclick="post('toggle_dry_run')">Chế độ: Live</button>
+          <button class="btn" id="qa-hud" onclick="post('toggle_camera_hud')">Camera HUD: Bật</button>
+          <button class="btn" id="qa-recenter" onclick="post('recenter')">Căn giữa chuột</button>
+        </div>
+
+        <div class="grid-4">
+          <div class="stat"><label id="st-fps-lbl">Tốc độ khung hình</label><div class="val" id="st-fps">-- FPS</div><div class="sub" id="st-del">GPU Metal</div></div>
+          <div class="stat"><label id="st-lat-lbl">Độ trễ Pipeline</label><div class="val" id="st-lat">-- ms</div><div class="sub" id="st-cls">Heuristic 3D</div></div>
+          <div class="stat"><label id="st-sys-lbl">Hệ thống</label><div class="val" id="st-cpu">--% CPU</div><div class="sub" id="st-ram">-- MB RAM</div></div>
+          <div class="stat"><label id="st-guard-lbl">Typing Guard</label><div class="val" id="st-guard">Sẵn sàng</div><div class="sub" id="st-app">macOS</div></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span id="t-live-hand">TÍN HIỆU BÀN TAY & XÁC SUẤT CỬ CHỈ TRỰC TIẾP</span><span class="pill-tag" id="live-dirz">dirZ: --</span></div>
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:var(--muted)">
+            <span id="live-hand-txt">Tay: Chưa thấy</span>
+            <span id="live-last-act">Hành động cuối: Ready</span>
+          </div>
+          <div id="prob-bars"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span id="t-perms">QUYỀN HỆ THỐNG MACOS</span></div>
+          <div class="grid-2">
+            <div class="perm-pill">
+              <div><strong id="p-acc-t">Trợ năng (Accessibility)</strong><div style="font-size:11px;color:var(--muted)" id="p-acc-d">Di chuột, click, cuộn, chia cửa sổ</div></div>
+              <div style="display:flex;align-items:center;gap:8px"><span id="p-acc-st" class="perm-miss">--</span><button class="btn sm" onclick="post('open_privacy',{pane:'Privacy_Accessibility'})">Mở</button></div>
+            </div>
+            <div class="perm-pill">
+              <div><strong id="p-cam-t">Camera</strong><div style="font-size:11px;color:var(--muted)" id="p-cam-d">Nhận diện 21 khớp tay local 100%</div></div>
+              <div style="display:flex;align-items:center;gap:8px"><span id="p-cam-st" class="perm-miss">--</span><button class="btn sm" onclick="post('open_privacy',{pane:'Privacy_Camera'})">Mở</button></div>
+            </div>
+            <div class="perm-pill">
+              <div><strong id="p-mic-t">Microphone</strong><div style="font-size:11px;color:var(--muted)" id="p-mic-d">Ghi âm cho tính năng Đọc giọng nói</div></div>
+              <div style="display:flex;align-items:center;gap:8px"><span id="p-mic-st" class="perm-miss">--</span><button class="btn sm" onclick="post('open_privacy',{pane:'Privacy_Microphone'})">Mở</button></div>
+            </div>
+            <div class="perm-pill">
+              <div><strong id="p-sp-t">Nhận dạng giọng nói</strong><div style="font-size:11px;color:var(--muted)" id="p-sp-d">Apple Speech tiếng Việt / Anh</div></div>
+              <div style="display:flex;align-items:center;gap:8px"><span id="p-sp-st" class="perm-miss">--</span><button class="btn sm" onclick="post('open_privacy',{pane:'Privacy_SpeechRecognition'})">Mở</button></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 2. GESTURES -->
+      <div id="tab-gestures" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span id="t-presets">BỘ CỬ CHỈ MẪU (1 CHẠM)</span></div>
+          <div class="grid-2">
+            <div class="preset-card" id="preset-airpoint" onclick="applyPreset('airpoint')">
+              <h4>✦ Chuẩn Airpoint (Khuyên dùng)</h4>
+              <p>Trỏ giữ yên chỉ chuột • Cái+Giữa = Click • Cái+Trỏ+Giữa = Kéo thả • Cái+Áp út = Cuộn/Chuột phải • Cái+Trỏ = Đọc giọng nói</p>
+            </div>
+            <div class="preset-card" id="preset-classic" onclick="applyPreset('classic')">
+              <h4>👆 Cổ điển (Quen tay người mới)</h4>
+              <p>Cái+Trỏ (chạm) = Click • Cái+Trỏ (giữ) = Kéo thả • Cái+Giữa = Đọc giọng nói • Cái+Áp út = Cuộn/Chuột phải</p>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span id="t-hand-mode">CHẾ ĐỘ BÀN TAY & BẬT/TẮT TỪNG CỬ CHỈ</span></div>
+          <div class="grid-2">
+            <div class="row"><div class="row-label"><strong>Số tay nhận diện</strong><span>Bật 2 tay cho Zoom & Palm Wheel trái/phải</span></div>
+              <select id="cfg-num-hands" onchange="setKey('tracker.num_hands', parseInt(this.value))">
+                <option value="2">2 tay (Đầy đủ Airpoint)</option>
+                <option value="1">1 tay (Tiết kiệm pin)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong>Tay điều khiển chuột</strong><span>Ưu tiên tay thuận</span></div>
+              <select id="cfg-cursor-hand" onchange="setKey('hand.cursor_hand', this.value); setKey('hand.click_hand', this.value);">
+                <option value="Right">Tay phải (Right)</option>
+                <option value="Left">Tay trái (Left)</option>
+                <option value="Both">Cả hai tay (Both)</option>
+              </select>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-top:6px" id="gesture-toggles"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span id="t-remap">TÙY BIẾN ÁNH XẠ CỬ CHỈ (TAP & HOLD)</span></div>
+          <div id="remap-table"></div>
+        </div>
+      </div>
+
+      <!-- 3. CURSOR & SCROLL -->
+      <div id="tab-cursor" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>CON TRỎ & ĐỘNG HỌC (KINEMATICS)</span></div>
+          <div id="cursor-sliders"></div>
+          <div class="grid-2" style="margin-top:6px" id="cursor-toggles"></div>
+        </div>
+        <div class="card">
+          <div class="card-title"><span>CUỘN 2D QUÁN TÍNH, CHIA CỬA SỔ & TYPING GUARD</span></div>
+          <div id="scroll-sliders"></div>
+          <div class="grid-2" style="margin-top:6px" id="scroll-toggles"></div>
+        </div>
+      </div>
+
+      <!-- 4. PALM WHEEL -->
+      <div id="tab-palm_wheel" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>PALM WHEEL — MENU XÒE LÒNG BÀN TAY 2 TAY</span></div>
+          <div class="grid-2" id="pw-toggles"></div>
+          <div id="pw-sliders" style="margin-top:6px"></div>
+        </div>
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-title"><span>TAY PHẢI (R1 – R5)</span></div>
+            <div id="pw-right-slots"></div>
+          </div>
+          <div class="card">
+            <div class="card-title"><span>TAY TRÁI (L1 – L5)</span></div>
+            <div id="pw-left-slots"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 5. CAMERA & HUD -->
+      <div id="tab-camera" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>THIẾT BỊ CAMERA (AVFOUNDATION)</span><button class="btn sm" onclick="post('refresh_cameras')">↻ Làm mới</button></div>
+          <div class="row"><div class="row-label"><strong>Chọn Camera</strong><span>Hỗ trợ FaceTime HD, iPhone Continuity, Webcam rời</span></div>
+            <select id="cfg-cam-dev" style="min-width:240px" onchange="setKey('camera.device_id', this.value)"></select>
+          </div>
+          <div class="grid-3" style="margin-top:8px">
+            <div class="row"><div class="row-label"><strong>Độ phân giải</strong></div>
+              <select id="cfg-cam-res" onchange="setCamRes(this.value)">
+                <option value="640x480">480p (Nhanh nhất)</option>
+                <option value="1280x720">720p HD</option>
+                <option value="1920x1080">1080p Full HD</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong>Tỷ lệ khung</strong></div>
+              <select id="cfg-cam-ar" onchange="setKey('camera.aspect_ratio', this.value)">
+                <option value="4:3">4:3</option>
+                <option value="16:9">16:9</option>
+                <option value="1:1">1:1 Vuông</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong>Lật gương</strong></div>
+              <label class="switch"><input type="checkbox" id="cfg-cam-mirror" onchange="setKey('camera.mirror', this.checked)"><span class="track"></span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>KHUNG CAMERA NỔI (HOVER-FADE) & LỚP OVERLAY MÀN HÌNH</span></div>
+          <div class="grid-2">
+            <div class="row"><div class="row-label"><strong>Vị trí góc màn hình</strong></div>
+              <select id="cfg-hud-pos" onchange="setKey('ui.camera_hud.position', this.value)">
+                <option value="bottom-right">Dưới - Phải</option>
+                <option value="bottom-left">Dưới - Trái</option>
+                <option value="top-right">Trên - Phải</option>
+                <option value="top-left">Trên - Trái</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong>Kích thước HUD</strong></div>
+              <select id="cfg-hud-size" onchange="setKey('ui.camera_hud.size', this.value)">
+                <option value="small">Nhỏ (220×154)</option>
+                <option value="medium">Vừa (300×210)</option>
+                <option value="large">Lớn (390×273)</option>
+              </select>
+            </div>
+          </div>
+          <div id="hud-sliders"></div>
+          <div class="grid-2" style="margin-top:6px" id="overlay-toggles"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>ÂM THANH PHẢN HỒI CLICK & PALM WHEEL</span><button class="btn sm" onclick="post('test_sound')">🔊 Thử âm thanh</button></div>
+          <div id="audio-controls"></div>
+        </div>
+      </div>
+
+      <!-- 6. DICTATION & API -->
+      <div id="tab-dictation" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>ĐỌC GIỌNG NÓI THÀNH VĂN BẢN (TIẾNG VIỆT & ANH LOCAL)</span><button class="btn sm primary" id="btn-test-dict" onclick="post('toggle_dictation')">🎙 Thử ghi âm</button></div>
+          <div class="grid-2">
+            <div class="row"><div class="row-label"><strong>Ngôn ngữ nói</strong><span>Chèn chữ có dấu an toàn không lỗi Telex</span></div>
+              <select id="cfg-dict-lang" onchange="setKey('dictation.language', this.value)">
+                <option value="vi-VN">🇻🇳 Tiếng Việt (vi-VN)</option>
+                <option value="en-US">🇺🇸 English (en-US)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong>Động cơ nhận dạng</strong></div>
+              <select id="cfg-dict-eng" onchange="setKey('dictation.engine', this.value)">
+                <option value="auto">Tự động (Apple Speech On-Device)</option>
+                <option value="apple_speech">Apple Speech Framework</option>
+                <option value="mlx_whisper">MLX Whisper (nếu đã cài)</option>
+              </select>
+            </div>
+          </div>
+          <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="dict-last-out">Bản ghi gần nhất: —</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>HỆ THỐNG, PHÍM TẮT TOÀN CỤC & TỰ ĐỘNG HÓA</span></div>
+          <div class="row">
+            <div class="row-label"><strong>Tự khởi động cùng macOS (Launch at Login)</strong><span>Tự mở AeroHand mỗi khi đăng nhập Mac</span></div>
+            <label class="switch"><input type="checkbox" id="cfg-launch-login" onchange="post('set_launch_at_login',{enabled:this.checked})"><span class="track"></span></label>
+          </div>
+          <div class="row">
+            <div class="row-label"><strong>Hồ sơ tự động theo ứng dụng (Per-App Profiles)</strong><span>Tự đổi tốc độ cuộn / độ nhạy theo VS Code, Safari, Keynote...</span></div>
+            <label class="switch"><input type="checkbox" id="cfg-profiles-en" onchange="setKey('profiles.enabled', this.checked)"><span class="track"></span></label>
+          </div>
+          <div class="row">
+            <div class="row-label"><strong>Phím tắt toàn cục</strong><span>Cmd+Shift+A (Tạm dừng) • Cmd+Shift+R (Căn giữa) • Cmd+Shift+H (Camera HUD)</span></div>
+            <span class="pill-tag">Đang bật</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>LOCAL HTTP API, CLI & APPLE SHORTCUTS (URL SCHEME)</span></div>
+          <div class="code-box"># Điều khiển AeroHand từ Terminal / Script / Raycast:
+aerohand status --json
+aerohand tracking on | off
+aerohand settings set cursor.sensitivity 2.4
+aerohand vitals
+aerohand see
+
+# Liên kết Apple Shortcuts (URL Scheme):
+aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |   aerohand://recenter</div>
+        </div>
+      </div>
+
+      <!-- 7. ML STUDIO & PROFILER -->
+      <div id="tab-ml" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>BỘ PHÂN LOẠI CỬ CHỈ (HEURISTIC 3D vs. ONNX TCN)</span></div>
+          <div class="row">
+            <div class="row-label"><strong>Backend đang chạy</strong><span id="ml-model-status">Heuristic 3D (Sẵn sàng không cần dữ liệu)</span></div>
+            <select id="cfg-cls-backend" onchange="setKey('classifier.backend', this.value)">
+              <option value="heuristic_3d">Heuristic 3D (Mặc định)</option>
+              <option value="onnx_tcn">ONNX 1D-TCN (Model tự huấn luyện)</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>STUDIO THU THẬP DỮ LIỆU HUẤN LUYỆN TCN (TRONG APP)</span><span class="pill-tag" id="col-total">0 mẫu</span></div>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
+            <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
+            <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
+            <button class="btn" onclick="post('collector_save')">💾 Lưu JSON</button>
+            <button class="btn danger" onclick="post('collector_clear')">🗑 Xóa tạm</button>
+          </div>
+          <div id="col-bars"></div>
+          <div class="code-box" style="margin-top:10px"># Sau khi quay đủ ~300–500 mẫu mỗi cử chỉ, chạy lệnh sau để huấn luyện & xuất ONNX:
+cd /Users/macos/Documents/AeroHand && uv sync --extra train
+uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invariant348</div>
+        </div>
+
+        <div class="card">
+          <div class="card-title"><span>ĐO ĐỘ TRỄ TỪNG TẦNG (PIPELINE TIMING PROFILER)</span><span class="pill-tag" id="prof-headroom">Headroom: -- ms</span></div>
+          <div id="timing-bars"></div>
+        </div>
+      </div>
+
+      <!-- 8. ONBOARDING & PRACTICE -->
+      <div id="tab-onboarding" class="tab-pane">
+        <div class="card">
+          <div class="card-title"><span>BÀI TẬP THỰC HÀNH TƯƠNG TÁC (TỰ SÁNG XANH KHI LÀM ĐÚNG)</span><button class="btn sm" onclick="post('reset_practice')">↺ Làm lại</button></div>
+          <p style="font-size:12px;color:var(--muted);margin-bottom:10px">Giơ bàn tay hướng vào camera (ngón trỏ hơi hướng về màn hình) và thử lần lượt 8 thao tác dưới đây. Mọi cử chỉ đã hoạt động kể cả khi bật chế độ Chạy thử (Dry-Run)!</p>
+          <div class="grid-2" id="practice-grid"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+  let STATE = { cfg: {}, i18n: {}, cameras: [], launch_at_login: false };
+  let CURRENT_TAB = "dashboard";
+  let BUILT_CONTROLS = false;
+
+  function post(action, data = {}) {
+    try {
+      window.webkit.messageHandlers.aerohand.postMessage({ action, ...data });
+    } catch (e) { console.log("bridge:", action, data); }
+  }
+
+  function setKey(key, value) {
+    post("set_key", { key, value });
+  }
+
+  function setLanguage(lang) {
+    setKey("ui.language", lang);
+  }
+
+  function applyPreset(preset) {
+    post("apply_preset", { preset });
+  }
+
+  function setCamRes(val) {
+    const [w, h] = val.split("x").map(Number);
+    post("set_keys", { updates: { "camera.width": w, "camera.height": h } });
+  }
+
+  function switchTab(tab) {
+    CURRENT_TAB = tab;
+    document.querySelectorAll(".nav-btn").forEach(b => b.classList.toggle("active", b.dataset.tab === tab));
+    document.querySelectorAll(".tab-pane").forEach(p => p.classList.toggle("active", p.id === "tab-" + tab));
+    const t = STATE.i18n.tabs || {};
+    document.getElementById("page-heading").textContent = t[tab] || tab;
+  }
+
+  function getPath(obj, path, fallback) {
+    let cur = obj;
+    for (const p of path.split(".")) {
+      if (cur && typeof cur === "object" && p in cur) cur = cur[p];
+      else return fallback;
+    }
+    return cur;
+  }
+
+  function makeSliderRow(id, label, sub, path, min, max, step, val) {
+    return `<div class="row">
+      <div class="row-label"><strong>${label}</strong><span>${sub}</span></div>
+      <div class="slider-wrap">
+        <input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}"
+          oninput="document.getElementById('${id}-v').textContent=Number(this.value).toFixed(${step < 0.1 ? 2 : (step < 1 ? 1 : 0)}); setKey('${path}', Number(this.value));" />
+        <span class="num-val" id="${id}-v">${Number(val).toFixed(step < 0.1 ? 2 : (step < 1 ? 1 : 0))}</span>
+      </div>
+    </div>`;
+  }
+
+  function makeToggleRow(id, label, sub, path, checked) {
+    return `<div class="row">
+      <div class="row-label"><strong>${label}</strong><span>${sub}</span></div>
+      <label class="switch"><input type="checkbox" id="${id}" ${checked ? "checked" : ""} onchange="setKey('${path}', this.checked)"><span class="track"></span></label>
+    </div>`;
+  }
+
+  const POSE_KEYS = [
+    "idle", "thumb_index_pinch", "thumb_middle_pinch",
+    "thumb_ring_pinch", "thumb_pinky_pinch", "thumb_pinky_base", "thumb_index_middle_pinch"
+  ];
+  const TAP_OPTS = ["none", "left_click", "right_click"];
+  const HOLD_OPTS = ["none", "drag", "scroll", "dictation", "window_tile", "spaces_nav"];
+  const PW_FLAT_OPTS = [
+    "unassigned", "toggle_pause", "recenter", "show_main_window", "toggle_camera_hud",
+    "mission_control", "spotlight", "dictation_toggle", "siri_listen",
+    "media_play_pause", "media_next", "media_prev", "volume_up", "volume_down", "volume_mute",
+    "window_hide", "window_fullscreen", "window_minimize", "window_close",
+    "edit_copy", "edit_paste", "edit_cut", "edit_undo", "edit_redo", "keyboard_emoji"
+  ];
+
+  function buildDynamicControls() {
+    const c = STATE.cfg;
+    const i18n = STATE.i18n;
+    const lang = getPath(c, "ui.language", "vi");
+    const isVi = lang !== "en";
+    const acts = i18n.actions || {};
+    const poses = i18n.poses || {};
+
+    // Language switch & sidebar translations
+    document.getElementById("lang-vi").classList.toggle("active", isVi);
+    document.getElementById("lang-en").classList.toggle("active", !isVi);
+    document.querySelectorAll("[data-t]").forEach(el => {
+      const v = getPath(i18n, el.dataset.t, null);
+      if (v) el.textContent = v;
+    });
+    document.getElementById("app-tagline").textContent = i18n.app_tagline || "";
+    document.getElementById("page-heading").textContent = (i18n.tabs || {})[CURRENT_TAB] || CURRENT_TAB;
+    document.getElementById("btn-reset").textContent = isVi ? "Mặc định" : "Reset";
+    document.getElementById("btn-quit").textContent = isVi ? "Thoát" : "Quit";
+
+    // Presets
+    const curPreset = getPath(c, "hand.gesture_preset", "airpoint");
+    document.getElementById("preset-airpoint").classList.toggle("selected", curPreset === "airpoint");
+    document.getElementById("preset-classic").classList.toggle("selected", curPreset === "classic");
+
+    // Hand selectors
+    document.getElementById("cfg-num-hands").value = String(getPath(c, "tracker.num_hands", 2));
+    document.getElementById("cfg-cursor-hand").value = String(getPath(c, "hand.cursor_hand", "Right"));
+
+    // Gesture toggles
+    const gt = [
+      ["g-click", isVi ? "Click trái & Double Click" : "Left Click & Double Click", "gestures.enable_click"],
+      ["g-rclick", isVi ? "Chuột phải" : "Right Click", "gestures.enable_right_click"],
+      ["g-grab", isVi ? "Kéo thả (Drag)" : "Click & Drag", "gestures.enable_grab"],
+      ["g-scroll", isVi ? "Cuộn 2D quán tính" : "2D Inertial Scroll", "gestures.enable_scroll"],
+      ["g-wt", isVi ? "Chia cửa sổ (AXUIElement)" : "Window Tiling (AXUIElement)", "gestures.enable_window_tile"],
+      ["g-sn", isVi ? "Chuyển Space / Mission Control" : "Spaces & Mission Control", "gestures.enable_spaces_nav"],
+      ["g-dict", isVi ? "Đọc giọng nói (Hold)" : "Hold-to-Dictate", "gestures.enable_dictation"],
+      ["g-zoom", isVi ? "Phóng to/Thu nhỏ 2 tay" : "Two-Hand Pinch Zoom", "gestures.enable_zoom"],
+      ["g-chold", isVi ? "Giữ cử chỉ Click để Kéo thả" : "Hold Click Pose to Drag", "pose_state_machine.enable_click_hold"],
+    ];
+    document.getElementById("gesture-toggles").innerHTML = gt
+      .map(([id, lbl, path]) => makeToggleRow(id, lbl, "", path, !!getPath(c, path, true))).join("");
+
+    // Remap table
+    const tapMap = getPath(c, "pose_state_machine.tap_actions", {});
+    const holdMap = getPath(c, "pose_state_machine.hold_actions", {});
+    document.getElementById("remap-table").innerHTML = POSE_KEYS.filter(k => k !== "idle").map(pose => {
+      const tapVal = tapMap[pose] || "none";
+      const holdVal = holdMap[pose] || "none";
+      const tapOpts = TAP_OPTS.map(o => `<option value="${o}" ${o === tapVal ? "selected" : ""}>${acts[o] || o}</option>`).join("");
+      const holdOpts = HOLD_OPTS.map(o => `<option value="${o}" ${o === holdVal ? "selected" : ""}>${acts[o] || o}</option>`).join("");
+      return `<div class="row">
+        <div class="row-label"><strong>${poses[pose] || pose}</strong><span>${pose}</span></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span style="font-size:11px;color:var(--muted)">Tap:</span>
+          <select onchange="setKey('pose_state_machine.tap_actions.${pose}', this.value)">${tapOpts}</select>
+          <span style="font-size:11px;color:var(--muted)">Hold:</span>
+          <select onchange="setKey('pose_state_machine.hold_actions.${pose}', this.value)">${holdOpts}</select>
+        </div>
+      </div>`;
+    }).join("");
+
+    // Cursor sliders & toggles
+    document.getElementById("cursor-sliders").innerHTML = [
+      makeSliderRow("s-sens", isVi ? "Độ nhạy con trỏ" : "Pointer Sensitivity", isVi ? "Tốc độ di chuyển tương đối" : "Relative cursor gain", "cursor.pointer_sensitivity", 0.8, 4.5, 0.05, getPath(c, "cursor.pointer_sensitivity", 2.2)),
+      makeSliderRow("s-acc", isVi ? "Gia tốc con trỏ" : "Pointer Acceleration", isVi ? "Lướt nhanh khi vẩy tay, chậm chuẩn khi ngắm" : "Speed-adaptive boost", "cursor.pointer_acceleration", 0.0, 2.5, 0.05, getPath(c, "cursor.pointer_acceleration", 1.4)),
+      makeSliderRow("s-dirz", isVi ? "Ngưỡng Cổng chỉ tay 3D (dirZ)" : "3D Pointing Gate (dirZ)", isVi ? "Càng âm càng chặt (chống trôi chuột khi hạ tay)" : "More negative = stricter forward aim", "cursor.pointing_forward_z_threshold", -0.30, 0.05, 0.01, getPath(c, "cursor.pointing_forward_z_threshold", -0.15)),
+      makeSliderRow("s-lerp", isVi ? "Tốc độ nội suy 60 Hz Lerp" : "60 Hz Lerp Speed", isVi ? "Cao hơn = bám tay sát hơn" : "Higher = tighter tracking", "cursor.lerp_speed", 20, 90, 1, getPath(c, "cursor.lerp_speed", 55)),
+    ].join("");
+    document.getElementById("cursor-toggles").innerHTML = [
+      makeToggleRow("c-lerp", isVi ? "Bật làm mượt 60 Hz Lerp" : "Enable 60 Hz Lerp", "", "cursor.enable_lerp_60hz", !!getPath(c, "cursor.enable_lerp_60hz", true)),
+      makeToggleRow("c-gate", isVi ? "Cổng chỉ tay 3D (dirZ)" : "3D Pointing Gate", "", "cursor.enable_pointing_gate", !!getPath(c, "cursor.enable_pointing_gate", true)),
+      makeToggleRow("c-dist", isVi ? "Bù khoảng cách tay (Distance Comp)" : "Distance Compensation", "", "cursor.enable_distance_compensation", !!getPath(c, "cursor.enable_distance_compensation", true)),
+      makeToggleRow("c-multi", isVi ? "Hỗ trợ Đa màn hình" : "Multi-Monitor Support", "", "system.multi_monitor", !!getPath(c, "system.multi_monitor", true)),
+    ].join("");
+
+    // Scroll & Guard
+    document.getElementById("scroll-sliders").innerHTML = [
+      makeSliderRow("s-scspd", isVi ? "Tốc độ cuộn 2D" : "2D Scroll Speed", isVi ? "Độ nhạy cuộn dọc và ngang" : "Horizontal & vertical scroll speed", "scroll.speed", 0.3, 2.5, 0.05, getPath(c, "scroll.speed", 1.0)),
+      makeSliderRow("s-wt", isVi ? "Ngưỡng vuốt chia cửa sổ (px)" : "Window Tile Sensitivity (px)", "", "window_tile.sensitivity_px", 10, 60, 1, getPath(c, "window_tile.sensitivity_px", 20)),
+      makeSliderRow("s-tgk", isVi ? "Typing Guard sau gõ phím (ms)" : "Typing Guard Keyboard Hold (ms)", isVi ? "Chặn cử chỉ nhầm khi gõ phím (0 quyền)" : "Blocks hand gestures after physical keys", "typing_guard.keyboard_ms", 300, 3000, 100, getPath(c, "typing_guard.keyboard_ms", 1500)),
+    ].join("");
+    document.getElementById("scroll-toggles").innerHTML = [
+      makeToggleRow("sc-inert", isVi ? "Quán tính cuộn + Momentum Phase" : "Scroll Inertia + Momentum Phase", "", "scroll.enable_inertia", !!getPath(c, "scroll.enable_inertia", true)),
+      makeToggleRow("sc-nat", isVi ? "Cuộn tự nhiên (Natural Scrolling)" : "Natural Scrolling", "", "scroll.natural_scrolling", !!getPath(c, "scroll.natural_scrolling", true)),
+      makeToggleRow("sc-axis", isVi ? "Khóa trục X / Y thông minh" : "Smart Axis Lock", "", "scroll.enable_axis_lock", !!getPath(c, "scroll.enable_axis_lock", true)),
+      makeToggleRow("sc-wtan", isVi ? "Animation chia cửa sổ" : "Animate Window Tiling", "", "window_tile.animate", !!getPath(c, "window_tile.animate", true)),
+      makeToggleRow("sc-tg", isVi ? "Typing Guard (0-Permission)" : "Zero-Perm Typing Guard", "", "typing_guard.enabled", !!getPath(c, "typing_guard.enabled", true)),
+      makeToggleRow("sc-idle", isVi ? "Tiết kiệm pin 8 FPS khi rảnh" : "8 FPS Idle Throttle", "", "runtime.idle_throttle_enabled", !!getPath(c, "runtime.idle_throttle_enabled", true)),
+    ].join("");
+
+    // Palm Wheel
+    document.getElementById("pw-toggles").innerHTML = [
+      makeToggleRow("pw-en", isVi ? "Bật Palm Wheel" : "Enable Palm Wheel", "", "palm_wheel.enabled", !!getPath(c, "palm_wheel.enabled", true)),
+      makeToggleRow("pw-fix", isVi ? "Cố định giữa màn hình" : "Fixed Screen Center", "", "ui.palm_wheel_fixed", !!getPath(c, "ui.palm_wheel_fixed", false)),
+      makeToggleRow("pw-r", isVi ? "Bật Tay phải (R1–R5)" : "Enable Right Hand", "", "palm_wheel.enabled_hands.Right", !!getPath(c, "palm_wheel.enabled_hands.Right", true)),
+      makeToggleRow("pw-l", isVi ? "Bật Tay trái (L1–L5)" : "Enable Left Hand", "", "palm_wheel.enabled_hands.Left", !!getPath(c, "palm_wheel.enabled_hands.Left", true)),
+    ].join("");
+    document.getElementById("pw-sliders").innerHTML = [
+      makeSliderRow("pw-hold", isVi ? "Thời gian giữ mở (ms)" : "Activation Hold (ms)", isVi ? "350ms giúp chống kích hoạt nhầm khi vuốt tóc" : "350ms suppresses false triggers", "palm_wheel.activation_hold_ms", 150, 700, 10, getPath(c, "palm_wheel.activation_hold_ms", 350)),
+      makeSliderRow("pw-dot", isVi ? "Độ thẳng lòng bàn tay (Dot)" : "Palm Facing Dot Threshold", "", "palm_wheel.palm_facing_dot_threshold", 0.35, 0.85, 0.02, getPath(c, "palm_wheel.palm_facing_dot_threshold", 0.60)),
+    ].join("");
+
+    const fingerLabels = isVi
+      ? { thumb: "Ngón cái (1)", index: "Ngón trỏ (2)", middle: "Ngón giữa (3)", ring: "Áp út (4)", pinky: "Ngón út (5)" }
+      : { thumb: "Thumb (1)", index: "Index (2)", middle: "Middle (3)", ring: "Ring (4)", pinky: "Pinky (5)" };
+
+    for (const side of ["Right", "Left"]) {
+      const b = getPath(c, `palm_wheel.bindings.${side}`, {});
+      const html = ["thumb", "index", "middle", "ring", "pinky"].map(f => {
+        const cur = b[f];
+        if (cur && typeof cur === "object" && cur.type === "submenu") {
+          const subLbl = acts[cur.label] || cur.label;
+          return `<div class="row"><div class="row-label"><strong>${fingerLabels[f]}</strong><span>Submenu: ${subLbl}</span></div><span class="pill-tag">▸ ${subLbl}</span></div>`;
+        }
+        const curStr = String(cur || "unassigned");
+        const opts = PW_FLAT_OPTS.map(o => `<option value="${o}" ${o === curStr ? "selected" : ""}>${acts[o] || o}</option>`).join("");
+        return `<div class="row"><div class="row-label"><strong>${fingerLabels[f]}</strong></div>
+          <select onchange="setKey('palm_wheel.bindings.${side}.${f}', this.value)">${opts}</select>
+        </div>`;
+      }).join("");
+      document.getElementById(side === "Right" ? "pw-right-slots" : "pw-left-slots").innerHTML = html;
+    }
+
+    // Camera & HUD
+    const camSel = document.getElementById("cfg-cam-dev");
+    const curDev = getPath(c, "camera.device_id", "");
+    camSel.innerHTML = `<option value="">${isVi ? "Mặc định tự động" : "Auto Default"}</option>` +
+      (STATE.cameras || []).map(d => `<option value="${d.unique_id}" ${d.unique_id === curDev ? "selected" : ""}>${d.name}</option>`).join("");
+    document.getElementById("cfg-cam-res").value = `${getPath(c, "camera.width", 640)}x${getPath(c, "camera.height", 480)}`;
+    document.getElementById("cfg-cam-ar").value = getPath(c, "camera.aspect_ratio", "4:3");
+    document.getElementById("cfg-cam-mirror").checked = !!getPath(c, "camera.mirror", true);
+    document.getElementById("cfg-hud-pos").value = getPath(c, "ui.camera_hud.position", "bottom-right");
+    document.getElementById("cfg-hud-size").value = getPath(c, "ui.camera_hud.size", "medium");
+
+    document.getElementById("hud-sliders").innerHTML = [
+      makeSliderRow("h-op", isVi ? "Độ mờ HUD khi rảnh" : "Camera HUD Idle Opacity", isVi ? "Tự sáng 100% khi rê chuột qua (kiểu Airpoint)" : "Auto-brightens on hover", "ui.camera_hud.opacity", 0.2, 1.0, 0.05, getPath(c, "ui.camera_hud.opacity", 0.55)),
+    ].join("");
+    document.getElementById("overlay-toggles").innerHTML = [
+      makeToggleRow("ov-pulse", isVi ? "Vòng sóng Click Pulse tại con trỏ" : "Cursor Click Pulse Overlay", "", "ui.show_click_feedback", !!getPath(c, "ui.show_click_feedback", true)),
+      makeToggleRow("ov-pw", isVi ? "Đĩa Palm Wheel 5 cánh nổi" : "On-Screen Palm Wheel Radial", "", "ui.show_palm_wheel_overlay", !!getPath(c, "ui.show_palm_wheel_overlay", true)),
+      makeToggleRow("ov-wt", isVi ? "Khung kính xem trước Window Tile" : "Window Tile Ghost Preview", "", "ui.show_window_tile_preview", !!getPath(c, "ui.show_window_tile_preview", true)),
+      makeToggleRow("ov-warn", isVi ? "Cảnh báo ánh sáng / khoảng cách" : "Smart Tracking Warnings", "", "ui.enable_tracking_warnings", !!getPath(c, "ui.enable_tracking_warnings", true)),
+      makeToggleRow("ov-conn", isVi ? "Vẽ khung xương bàn tay" : "Show Hand Skeleton", "", "ui.camera_hud.show_connections", !!getPath(c, "ui.camera_hud.show_connections", true)),
+      makeToggleRow("ov-lm", isVi ? "Vẽ 21 khớp ngón tay" : "Show 21 Landmarks", "", "ui.camera_hud.show_landmarks", !!getPath(c, "ui.camera_hud.show_landmarks", true)),
+    ].join("");
+
+    document.getElementById("audio-controls").innerHTML = [
+      makeToggleRow("au-en", isVi ? "Bật âm thanh Click & Wheel" : "Enable Click & Wheel Audio", "", "audio.enabled", !!getPath(c, "audio.enabled", true)),
+      makeSliderRow("au-vol", isVi ? "Âm lượng" : "Click Volume", "", "audio.volume", 0.0, 1.0, 0.05, getPath(c, "audio.volume", 0.50)),
+    ].join("");
+
+    // Dictation & System
+    document.getElementById("cfg-dict-lang").value = getPath(c, "dictation.language", "vi-VN");
+    document.getElementById("cfg-dict-eng").value = getPath(c, "dictation.engine", "auto");
+    document.getElementById("cfg-launch-login").checked = !!STATE.launch_at_login;
+    document.getElementById("cfg-profiles-en").checked = !!getPath(c, "profiles.enabled", true);
+
+    // ML Studio
+    document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");
+    document.getElementById("col-pose-sel").innerHTML = POSE_KEYS
+      .map((p, idx) => `<option value="${p}">[${idx}] ${poses[p] || p}</option>`).join("");
+
+    // Probability bar skeleton
+    document.getElementById("prob-bars").innerHTML = POSE_KEYS.map(p =>
+      `<div class="bar-row"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="pb-${p}" style="width:0%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--muted)" id="pv-${p}">0%</span></div>`
+    ).join("");
+
+    // Collector bars
+    document.getElementById("col-bars").innerHTML = POSE_KEYS.map(p =>
+      `<div class="bar-row"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="cb-${p}" style="width:0%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--teal)" id="cv-${p}">0</span></div>`
+    ).join("");
+
+    // Practice cards
+    const pItems = [
+      ["move", isVi ? "1. Di chuyển con trỏ" : "1. Move Cursor", isVi ? "Giơ ngón trỏ hướng camera & lướt nhẹ" : "Point index forward & glide"],
+      ["click", isVi ? "2. Click trái" : "2. Left Click", isVi ? "Chạm thả nhanh Cái + Giữa (hoặc Trỏ)" : "Tap Thumb + Middle"],
+      ["right_click", isVi ? "3. Chuột phải" : "3. Right Click", isVi ? "Chụm Cái + Áp út giữ yên rồi thả" : "Hold Thumb + Ring still & release"],
+      ["drag", isVi ? "4. Kéo thả (Drag)" : "4. Click & Drag", isVi ? "Chụm Cái + Trỏ + Giữa và kéo" : "Hold 3-finger pinch & move"],
+      ["scroll", isVi ? "5. Cuộn 2D quán tính" : "5. 2D Scroll", isVi ? "Chụm Cái + Áp út và di lên/xuống" : "Pinch Thumb + Ring & slide"],
+      ["window_tile", isVi ? "6. Chia cửa sổ" : "6. Tile Window", isVi ? "Chụm Cái + Út rồi vuốt Trái/Phải/Lên" : "Pinch Thumb + Pinky & slide"],
+      ["spaces_nav", isVi ? "7. Chuyển Space" : "7. Spaces Nav", isVi ? "Chạm Cái + Gốc út rồi vuốt ngang/lên" : "Touch Pinky Base & slide"],
+      ["palm_wheel", isVi ? "8. Palm Wheel" : "8. Palm Wheel", isVi ? "Xòe lòng bàn tay 0.35s rồi gập 1 ngón" : "Hold open palm 350ms & curl 1 finger"],
+    ];
+    document.getElementById("practice-grid").innerHTML = pItems.map(([k, t, d]) =>
+      `<div class="practice-card" id="pr-${k}"><div><strong>${t}</strong><div style="font-size:11px;color:var(--muted)">${d}</div></div><div class="practice-check" id="prc-${k}">○</div></div>`
+    ).join("");
+
+    BUILT_CONTROLS = true;
+  }
+
+  window.hydrateState = function(payload) {
+    STATE = payload;
+    document.getElementById("ver-label").textContent = "v" + (payload.version || "0.2.0");
+    buildDynamicControls();
+  };
+
+  window.updateTelemetry = function(snap) {
+    if (!BUILT_CONTROLS) return;
+    const i18n = STATE.i18n || {};
+    const st = i18n.status || {};
+    const isVi = getPath(STATE.cfg, "ui.language", "vi") !== "en";
+
+    // Status badge
+    const badge = document.getElementById("status-badge");
+    badge.className = "status-badge";
+    if (snap.error) { badge.classList.add("err"); document.getElementById("status-text").textContent = st.error || "ERROR"; }
+    else if (snap.paused) { badge.classList.add("paused"); document.getElementById("status-text").textContent = st.paused || "PAUSED"; }
+    else if (!snap.accessibility_ok && !snap.dry_run) { badge.classList.add("dry"); document.getElementById("status-text").textContent = st.need_access || "NEED ACCESS"; }
+    else if (snap.dry_run) { badge.classList.add("dry"); document.getElementById("status-text").textContent = st.dry_run || "DRY-RUN"; }
+    else { document.getElementById("status-text").textContent = st.live || "LIVE"; }
+
+    // Quick buttons
+    document.getElementById("qa-pause").textContent = snap.paused ? (isVi ? "▶ Tiếp tục" : "▶ Resume") : (isVi ? "⏸ Tạm dừng" : "⏸ Pause");
+    document.getElementById("qa-mode").textContent = snap.dry_run ? (isVi ? "Chế độ: Chạy thử" : "Mode: Dry-Run") : (isVi ? "Chế độ: Live" : "Mode: Live");
+    const hudVis = !!getPath(STATE.cfg, "ui.camera_hud.visible", true);
+    document.getElementById("qa-hud").textContent = (isVi ? "Camera HUD: " : "Camera HUD: ") + (hudVis ? (isVi ? "Bật" : "ON") : (isVi ? "Tắt" : "OFF"));
+
+    // Stats
+    document.getElementById("st-fps").textContent = (snap.fps || 0).toFixed(1) + " FPS";
+    document.getElementById("st-del").textContent = (snap.delegate || "CPU") + " Metal • " + (snap.hands_count || 0) + (isVi ? " tay" : " hand(s)");
+    const t = snap.timing || {};
+    document.getElementById("st-lat").textContent = (t.total_ms || 0).toFixed(1) + " ms";
+    document.getElementById("st-cls").textContent = snap.classifier_name || "Heuristic 3D";
+    const v = snap.vitals || {};
+    document.getElementById("st-cpu").textContent = (v.cpu_usage || 0).toFixed(0) + "% CPU";
+    document.getElementById("st-ram").textContent = (v.process_ram_mb || 0).toFixed(0) + " MB • " + (v.ram_used_gb || 0).toFixed(1) + "/" + (v.ram_total_gb || 0).toFixed(0) + "GB";
+    document.getElementById("st-guard").textContent = snap.guard_reason ? snap.guard_reason : (isVi ? "Đang bảo vệ" : "Armed");
+    document.getElementById("st-app").textContent = snap.active_app || "macOS";
+
+    // Hand & probabilities
+    document.getElementById("live-dirz").textContent = `dirZ: ${(snap.dir_z || 0) >= 0 ? "+" : ""}${(snap.dir_z || 0).toFixed(2)} (${snap.is_pointing ? "OPEN" : "GATE"})`;
+    document.getElementById("live-hand-txt").textContent = (isVi ? "Tay chính: " : "Active Hand: ") + (snap.hand || (isVi ? "Chưa thấy" : "None")) + " • Pose: " + (snap.active_pose || snap.pose || "idle");
+    document.getElementById("live-last-act").textContent = (isVi ? "Hành động: " : "Action: ") + (snap.last_action || "Ready");
+    const probs = snap.probabilities || {};
+    for (const p of POSE_KEYS) {
+      const pct = Math.round((probs[p] || 0) * 100);
+      const b = document.getElementById("pb-" + p);
+      const pv = document.getElementById("pv-" + p);
+      if (b) b.style.width = pct + "%";
+      if (pv) pv.textContent = pct + "%";
+    }
+
+    // Permissions
+    const perms = snap.permissions || {};
+    const setPerm = (id, ok) => {
+      const el = document.getElementById(id);
+      if (!el) return;
+      el.textContent = ok ? (isVi ? "✓ Đã cấp" : "✓ Granted") : (isVi ? "⚠ Chưa cấp" : "⚠ Needed");
+      el.className = ok ? "perm-ok" : "perm-miss";
+    };
+    setPerm("p-acc-st", !!perms.accessibility);
+    setPerm("p-cam-st", !!perms.camera);
+    setPerm("p-mic-st", !!perms.microphone);
+    setPerm("p-sp-st", !!perms.speech);
+
+    // Dictation status
+    const d = snap.dictation || {};
+    document.getElementById("btn-test-dict").textContent = d.recording ? (isVi ? "⏹ Dừng & Chuyển chữ" : "⏹ Stop & Transcribe") : (isVi ? "🎙 Thử ghi âm" : "🎙 Test Dictation");
+    document.getElementById("dict-last-out").textContent = d.last_error
+      ? `⚠ ${d.last_error}`
+      : ((isVi ? "Bản ghi gần nhất: " : "Last transcript: ") + (d.last_transcript || "—"));
+
+    // Collector & Timing (only update when ML tab active to save DOM work)
+    if (CURRENT_TAB === "ml") {
+      const col = snap.collector || {};
+      document.getElementById("col-total").textContent = (col.total || 0) + (isVi ? " mẫu" : " samples");
+      document.getElementById("btn-col-rec").textContent = col.recording ? (isVi ? "⏹ Dừng ghi mẫu" : "⏹ Stop Recording") : (isVi ? "⏺ Bắt đầu ghi mẫu" : "⏺ Start Recording");
+      const cnts = col.counts || {};
+      for (const p of POSE_KEYS) {
+        const n = cnts[p] || 0;
+        const cb = document.getElementById("cb-" + p);
+        const cv = document.getElementById("cv-" + p);
+        if (cb) cb.style.width = Math.min(100, Math.round((n / 400) * 100)) + "%";
+        if (cv) cv.textContent = String(n);
+      }
+      document.getElementById("prof-headroom").textContent = `Headroom: ${(t.headroom_ms || 0).toFixed(1)} ms (${(t.utilization_pct || 0).toFixed(0)}%)`;
+      const tRows = [
+        ["MediaPipe HandLandmarker", t.mediapipe_ms || 0],
+        ["Stage-1 Pre-Filters", t.pre_filters_ms || 0],
+        ["Cursor Kinematics", t.cursor_ms || 0],
+        ["Gesture & Palm Wheel", t.gesture_ms || 0],
+        ["Classifier / ML", t.gesture_ml_ms || 0],
+        ["Camera HUD Render", t.render_ms || 0],
+      ];
+      document.getElementById("timing-bars").innerHTML = tRows.map(([name, ms]) =>
+        `<div class="bar-row"><span style="font-size:12px">${name}</span><div class="bar-bg"><div class="bar-fill" style="width:${Math.min(100, (ms/20)*100)}%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--teal)">${ms.toFixed(2)}ms</span></div>`
+      ).join("");
+    }
+
+    // Practice checklist
+    const pr = snap.practice || {};
+    for (const [k, done] of Object.entries(pr)) {
+      const card = document.getElementById("pr-" + k);
+      const chk = document.getElementById("prc-" + k);
+      if (card) card.classList.toggle("done", !!done);
+      if (chk) chk.textContent = done ? "✓" : "○";
+    }
+  };
+
+  // Notify Python bridge when page is ready
+  window.addEventListener("DOMContentLoaded", () => post("ready"));
+</script>
+</body>
+</html>

@@ -1,66 +1,112 @@
-# AeroHand — Default Configuration
-# User customizations should live in `config/user_overrides.yaml` (override-only merge).
+# AeroHand v0.2.0 — Canonical Default Configuration
+# User customizations are persisted as minimal deltas in `config/user_overrides.yaml`.
+
+ui:
+  language: "vi"                       # "vi" (Tiếng Việt) | "en" (English)
+  theme: "dark"
+  onboarding_completed: false
+  show_timing_panel: true
+  show_click_feedback: true            # On-screen click pulse ripple at cursor
+  cursor_style: "arrow"                # "arrow" | "circle" | "crosshair"
+  cursor_size: 1.0
+  show_palm_wheel_overlay: true        # On-screen 5-petal radial menu overlay
+  palm_wheel_fixed: false              # false = follow palm position, true = center screen
+  show_window_tile_preview: true       # Frosted glass snap-zone preview before release
+  enable_tracking_warnings: true       # Smart warnings: low light, too far/close, edge
+  hints:
+    click: false
+    right_click: true
+    grab: true
+    scroll: true
+    zoom: true
+    window_tile: true
+    spaces_nav: true
+    dictation: true
+  camera_hud:
+    visible: true
+    position: "bottom-right"           # "top-left" | "top-right" | "bottom-left" | "bottom-right"
+    size: "medium"                     # "small" | "medium" | "large"
+    opacity: 0.55                      # Idle opacity (Airpoint hover-fade UX)
+    hover_opacity: 1.0                 # Opacity when hovering cursor over HUD
+    show_connections: true
+    show_landmarks: true
 
 camera:
+  device_id: ""                        # Empty = auto default camera; or AVFoundation uniqueID
   index: 0
   width: 640
   height: 480
+  aspect_ratio: "4:3"                  # "auto" | "16:9" | "4:3" | "1:1"
   fps_cap: 60
   mirror: true
 
 tracker:
   model_path: "models/hand_landmarker.task"
-  delegate: "GPU"                    # Auto-falls back to CPU if GPU delegate is unavailable
-  num_hands: 1                       # Single-hand default (set 2 only if benchmarking dual-hand)
+  delegate: "GPU"                      # Auto-falls back to CPU if Metal GPU delegate unavailable
+  num_hands: 2                         # Full 2-hand parity (Left+Right Palm Wheel + 2-Hand Zoom)
   min_hand_detection_confidence: 0.55
   min_hand_presence_confidence: 0.55
   min_tracking_confidence: 0.55
 
 hand:
-  cursor_hand: "Right"               # "Right" | "Left" | "Both"
-  click_hand: "Right"                # "Right" | "Left" | "Both"
+  cursor_hand: "Right"                 # "Right" | "Left" | "Both"
+  click_hand: "Right"                  # "Right" | "Left" | "Both"
+  gesture_preset: "airpoint"           # "airpoint" | "classic" | "custom"
+
+gestures:
+  enable_click: true
+  enable_right_click: true
+  enable_grab: true
+  enable_scroll: true
+  enable_window_tile: true
+  enable_spaces_nav: true
+  enable_dictation: true
+  enable_zoom: true
+  zoom_speed: 1.0
 
 smoothing:
   enable_landmark_smoothing: true
-  landmark_min_cutoff: 2.0           # Fast Stage-1 OneEuro (Airpoint default)
-  landmark_beta: 45.0                # Low lag during rapid finger movement
+  landmark_min_cutoff: 2.0             # Fast Stage-1 OneEuro (Airpoint default)
+  landmark_beta: 45.0                  # Low lag during rapid finger movement
   landmark_d_cutoff: 1.0
-  landmark_exclude_joints: []        # Optional landmark indices to bypass smoothing
-  gap_reset_ms: 100.0                # Reset filters on camera hiccup >= 100ms
+  landmark_exclude_joints: []          # Optional landmark indices to bypass smoothing
+  gap_reset_ms: 100.0                  # AM-7 filter reset on camera hiccup >= 100ms
 
 cursor:
   enable_filter: true
-  filter_min_cutoff: 1.0             # Stage-2 OneEuro on cursor output
+  filter_min_cutoff: 1.0               # Stage-2 OneEuro on cursor output
   filter_beta: 0.01
   filter_d_cutoff: 1.0
-  pointer_sensitivity: 2.2           # Relative gain multiplier
-  pointer_acceleration: 1.4          # Speed-adaptive acceleration boost
+  pointer_sensitivity: 2.2             # Relative gain multiplier
+  pointer_acceleration: 1.4            # Speed-adaptive acceleration boost
   enable_distance_compensation: true
-  reference_palm_size: 0.10          # Normalized wrist->middle_mcp reference
-  max_jump_ratio: 0.15               # Reject single-frame jump > 15% screen width
-  enable_lerp_60hz: true             # Interpolate 30Hz webcam to smooth 60Hz cursor
+  reference_palm_size: 0.10            # Normalized wrist->middle_mcp reference
+  max_jump_ratio: 0.15                 # Reject single-frame jump > 15% screen width
+  enable_lerp_60hz: true               # Interpolate 30Hz webcam to smooth 60Hz cursor
   lerp_speed: 55.0
   lerp_rate_hz: 60.0
-  deadzone_px: 0.35                  # Micro-jitter floor
-  reacquire_skip_frames: 2           # Ignore first 2 frames after hand reappears
+  deadzone_px: 0.35                    # Micro-jitter floor
+  reacquire_skip_frames: 2             # Ignore first 2 frames after hand reappears
   enable_pointing_gate: true
-  pointing_forward_z_threshold: -0.15 # (LM8 - LM0).z / len must point toward screen
-  pointing_gate_hysteresis: 0.04     # Exit threshold = threshold + hysteresis (-0.11)
+  pointing_forward_z_threshold: -0.15  # (LM8 - LM0).z / len must point toward screen
+  pointing_gate_hysteresis: 0.04       # Exit threshold = threshold + hysteresis (-0.11)
+  virtual_canvas_width: 1920
+  virtual_canvas_height: 1080
 
 classifier:
-  backend: "heuristic_3d"            # "heuristic_3d" (zero-setup MVP) | "onnx_tcn" (self-trained)
-  onnx_model_path: null              # Path to self-trained causal TCN .onnx
-  onnx_normalizer_path: null         # Path to JSON {"mean": [...], "scale": [...]}
+  backend: "heuristic_3d"              # "heuristic_3d" (zero-setup) | "onnx_tcn" (self-trained)
+  onnx_model_path: "models/aerohand_tcn.onnx"
+  onnx_normalizer_path: "models/aerohand_tcn_normalizer.json"
   sequence_length: 5
+  feature_set: "invariant348"          # "invariant348" | "airmouse885"
   heuristic_3d:
-    # Normalized 3D distances in palm-width units (LM5-LM17 = 1.0)
-    pinch_on_dist: 0.34              # Strong contact distance (~1.0 probability)
-    pinch_off_dist: 0.62             # Clearly open distance (~0.0 probability)
-    pinky_base_on_dist: 0.42         # Thumb tip (LM4) to pinky MCP (LM17)
+    pinch_on_dist: 0.34
+    pinch_off_dist: 0.62
+    pinky_base_on_dist: 0.42
     pinky_base_off_dist: 0.72
-    dual_pinch_on_dist: 0.38         # Both index (LM8) & middle (LM12) near thumb (LM4)
+    dual_pinch_on_dist: 0.38
     dual_pinch_off_dist: 0.65
-    min_margin: 0.08                 # Winner must beat runner-up by margin to suppress ambiguity
+    min_margin: 0.08
     require_pointing_gate_for_actions: true
 
 pose_state_machine:
@@ -68,13 +114,13 @@ pose_state_machine:
   pose_hold_motion_threshold_px: 15.0
   click_debounce_ms: 200
   enable_click_debounce: true
-  enable_click_hold: false           # Drag uses dedicated thumb_index_middle_pinch
+  enable_click_hold: false             # true = hold click pose to drag (classic style)
   double_click_window_ms: 350
   thresholds:
     thumb_index_pinch:
-      enter_threshold: 0.65
+      enter_threshold: 0.78
       exit_threshold: 0.30
-      enter_frames: 2
+      enter_frames: 3
       exit_frames: 2
     thumb_middle_pinch:
       enter_threshold: 0.75
@@ -104,8 +150,9 @@ pose_state_machine:
   tap_actions:
     thumb_middle_pinch: "left_click"
   hold_actions:
-    thumb_ring_pinch: "scroll"       # Still (< 15px) on release -> right_click; move -> scroll
+    thumb_ring_pinch: "scroll"         # Still (< 15px) on release -> right_click; move -> scroll
     thumb_index_middle_pinch: "drag"
+    thumb_index_pinch: "dictation"     # Hold to dictate (vi-VN / en-US), release to insert text
     thumb_pinky_pinch: "window_tile"
     thumb_pinky_base: "spaces_nav"
 
@@ -117,48 +164,139 @@ scroll:
   axis_lock_distance: 15.0
   axis_lock_ratio: 2.0
   breakout_threshold: 8.0
+  enable_inertia: true
   inertia_friction: 0.95
   min_inertia_speed: 5.0
   natural_scrolling: true
-  use_phases: true
+  use_phases: true                     # Emits native macOS ScrollPhase + MomentumPhase
 
 spaces_nav:
   enabled: true
   lock_threshold_px: 8.0
   sensitivity_px: 20.0
-  invert: true                       # Natural direction (swipe left -> next space right)
+  invert: true
   cooldown_ms: 450
 
 window_tile:
   enabled: true
+  animate: true
   lock_threshold_px: 8.0
   sensitivity_px: 20.0
   cooldown_ms: 450
 
 palm_wheel:
   enabled: true
-  activation_hold_ms: 350            # Hold open palm steady ~350ms to prevent hair/stretch FA
-  max_activation_motion_norm: 0.035  # Cancel activation if palm moves rapidly (>3.5% frame/step)
-  press_down_threshold: 0.95         # Distance / cylinder_radius (< 1.0 = inside cylinder)
+  enabled_hands:
+    Left: true
+    Right: true
+  activation_hold_ms: 350              # Hardened hold duration to suppress hair/stretch FA
+  max_activation_motion_norm: 0.035    # Reset hold timer if palm moves rapidly
+  press_down_threshold: 0.95
   press_up_threshold: 1.10
-  cylinder_radius_multiplier: 0.50   # R = 0.5 * palm_length
-  palm_facing_dot_threshold: 0.60    # Require clearer frontal palm facing camera
+  cylinder_radius_multiplier: 0.50
+  palm_facing_dot_threshold: 0.60
   palm_facing_dot_hysteresis: 0.05
   open_palm_grace_ms: 100
   confirmation_hold_ms: 200
-  cooldown_ms: 450
-  slots:
-    thumb: "toggle_pause"
-    index: "mission_control"
-    middle: "recenter"
-    ring: "spotlight"
-    pinky: "media_play_pause"
+  confirmation_grace_ms: 200
+  cooldown_ms: 300
+  bindings:
+    Right:
+      thumb:
+        type: "submenu"
+        label: "Tracking"
+        icon: "pointer"
+        items:
+          thumb: "toggle_pause"
+          index: "recenter"
+          middle: "show_main_window"
+          ring: "toggle_camera_hud"
+          pinky: "submenu_back"
+      index: "mission_control"
+      middle: "spotlight"
+      ring: "dictation_toggle"
+      pinky:
+        type: "submenu"
+        label: "Player"
+        icon: "play"
+        items:
+          thumb: "submenu_back"
+          index: "media_prev"
+          middle: "media_play_pause"
+          ring: "media_next"
+          pinky:
+            type: "submenu"
+            label: "Volume"
+            icon: "volume"
+            items:
+              thumb: "submenu_back"
+              index: "volume_down"
+              middle: "volume_mute"
+              ring: "volume_up"
+              pinky: "unassigned"
+    Left:
+      thumb: "siri_listen"
+      index:
+        type: "submenu"
+        label: "Window"
+        icon: "window"
+        items:
+          thumb: "window_hide"
+          index: "window_fullscreen"
+          middle: "window_minimize"
+          ring: "window_close"
+          pinky: "submenu_back"
+      middle:
+        type: "submenu"
+        label: "Edit"
+        icon: "edit"
+        items:
+          thumb: "edit_paste"
+          index: "edit_copy"
+          middle: "edit_cut"
+          ring: "edit_redo"
+          pinky: "edit_undo"
+      ring:
+        type: "submenu"
+        label: "Apps"
+        icon: "apps"
+        items:
+          thumb: "open_app:/System/Library/CoreServices/Finder.app"
+          index: "open_app:/Applications/Safari.app"
+          middle: "open_app:/System/Applications/Notes.app"
+          ring: "open_app:/System/Applications/Utilities/Terminal.app"
+          pinky: "submenu_back"
+      pinky: "keyboard_emoji"
+
+dictation:
+  enabled: true
+  engine: "auto"                       # "auto" (Apple Speech -> mlx_whisper -> macOS Dictation)
+  language: "vi-VN"                    # "vi-VN" | "en-US"
+  paste_mode: "clipboard"              # UTF-8 safe clipboard paste & restore (no Telex corruption)
+  max_duration_s: 30.0
 
 audio:
   enabled: true
-  volume: 0.45
-  click_down_sound: "Tink"           # Native macOS system sound fallback if no .wav
-  click_up_sound: "Pop"
+  muted: false
+  volume: 0.50
+  click_down_sound: "assets/sounds/click_down.wav"
+  click_up_sound: "assets/sounds/click_up.wav"
+  wheel_tick_sound: "assets/sounds/wheel_tick.wav"
+
+api:
+  enabled: true
+  host: "127.0.0.1"
+  port: 17420
+
+hotkeys:
+  enabled: true
+  toggle_pause: "cmd+shift+a"
+  recenter: "cmd+shift+r"
+  toggle_hud: "cmd+shift+h"
+
+system:
+  launch_at_login: false
+  multi_monitor: true
 
 runtime:
   idle_throttle_enabled: true
@@ -169,9 +307,25 @@ runtime:
 
 typing_guard:
   enabled: true
-  source: "counter"                  # Zero Input Monitoring permission required!
+  source: "counter"                    # Zero Input Monitoring permission required
   own_post_margin_ms: 50
   keyboard_ms: 1500
   mouse_ms: 1000
-  keyboard_blocks: ["pointer", "click", "drag", "scroll", "swipe", "window_tile"]
+  keyboard_blocks: ["pointer", "click", "drag", "scroll", "swipe", "window_tile", "zoom"]
   mouse_blocks: ["pointer", "click", "drag", "scroll"]
+
+profiles:
+  enabled: true
+  apps:
+    com.microsoft.VSCode:
+      name: "VS Code"
+      scroll:
+        speed: 1.2
+    com.apple.Safari:
+      name: "Safari"
+      scroll:
+        speed: 1.15
+    com.apple.iWork.Keynote:
+      name: "Keynote"
+      cursor:
+        pointer_sensitivity: 1.8

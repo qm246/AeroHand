@@ -1,12 +1,13 @@
 """
-Airpoint-style visual overlay renderer for the Floating Camera Pill & Preview window.
-Draws crisp anti-aliased 21-landmark hand skeleton, active pinch highlight, 3D pointing-gate
-indicator, and Palm Wheel activation ring.
+Airpoint-style visual overlay renderer for the Floating Camera HUD & Preview window.
+Draws anti-aliased 21-landmark hand skeletons for BOTH hands (teal Left, blue Right),
+active pinch/dictation/scroll/drag fingertip highlights, 3D pointing-gate status,
+and Palm Wheel activation progress rings.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -22,12 +23,13 @@ HAND_CONNECTIONS: Tuple[Tuple[int, int], ...] = (
     (5, 9), (9, 13), (13, 17),
 )
 
-# BGR colors inspired by Airpoint's clean teal/blue dark aesthetic
+# BGR colors matching Airpoint's clean teal/blue dark glass aesthetic
 COL_TEAL = (191, 212, 45)      # #2dd4bf (Left hand)
 COL_BLUE = (250, 165, 96)      # #60a5fa (Right hand)
 COL_GREEN = (128, 232, 74)
 COL_AMBER = (36, 191, 251)
 COL_ROSE = (113, 113, 248)
+COL_PURPLE = (240, 130, 190)
 COL_WHITE = (245, 247, 250)
 COL_MUTED = (165, 172, 184)
 COL_BONE = (210, 218, 228)
@@ -36,6 +38,7 @@ COL_BONE = (210, 218, 228)
 def render_camera_hud(
     frame_bgr: np.ndarray,
     raw_hands: List[HandInput],
+    outputs: List[HandOutput],
     primary: Optional[HandOutput],
     *,
     fps: float,
@@ -43,70 +46,71 @@ def render_camera_hud(
     dry_run: bool,
     is_idle: bool,
     guard_reason: str = "",
+    dictating: bool = False,
+    zooming: bool = False,
+    show_connections: bool = True,
+    show_landmarks: bool = True,
     compact: bool = True,
 ) -> np.ndarray:
     """Render an Airpoint-style floating camera HUD frame (BGR)."""
     vis = frame_bgr.copy()
     h, w = vis.shape[:2]
+    out_by_hand: Dict[str, HandOutput] = {o.hand: o for o in outputs}
 
-    # Subtle dark vignette tint for crisp skeleton contrast
-    overlay = vis.copy()
-
-    # Draw hand skeletons
     for hand_inp in raw_hands:
         accent = COL_BLUE if hand_inp.handedness == "Right" else COL_TEAL
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_inp.landmarks[:21]]
-        for a, b in HAND_CONNECTIONS:
-            cv2.line(vis, pts[a], pts[b], COL_BONE, 2, cv2.LINE_AA)
-        for idx, (px, py) in enumerate(pts):
-            if idx in (4, 8, 12, 16, 20):
-                cv2.circle(vis, (px, py), 5, accent, -1, cv2.LINE_AA)
-                cv2.circle(vis, (px, py), 6, COL_WHITE, 1, cv2.LINE_AA)
-            else:
-                cv2.circle(vis, (px, py), 3, accent, -1, cv2.LINE_AA)
 
-        # Highlight active gesture ring on fingertip / palm
-        if primary is not None and primary.hand == hand_inp.handedness:
-            p = primary.pose
-            c = primary.cursor
+        if show_connections:
+            for a, b in HAND_CONNECTIONS:
+                cv2.line(vis, pts[a], pts[b], COL_BONE, 2, cv2.LINE_AA)
+        if show_landmarks:
+            for idx, (px, py) in enumerate(pts):
+                if idx in (4, 8, 12, 16, 20):
+                    cv2.circle(vis, (px, py), 5, accent, -1, cv2.LINE_AA)
+                    cv2.circle(vis, (px, py), 6, COL_WHITE, 1, cv2.LINE_AA)
+                else:
+                    cv2.circle(vis, (px, py), 3, accent, -1, cv2.LINE_AA)
+
+        ho = out_by_hand.get(hand_inp.handedness)
+        if ho is not None:
+            p = ho.pose
+            c = ho.cursor
             if p.is_clicking or p.is_pinching:
                 cv2.circle(vis, pts[12], 14, COL_GREEN, 2, cv2.LINE_AA)
                 cv2.circle(vis, pts[4], 14, COL_GREEN, 2, cv2.LINE_AA)
             elif p.is_grabbing:
                 cv2.circle(vis, pts[8], 16, COL_AMBER, 3, cv2.LINE_AA)
+            elif p.is_dictating:
+                cv2.circle(vis, pts[8], 16, COL_PURPLE, 3, cv2.LINE_AA)
+                cv2.circle(vis, pts[4], 14, COL_PURPLE, 2, cv2.LINE_AA)
             elif p.is_scrolling:
                 cv2.circle(vis, pts[16], 15, COL_TEAL, 2, cv2.LINE_AA)
             elif c.is_pointing:
-                cv2.circle(vis, pts[8], 10, COL_BLUE, 2, cv2.LINE_AA)
+                cv2.circle(vis, pts[8], 10, accent, 2, cv2.LINE_AA)
 
-            # Palm Wheel activation progress arc around palm center
+            # Palm Wheel activation progress arc
             if p.palm_wheel_state in ("activating", "active", "confirmed"):
                 pcx = (pts[0][0] + pts[9][0]) // 2
                 pcy = (pts[0][1] + pts[9][1]) // 2
-                rad = 38
+                rad = 36
                 ring_col = COL_GREEN if p.palm_wheel_state == "active" else COL_AMBER
                 cv2.circle(vis, (pcx, pcy), rad, (50, 58, 72), 3, cv2.LINE_AA)
                 end_angle = int(360 * max(0.0, min(1.0, p.palm_wheel_progress)))
                 cv2.ellipse(vis, (pcx, pcy), (rad, rad), -90, 0, end_angle, ring_col, 4, cv2.LINE_AA)
-                if p.palm_wheel_state == "active":
-                    cv2.putText(
-                        vis,
-                        "PALM WHEEL",
-                        (max(8, pcx - 42), max(22, pcy - rad - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45,
-                        COL_GREEN,
-                        1,
-                        cv2.LINE_AA,
-                    )
 
     # Top translucent status pill bar
-    bar_h = 34 if compact else 54
-    cv2.rectangle(overlay, (0, 0), (w, bar_h), (14, 18, 26), -1)
+    overlay = vis.copy()
+    bar_h = 32 if compact else 48
+    cv2.rectangle(overlay, (0, 0), (w, bar_h), (12, 16, 24), -1)
     cv2.addWeighted(overlay, 0.72, vis, 0.28, 0.0, vis)
 
     if paused:
         dot_col, state_txt = COL_AMBER, "PAUSED"
+    elif dictating:
+        dot_col, state_txt = COL_PURPLE, "DICTATING"
+    elif zooming:
+        dot_col, state_txt = COL_TEAL, "ZOOMING"
     elif guard_reason:
         dot_col, state_txt = COL_ROSE, f"GUARD: {guard_reason}"
     elif dry_run:
@@ -116,30 +120,29 @@ def render_camera_hud(
     else:
         dot_col, state_txt = COL_GREEN, "LIVE"
 
-    cv2.circle(vis, (16, 17), 5, dot_col, -1, cv2.LINE_AA)
+    cv2.circle(vis, (16, 16), 5, dot_col, -1, cv2.LINE_AA)
     cv2.putText(
         vis,
         f"AeroHand  {state_txt}",
-        (28, 22),
+        (28, 21),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.50,
+        0.48,
         COL_WHITE,
         1,
         cv2.LINE_AA,
     )
-    fps_txt = f"{fps:4.0f} FPS"
     cv2.putText(
         vis,
-        fps_txt,
-        (w - 78, 22),
+        f"{fps:4.0f} FPS",
+        (w - 76, 21),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.48,
+        0.46,
         COL_MUTED,
         1,
         cv2.LINE_AA,
     )
 
-    # Bottom status badge for active pose & pointing gate
+    # Bottom status badge
     if primary is not None:
         p = primary.pose
         c = primary.cursor
@@ -147,16 +150,16 @@ def render_camera_hud(
         if pose_label == PoseName.IDLE.value:
             pose_label = "pointing" if c.is_pointing else "resting (gate)"
         gate_col = COL_GREEN if c.is_pointing else COL_MUTED
-        pill_y = h - 30
+        pill_y = h - 28
         ov2 = vis.copy()
-        cv2.rectangle(ov2, (0, pill_y), (w, h), (14, 18, 26), -1)
+        cv2.rectangle(ov2, (0, pill_y), (w, h), (12, 16, 24), -1)
         cv2.addWeighted(ov2, 0.72, vis, 0.28, 0.0, vis)
         cv2.putText(
             vis,
-            f"{pose_label}  |  dirZ {c.pointing_dir_z:+.2f}",
-            (12, h - 10),
+            f"{primary.hand[0]}: {pose_label} | dirZ {c.pointing_dir_z:+.2f}",
+            (12, h - 9),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.48,
+            0.46,
             gate_col,
             1,
             cv2.LINE_AA,

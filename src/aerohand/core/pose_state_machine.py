@@ -1,6 +1,6 @@
 """
 Unified Probability-Based Asymmetric Schmitt Pose State Machine.
-Ported from Airpoint SDK `PoseStateMachine.ts` (Apache-2.0).
+Ported from Airpoint SDK `PoseStateMachine.ts` & `poseActions.ts` (Apache-2.0).
 
 Handles:
 - Per-pose enter/exit thresholds & consecutive frame counts (asymmetric hysteresis).
@@ -8,6 +8,7 @@ Handles:
   cursor motion (`pose_hold_motion_threshold_px`).
 - Dual behavior on `thumb_ring_pinch`: stillness (< motion threshold) emits right-click on
   hold_end; movement (>= motion threshold) activates continuous scroll.
+- Live config hot-reload (`update_config`) and `enable_click_hold` drag promotion.
 """
 
 from __future__ import annotations
@@ -38,6 +39,16 @@ class PoseStateMachine:
     """Asymmetric hysteresis & tap/hold resolver operating on soft pose probabilities."""
 
     def __init__(self, psm_cfg: Optional[Dict[str, Any]] = None) -> None:
+        self._active_pose: Optional[PoseName] = None
+        self._candidate_pose: Optional[PoseName] = None
+        self._enter_count: int = 0
+        self._exit_count: int = 0
+        self._start_time_ms: float = 0.0
+        self._hold_active: bool = False
+        self._motion_distance: float = 0.0
+        self.update_config(psm_cfg)
+
+    def update_config(self, psm_cfg: Optional[Dict[str, Any]]) -> None:
         cfg = psm_cfg or {}
         self.hold_threshold_ms: float = float(cfg.get("pose_hold_threshold_ms", 180.0))
         self.hold_motion_threshold_px: float = float(cfg.get("pose_hold_motion_threshold_px", 15.0))
@@ -58,32 +69,34 @@ class PoseStateMachine:
                 )
 
         self.tap_actions: Dict[PoseName, str] = {}
-        for k, v in (cfg.get("tap_actions") or {"thumb_middle_pinch": "left_click"}).items():
+        raw_taps = cfg.get("tap_actions")
+        if raw_taps is None:
+            raw_taps = {"thumb_middle_pinch": "left_click"}
+        for k, v in raw_taps.items():
+            if not v or v == "none":
+                continue
             try:
                 self.tap_actions[PoseName(k)] = str(v)
             except ValueError:
                 pass
 
         self.hold_actions: Dict[PoseName, str] = {}
-        default_holds = {
-            "thumb_ring_pinch": "scroll",
-            "thumb_index_middle_pinch": "drag",
-            "thumb_pinky_pinch": "window_tile",
-            "thumb_pinky_base": "spaces_nav",
-        }
-        for k, v in (cfg.get("hold_actions") or default_holds).items():
+        raw_holds = cfg.get("hold_actions")
+        if raw_holds is None:
+            raw_holds = {
+                "thumb_ring_pinch": "scroll",
+                "thumb_index_middle_pinch": "drag",
+                "thumb_index_pinch": "dictation",
+                "thumb_pinky_pinch": "window_tile",
+                "thumb_pinky_base": "spaces_nav",
+            }
+        for k, v in raw_holds.items():
+            if not v or v == "none":
+                continue
             try:
                 self.hold_actions[PoseName(k)] = str(v)
             except ValueError:
                 pass
-
-        self._active_pose: Optional[PoseName] = None
-        self._candidate_pose: Optional[PoseName] = None
-        self._enter_count: int = 0
-        self._exit_count: int = 0
-        self._start_time_ms: float = 0.0
-        self._hold_active: bool = False
-        self._motion_distance: float = 0.0
 
     def reset(self) -> None:
         self._active_pose = None
@@ -117,7 +130,7 @@ class PoseStateMachine:
         mapped = self.hold_actions.get(pose)
         if mapped:
             return mapped
-        if pose == PoseName.THUMB_MIDDLE_PINCH and self.enable_click_hold:
+        if self.enable_click_hold and self.tap_actions.get(pose) == "left_click":
             return "drag"
         return None
 

@@ -428,6 +428,12 @@ class HandCursorEngine:
         self.pointing_forward_z_threshold: float = float(cur_cfg.get("pointing_forward_z_threshold", -0.15))
         self.pointing_gate_hysteresis: float = float(cur_cfg.get("pointing_gate_hysteresis", 0.04))
         self.click_lookback_ms: float = max(0.0, float(cur_cfg.get("click_lookback_ms", 90.0)))
+        self.click_lookback_max_speed_px_s: float = max(
+            0.0, float(cur_cfg.get("click_lookback_max_speed_px_s", 250.0))
+        )
+        self.click_lookback_max_offset_px: float = max(
+            0.0, float(cur_cfg.get("click_lookback_max_offset_px", 24.0))
+        )
         self.click_dwell_lock_ms: float = max(0.0, float(cur_cfg.get("click_dwell_lock_ms", 120.0)))
         self.click_dwell_lock_cooldown_ms: float = max(
             0.0, float(cur_cfg.get("click_dwell_lock_cooldown_ms", 400.0))
@@ -810,8 +816,12 @@ class HandCursorEngine:
                     if hs.pose_sm.get_tap_action(ev.pose) == "left_click" and self._is_click_allowed_for_hand(hand):
                         is_pinching = True
                         if self.click_lookback_ms > 0.0:
-                            hs.click_anchor_pos = hs.kinematics.lookup_position(
-                                timestamp_ms - self.click_lookback_ms
+                            hs.click_anchor_pos = hs.kinematics.lookup_position_guarded(
+                                timestamp_ms - self.click_lookback_ms,
+                                (cursor_out.x, cursor_out.y),
+                                max_speed_px_s=self.click_lookback_max_speed_px_s,
+                                max_offset_px=self.click_lookback_max_offset_px,
+                                fallback_pos=hs.dwell_lock_pos,
                             )
                         else:
                             hs.click_anchor_pos = (cursor_out.x, cursor_out.y)

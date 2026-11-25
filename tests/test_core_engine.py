@@ -1185,6 +1185,7 @@ def test_click_lookback_returns_pre_pinch_position():
     cfg["cursor"]["reacquire_skip_frames"] = 0
     cfg["cursor"]["enable_filter"] = False
     cfg["cursor"]["click_lookback_ms"] = 90.0
+    cfg["cursor"]["click_lookback_max_offset_px"] = 0.0
     cfg["cursor"]["click_dwell_lock_ms"] = 0.0
     cfg["palm_wheel"]["enabled"] = False
 
@@ -2318,3 +2319,77 @@ def test_dwell_lock_cooldown_enforced():
         clf.p = prob
         eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)
     assert eng.dwell_lock_activations == 2
+
+
+def test_lookback_ignored_when_pointer_fast():
+    kin = CursorKinematics()
+    # Fast pointer movement at 900 px/s recorded at t=100ms
+    kin.record_history(100.0, 400.0, 400.0, speed_px_s=900.0)
+    kin.record_history(190.0, 490.0, 400.0, speed_px_s=850.0)
+    # Speed > 250 px/s -> lookback MUST be ignored and return live_pos (490, 400), NOT (400, 400)
+    anchored = kin.lookup_position_guarded(
+        100.0,
+        (490.0, 400.0),
+        max_speed_px_s=250.0,
+        max_offset_px=24.0,
+    )
+    assert anchored == (490.0, 400.0)
+    # If dwell_lock fallback is provided while fast, returns fallback
+    anchored_fb = kin.lookup_position_guarded(
+        100.0,
+        (490.0, 400.0),
+        max_speed_px_s=250.0,
+        max_offset_px=24.0,
+        fallback_pos=(485.0, 400.0),
+    )
+    assert anchored_fb == (485.0, 400.0)
+
+
+def test_lookback_offset_clamped():
+    kin = CursorKinematics()
+    # Steady slow point at (500, 500) at t=100ms; live drifted 60px right to (560, 500)
+    kin.record_history(100.0, 500.0, 500.0, speed_px_s=20.0)
+    anchored = kin.lookup_position_guarded(
+        100.0,
+        (560.0, 500.0),
+        max_speed_px_s=250.0,
+        max_offset_px=24.0,
+    )
+    assert math.hypot(anchored[0] - 560.0, anchored[1] - 500.0) == pytest.approx(24.0, abs=1e-5)
+    assert anchored[0] == pytest.approx(536.0, abs=1e-5)
+    assert anchored[1] == pytest.approx(500.0, abs=1e-5)
+
+
+def test_lerp_reset_after_anchored_click():
+    from aerohand.core.types import CursorOutput, HandOutput, PoseOutput
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["cursor"]["enable_lerp_60hz"] = True
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    rt._screen_ox, rt._screen_oy = 0.0, 0.0
+    rt._lerp.reset((520.0, 500.0))
+
+    # Anchored click lands at (500, 500) while live cursor is at (520, 500) (offset = 20px > 2px)
+    ho = HandOutput(
+        hand="Right",
+        cursor=CursorOutput(hand="Right", x=520.0, y=500.0, is_pointing=True, is_valid=True),
+        pose=PoseOutput(
+            hand="Right",
+            is_clicking=True,
+            click_count=1,
+            click_x=500.0,
+            click_y=500.0,
+        ),
+    )
+    rt._dispatch_actions([ho], ho, 1000.0)
+    # Lerp current MUST sync to anchor (500, 500) while target stays at live (520, 500)
+    assert rt._lerp._current == (500.0, 500.0)
+    assert rt._lerp._target == (520.0, 500.0)
+    # First lerp tick moves smoothly forward from 500 toward 520 without snapping past 520
+    step = rt._lerp.step(1.0 / 60.0)
+    assert step is not None
+    nx, ny, dx, _ = step
+    assert 500.0 < nx < 520.0
+    assert dx > 0.0

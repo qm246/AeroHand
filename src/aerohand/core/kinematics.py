@@ -94,7 +94,9 @@ class CursorKinematics:
         self._skip_remaining: int = 0
         self._display_speed: float = 0.0
         self._display_finger_speed: float = 0.0
-        self._history: Deque[Tuple[float, float, float]] = deque(maxlen=64)  # (ts_ms, x, y) over ~0.5s
+        self._history: Deque[Tuple[float, float, float, float]] = deque(
+            maxlen=64
+        )  # (ts_ms, x, y, speed_px_s) over ~0.5s
 
     def reset(self) -> None:
         self.filter_x.reset()
@@ -107,8 +109,15 @@ class CursorKinematics:
         self._display_finger_speed = 0.0
         self._history.clear()
 
-    def record_history(self, timestamp_ms: float, x: float, y: float, window_ms: float = 500.0) -> None:
-        self._history.append((float(timestamp_ms), float(x), float(y)))
+    def record_history(
+        self,
+        timestamp_ms: float,
+        x: float,
+        y: float,
+        speed_px_s: float = 0.0,
+        window_ms: float = 500.0,
+    ) -> None:
+        self._history.append((float(timestamp_ms), float(x), float(y), max(0.0, float(speed_px_s))))
         cutoff = float(timestamp_ms) - float(window_ms)
         while len(self._history) > 1 and self._history[0][0] < cutoff:
             self._history.popleft()
@@ -120,6 +129,37 @@ class CursorKinematics:
         target = float(target_timestamp_ms)
         best = min(self._history, key=lambda item: abs(item[0] - target))
         return (best[1], best[2])
+
+    def lookup_position_guarded(
+        self,
+        target_timestamp_ms: float,
+        live_pos: Tuple[float, float],
+        *,
+        max_speed_px_s: float = 250.0,
+        max_offset_px: float = 24.0,
+        fallback_pos: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[float, float]:
+        """
+        Speed-guarded & distance-clamped pre-pinch lookback (V031-04):
+          - If pointer speed at lookback target > `max_speed_px_s` (>0), ignore lookback and
+            return `fallback_pos` (dwell lock) or `live_pos`.
+          - Clamp the anchor offset from `live_pos` to `<= max_offset_px` (>0).
+        """
+        if not self._history:
+            return fallback_pos if fallback_pos is not None else live_pos
+        target = float(target_timestamp_ms)
+        best = min(self._history, key=lambda item: abs(item[0] - target))
+        _, hx, hy, spd = best
+        if max_speed_px_s > 0.0 and spd > max_speed_px_s:
+            return fallback_pos if fallback_pos is not None else live_pos
+        lx, ly = float(live_pos[0]), float(live_pos[1])
+        dx = hx - lx
+        dy = hy - ly
+        dist = math.hypot(dx, dy)
+        if max_offset_px > 0.0 and dist > max_offset_px:
+            scale = max_offset_px / dist
+            return (lx + dx * scale, ly + dy * scale)
+        return (hx, hy)
 
     def set_cursor_position(self, x: float, y: float) -> None:
         """Anchor pointer position (e.g. from real OS cursor or recenter) without jumping."""
@@ -209,8 +249,8 @@ class CursorKinematics:
                 step_dx, step_dy = 0.0, 0.0
 
             self._last_pointer_pos = (final_x, final_y)
-            self.record_history(timestamp_ms, final_x, final_y)
             cursor_speed = math.hypot(step_dx, step_dy) / dt_s
+            self.record_history(timestamp_ms, final_x, final_y, speed_px_s=cursor_speed)
 
             alpha = 0.15
             self._display_speed = self._display_speed * (1.0 - alpha) + cursor_speed * alpha
@@ -259,6 +299,17 @@ class CursorLerpInterpolator:
         self._current = pos
         self._target = pos
         self._speed_px_s = 0.0
+
+    def sync_current_to_anchor(
+        self,
+        anchor_x: float,
+        anchor_y: float,
+        live_x: float,
+        live_y: float,
+    ) -> None:
+        """Align lerp current position to an anchored click so subsequent ticks ease smoothly."""
+        self._current = (float(anchor_x), float(anchor_y))
+        self._target = (float(live_x), float(live_y))
 
     def set_target(self, x: float, y: float, *, speed_px_s: Optional[float] = None) -> None:
         self._target = (float(x), float(y))

@@ -15,6 +15,7 @@ AeroHand Unified Runtime (v0.2.0 — Full Airpoint Stage 1–3 Parity + GestureC
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from copy import deepcopy
@@ -999,6 +1000,9 @@ class AeroHandRuntime:
                 self._practice["click"] = True
                 self._emit_click_pulse("double_click" if cnt == 2 else "left_click", clk_x, clk_y)
                 self.input_ctl.mouse_click(clk_x, clk_y, button="left", click_count=cnt)
+                if use_anchor and math.hypot(clk_x - abs_x, clk_y - abs_y) > 2.0:
+                    with self._lerp_lock:
+                        self._lerp.sync_current_to_anchor(clk_x, clk_y, abs_x, abs_y)
                 active_hint = "click"
 
             if cp.is_right_clicking:

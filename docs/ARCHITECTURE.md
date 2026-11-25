@@ -1,4 +1,4 @@
-# Kiến Trúc Hệ Thống AeroHand (v0.2.0)
+# Kiến Trúc Hệ Thống AeroHand (v0.3.0)
 
 ## 1. Mục tiêu thiết kế
 Kết hợp **thuật toán công thái học & trải nghiệm UX hoàn chỉnh** của `andrewslabmd/airpoint-sdk` (Apache-2.0) với **nền tảng an toàn macOS bản địa, tiêu thụ tài nguyên thấp và kỷ luật đánh giá ML** từ `GestureCtl` trong một ứng dụng macOS gọn nhẹ chạy hoàn toàn bằng Python + PyObjC + `WKWebView` bản địa (không cần Electron/Node).
@@ -50,8 +50,9 @@ Tầng macOS Bản Địa (`src/aerohand/platform/`) & Giao Diện (`src/aerohan
 ---
 
 ## 3. Các bất biến an toàn (Safety Invariants)
-1. **Không bao giờ kẹt nút chuột / phím tắt**: Mất tay quá `hand_lost_release_ms` (`350 ms`), kéo thả quá `20 s`, tạm dừng, lỗi ngoại lệ hoặc thoát app đều bắt buộc gọi `MacOSInputController.release_all()`.
-2. **Typing Guard luôn bảo vệ không cần Input Monitoring**: Gõ phím vật lý chặn cử chỉ tay trong `1.5 s`; chạm chuột/trackpad chặn trong `1.0 s`. Mọi sự kiện ảo đều bơm vào `kCGSessionEventTap` để không làm nhiễm bộ đếm `HIDSystemState`.
-3. **Fail-open ở tầng phân loại ML**: Bất kỳ lỗi nào trong heuristic hoặc ONNX Runtime đều rơi an toàn về `PoseName.IDLE`, không crash và không giữ dính click.
-4. **Ổn định bộ nhớ dài hạn**: MediaPipe chạy `CPU XNNPACK` mặc định (0 rò rỉ `CVPixelBuffer`) kết hợp `objc.autorelease_pool()` ở vòng lặp HUD 20 Hz.
-5. **Clean-Room & Quyền riêng tư 100% cục bộ**: Không có dữ liệu ảnh camera hay tệp trọng số độc quyền nào rời khỏi máy hoặc bị đóng gói trong repo.
+1. **Không bao giờ kẹt nút chuột / phím tắt (Level-Triggered Failsafe)**: Watchdog `_enforce_input_safety` chạy mỗi vòng lặp (kể cả khi `cf.success == False` hoặc chỉ thấy tay phụ): mất tay chính quá `hand_lost_release_ms` (`350 ms`), treo camera quá `camera_stall_release_ms` (`500 ms`), kéo thả quá `20 s`, tạm dừng, lỗi classifier hoặc thoát app đều gọi `MacOSInputController.release_all()` + `end_scroll_phase()`.
+2. **Bảo mật Local Control API**: Chỉ bind `127.0.0.1`, kiểm tra chặt `Host` (chống DNS rebinding), chặn mọi request mang header `Origin` (chống CSRF trình duyệt), yêu cầu `X-AeroHand-Token` (tạo ngẫu nhiên 32 byte, lưu quyền `0600` trong `~/Library/Application Support/AeroHand/api_token`), giới hạn body 64 KiB (413) và whitelist khóa cấu hình scalar cho `PATCH /api/settings`.
+3. **Typing Guard luôn bảo vệ không cần Input Monitoring**: Gõ phím vật lý chặn cử chỉ tay trong `1.5 s`; chạm chuột/trackpad chặn trong `1.0 s`. Mọi sự kiện ảo đều bơm vào `kCGSessionEventTap` để không làm nhiễm bộ đếm `HIDSystemState`.
+4. **Fail-open & Guarded ML**: Bất kỳ lỗi nào trong heuristic hoặc ONNX Runtime đều rơi an toàn về `PoseName.IDLE` và giải phóng input; `GuardedClassifier` tự động fallback về `Heuristic3DPinchClassifier` khi p95 > `8 ms` hoặc ≥ 3 lỗi trong `10 s`, đồng thời xóa ring buffer 5 frame khi mất tay hoặc đổi model.
+5. **Ổn định bộ nhớ & Không Race đa luồng**: MediaPipe chạy `CPU XNNPACK` mặc định (0 rò rỉ `CVPixelBuffer`) kết hợp `objc.autorelease_pool()` ở mọi tick UI/overlay; cập nhật cấu hình từ UI/API được xếp hàng áp dụng trên luồng xử lý và cập nhật hệ số One-Euro tại chỗ không làm nhảy chuột; file lock/trigger/log đặt trong `~/Library/Application Support/AeroHand` và `~/Library/Logs/AeroHand` với quyền `0600`.
+6. **Clean-Room & Quyền riêng tư 100% cục bộ**: Không có dữ liệu ảnh camera, giọng nói hay tệp trọng số độc quyền nào rời khỏi máy hoặc bị đóng gói trong repo.

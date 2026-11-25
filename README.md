@@ -8,7 +8,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-teal.svg)](LICENSE)
 [![Platform: macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)](#cài-đặt--chạy-nhanh-macos-apple-silicon)
-[![Version: v0.2.0](https://img.shields.io/badge/Version-0.2.0-emerald.svg)](#)
+[![Version: v0.3.0](https://img.shields.io/badge/Version-0.3.0-emerald.svg)](#)
 
 </div>
 
@@ -22,19 +22,20 @@
 
 ---
 
-## Tính năng nổi bật (v0.2.0)
+## Tính năng nổi bật (v0.3.0)
 
-- **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác*), **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì.
-- **4 lớp Overlay nổi trên toàn màn hình (click-through)**:
+- **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác* kèm **Wizard hiệu chỉnh cá nhân 30 giây**), **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì, tải nhẹ 5 Hz khi ẩn cửa sổ và lưu cấu hình có debounce 500 ms.
+- **4 lớp Overlay nổi đa màn hình (1 panel click-through / màn hình, chuẩn hóa `ScreenGeometry`)**:
   - Đĩa tròn **Palm Wheel 5 cánh** kèm breadcrumb menu con (theo tay hoặc cố định giữa màn hình).
   - Vòng sóng **Click Pulse** ngay tại con trỏ khi Click / Double-Click / Chuột phải / Drag.
-  - Khung kính mờ **Window Tile Ghost Preview** xem trước vùng snap cửa sổ.
-  - **Toast gợi ý cử chỉ**, sóng âm **Voice Dictation** và **cảnh báo thông minh** (ánh sáng yếu, tay quá xa/gần, sát mép khung hình).
-- **Floating Camera HUD Hover-Fade**: chọn 4 góc màn hình, 3 kích thước (S/M/L), tự mờ khi rảnh và sáng 100% khi rê chuột qua.
+  - Khung kính mờ **Window Tile Ghost Preview** xem trước chính xác nửa trái/phải/trên/dưới, toàn màn hình và căn giữa.
+  - **Toast gợi ý cử chỉ tự đồng bộ gesture map sống**, sóng âm **Voice Dictation** và **cảnh báo thông minh** (ánh sáng yếu, tay quá xa/gần, sát mép khung hình, fallback ONNX).
+- **Con trỏ & click chính xác vượt trội**: Nội suy **Adaptive 60 Hz Lerp** (40→70 theo vận tốc), **Click Lookback 90 ms** + **Pre-click Dwell Lock 120 ms** chống lệch điểm ngắm khi bấm, chốt pointing gate khi đang kéo thả, tách độc lập **tay trỏ** và **tay click/drag**, và camera **crop giữ tỷ lệ đồng nhất** với queue size-1 chống méo hình.
 - **Chia cửa sổ chuẩn bằng Accessibility API (`AXUIElement`)**: hoạt động mọi ứng dụng macOS, hỗ trợ đa màn hình (Multi-Monitor) và hiệu ứng animation mượt.
-- **Voice Dictation Tiếng Việt (`vi-VN`) & Tiếng Anh (`en-US`)**: dùng Apple `SFSpeechRecognizer` cục bộ (hỗ trợ `mlx_whisper`), chèn chữ có dấu UTF-8 an toàn không lỗi bộ gõ Telex/EVKey.
-- **Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`), `aerohand` CLI, URL Scheme `aerohand://` (cho Apple Shortcuts / Raycast), **Hồ sơ theo ứng dụng (Per-App Profiles)**, phím tắt toàn cục (`Cmd+Shift+A/R/H`), và tự khởi động cùng macOS (**Launch at Login**).
-- **Ổn định 24/7 trên macOS**: chạy MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS, khắc phục triệt để lỗi rò rỉ `CVPixelBuffer` của MediaPipe Metal trên macOS) + `autorelease_pool`.
+- **Voice Dictation Tiếng Việt (`vi-VN`) & Tiếng Anh (`en-US`)**: dùng Apple `SFSpeechRecognizer` 100% on-device kèm fallback tự động `mlx_whisper` cục bộ; chèn chữ có dấu UTF-8 và **snapshot/khôi phục toàn bộ kiểu clipboard** (giữ nguyên ảnh PNG, file URL, RTF; delay 0.35s cho app Electron/Chromium).
+- **Bảo mật & Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`) được bảo vệ bằng **kiểm tra `Host` + chặn `Origin` (chống CSRF / DNS rebinding)**, xác thực **`X-AeroHand-Token`** lưu quyền `0600`, giới hạn body 64 KiB và whitelist key; `aerohand` CLI tự đọc token; URL Scheme `aerohand://`; Per-App Profiles; phím tắt tùy biến có kiểm tra trùng; và Launch at Login.
+- **ML Studio & Guarded ONNX 1D-TCN**: Data Collector trong app hỗ trợ **kịch bản hướng dẫn có đếm ngược**, **tự cắt 300 ms chuyển tiếp đầu/cuối**, **metadata phiên**, **giữ phím `0–6` gắn nhãn**, **hủy 5 giây vừa quay**, và **Quality Gate**; `train_tcn.py` hỗ trợ group split chống rò rỉ, cắt chuỗi theo gap `>100 ms`, landmark augmentation, Focal Loss, Temperature Scaling và xuất `metrics.json`; runtime có **Shadow Mode** và **Auto-Fallback** về Heuristic 3D khi p95 > 8 ms hoặc lỗi liên tiếp.
+- **Ổn định 24/7 trên macOS**: chạy MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS, tránh lỗi rò rỉ `CVPixelBuffer` Metal) + `objc.autorelease_pool()` + **watchdog chống kẹt chuột level-triggered** (mất tay chính, chỉ còn tay phụ, treo camera > 500 ms, hoặc drag > 20 s).
 
 ---
 
@@ -91,7 +92,7 @@ Liên kết nhanh cho **Apple Shortcuts / Raycast**:
 
 ### 4. Chạy chế độ dòng lệnh & kiểm thử
 ```bash
-uv run pytest -q                              # Chạy toàn bộ 14 unit/integration test
+uv run pytest -q                              # Chạy toàn bộ 52 unit/integration test
 uv run ruff check src tests scripts           # Kiểm tra lint
 uv run aerohand run --dry-run --preview       # Chạy thử bằng cửa sổ OpenCV
 ```
@@ -102,13 +103,13 @@ uv run aerohand run --dry-run --preview       # Chạy thử bằng cửa sổ O
 
 AeroHand chạy sẵn ngay bằng **`Heuristic3DPinchClassifier`** (hình học 3D trong `palm_frame` bất biến góc xoay). Để nâng độ chính xác pinch khi nghiêng tay gắt lên ngang các model thương mại:
 
-1. Mở tab **Dữ liệu ML** ngay trong `AeroHand.app`, quay ~300–500 mẫu cho từng cử chỉ (`0..6`) và bấm **Lưu JSON** (lưu vào `data/sessions/`).
-2. Cài nhóm thư viện huấn luyện và chạy script train Causal 1D-TCN (hỗ trợ so sánh A/B giữa **`invariant348`** và **`airmouse885`**):
+1. Mở tab **Dữ liệu ML** ngay trong `AeroHand.app`, chọn metadata (góc cổ tay, khoảng cách, ánh sáng), bật **Quay theo kịch bản hướng dẫn** (hoặc nhấn giữ phím `0..6` gắn nhãn trực tiếp), kiểm tra **Quality Gate** rồi bấm **Lưu JSON** (lưu vào `data/sessions/`).
+2. Cài nhóm thư viện huấn luyện và chạy script train Causal 1D-TCN (hỗ trợ so sánh A/B giữa **`invariant348`** và **`airmouse885`**, Focal Loss, Landmark Augmentation, Temperature Scaling và xuất `metrics.json`):
 ```bash
 uv sync --extra train
-uv run python scripts/train_tcn.py --sessions data/sessions --out-dir models --feature-set invariant348
+uv run python scripts/train_tcn.py --sessions data/sessions --out-dir models --feature-set invariant348 --loss focal --augment
 ```
-3. Mở tab **Dữ liệu ML** trong app → đổi **Bộ phân loại Pinch** sang **`ONNX 1D-TCN`** (không cần sửa code).
+3. Mở tab **Dữ liệu ML** trong app → bật **Shadow Mode** để theo dõi độ lệch A/B trên `aerohand vitals`, sau đó chuyển **Bộ phân loại Pinch** sang **`ONNX 1D-TCN`** (tự động fallback về Heuristic 3D nếu p95 > 8 ms hoặc có lỗi liên tiếp).
 
 ---
 

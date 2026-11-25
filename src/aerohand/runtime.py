@@ -30,7 +30,11 @@ from aerohand.config import (
     repo_root,
     resolve_profile_config,
 )
-from aerohand.core.engine import HandCursorEngine
+from aerohand.core.engine import (
+    HandCursorEngine,
+    PinchCalibrationWizard,
+    format_live_hint_toast,
+)
 from aerohand.core.kinematics import CursorLerpInterpolator
 from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
@@ -88,11 +92,13 @@ class RuntimeSnapshot:
     window_tile_preview: Optional[Dict[str, Any]] = None
     spaces_nav_preview: Optional[str] = None
     active_hint: Optional[str] = None
+    active_hint_text: Optional[str] = None
     warning: Optional[Dict[str, str]] = None
     dictation: Dict[str, Any] = field(default_factory=dict)
     timing: Dict[str, float] = field(default_factory=dict)
     vitals: Dict[str, Any] = field(default_factory=dict)
     collector: Dict[str, Any] = field(default_factory=dict)
+    calibration: Dict[str, Any] = field(default_factory=dict)
     practice: Dict[str, bool] = field(default_factory=dict)
     click_event_seq: int = 0
     click_event: Optional[Dict[str, Any]] = None
@@ -203,6 +209,7 @@ class AeroHandRuntime:
         )
         self.vitals_mon = SystemVitalsMonitor()
         self.collector: PinchDataCollector = PinchDataCollector()
+        self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
 
         self._api_server: Optional[LocalControlAPIServer] = None
@@ -454,6 +461,30 @@ class AeroHandRuntime:
             self._practice[k] = False
         self._move_accum_px = 0.0
         return dict(self._practice)
+
+    def calibration_start(self) -> Dict[str, Any]:
+        self.calibration.start()
+        return self.calibration.status()
+
+    def calibration_cancel(self) -> Dict[str, Any]:
+        self.calibration.cancel()
+        return self.calibration.status()
+
+    def calibration_apply(self) -> Optional[Dict[str, Any]]:
+        sugg = self.calibration.suggestion
+        if not sugg:
+            return None
+        new_cfg = deepcopy(self.base_config)
+        h3d = new_cfg.setdefault("classifier", {}).setdefault("heuristic_3d", {})
+        h3d["pinch_on_dist"] = float(sugg["pinch_on_dist"])
+        h3d["pinky_base_on_dist"] = float(sugg["pinky_base_on_dist"])
+        h3d["dual_pinch_on_dist"] = float(sugg["dual_pinch_on_dist"])
+        th_map = new_cfg.setdefault("pose_state_machine", {}).setdefault("thresholds", {})
+        for pose_k, val in (sugg.get("enter_thresholds") or {}).items():
+            th_map.setdefault(pose_k, {})["enter_threshold"] = float(val)
+        self.apply_live_settings(new_cfg)
+        self.calibration.cancel()
+        return self.base_config
 
     def get_snapshot(self) -> RuntimeSnapshot:
         with self._snapshot_lock:
@@ -1098,6 +1129,16 @@ class AeroHandRuntime:
                 )
                 primary = self._select_primary_hand(outputs)
                 self._record_collector_frame(hands, primary, cf.timestamp_ms)
+                if self.calibration.state == "running":
+                    cal_hand = next(
+                        (h for h in hands if primary is not None and h.handedness == primary.hand),
+                        hands[0] if hands else None,
+                    )
+                    self.calibration.update(
+                        cal_hand.landmarks if cal_hand is not None else None,
+                        cal_hand.world_landmarks if cal_hand is not None else None,
+                        cal_hand.handedness if cal_hand is not None else "Right",
+                    )
                 active_hint = self._dispatch_actions(outputs, primary, frame_wall_ms)
                 self._enforce_input_safety(frame_wall_ms)
 
@@ -1219,11 +1260,13 @@ class AeroHandRuntime:
                         primary.pose.spaces_nav_preview_direction if primary is not None else None
                     ),
                     active_hint=active_hint,
+                    active_hint_text=format_live_hint_toast(active_hint, self.config),
                     warning=warn_dict,
                     dictation=self.dictation.status_dict(),
                     timing=timing.to_dict(),
                     vitals=self.vitals_mon.read().to_dict(),
                     collector=self.collector_status(),
+                    calibration=self.calibration.status(),
                     practice=dict(self._practice),
                     click_event_seq=self._click_seq,
                     click_event=self._last_click_event,

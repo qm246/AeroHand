@@ -1401,3 +1401,49 @@ def test_compute_tile_rect_halves():
     assert fill[3] == pytest.approx(872.0 - 8.0)
     assert center[2] == pytest.approx(1440.0 * 0.72)
     assert center[3] == pytest.approx(872.0 * 0.78)
+
+
+def test_calibration_suggestion_within_bounds():
+    from aerohand.core.engine import (
+        SAFE_DUAL_PINCH_ON_BOUNDS,
+        SAFE_ENTER_THRESHOLD_BOUNDS,
+        SAFE_PINCH_ON_BOUNDS,
+        SAFE_PINKY_BASE_ON_BOUNDS,
+        suggest_calibrated_thresholds,
+    )
+
+    # Extreme too-small and too-large measurements must still clamp cleanly within safe bounds
+    for raw_val in (0.01, 0.25, 0.95):
+        sugg = suggest_calibrated_thresholds(
+            {
+                "thumb_index_pinch": raw_val,
+                "thumb_middle_pinch": raw_val,
+                "thumb_ring_pinch": raw_val,
+                "thumb_pinky_pinch": raw_val,
+                "thumb_pinky_base": raw_val,
+                "thumb_index_middle_pinch": raw_val,
+            }
+        )
+        assert SAFE_PINCH_ON_BOUNDS[0] <= sugg["pinch_on_dist"] <= SAFE_PINCH_ON_BOUNDS[1]
+        assert SAFE_PINKY_BASE_ON_BOUNDS[0] <= sugg["pinky_base_on_dist"] <= SAFE_PINKY_BASE_ON_BOUNDS[1]
+        assert SAFE_DUAL_PINCH_ON_BOUNDS[0] <= sugg["dual_pinch_on_dist"] <= SAFE_DUAL_PINCH_ON_BOUNDS[1]
+        for th in sugg["enter_thresholds"].values():
+            assert SAFE_ENTER_THRESHOLD_BOUNDS[0] <= th <= SAFE_ENTER_THRESHOLD_BOUNDS[1]
+
+
+def test_toast_uses_live_gesture_map():
+    from aerohand.config import apply_gesture_preset
+    from aerohand.core.engine import format_live_hint_toast
+
+    cfg_ap = load_config()
+    msg_vi_ap = format_live_hint_toast("click", cfg_ap, lang="vi")
+    msg_en_ap = format_live_hint_toast("click", cfg_ap, lang="en")
+    assert msg_vi_ap and "Cái + Giữa" in msg_vi_ap
+    assert msg_en_ap and "Thumb + Middle" in msg_en_ap
+
+    # Switch to Classic preset -> toast dynamically updates to Thumb + Index (no hard-coded gesture names!)
+    cfg_cl = apply_gesture_preset(cfg_ap, "classic")
+    msg_vi_cl = format_live_hint_toast("click", cfg_cl, lang="vi")
+    msg_en_cl = format_live_hint_toast("click", cfg_cl, lang="en")
+    assert msg_vi_cl and "Cái + Trỏ" in msg_vi_cl
+    assert msg_en_cl and "Thumb + Index" in msg_en_cl

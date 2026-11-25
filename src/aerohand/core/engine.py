@@ -27,7 +27,17 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from aerohand.core.filters import LandmarkSmoother
 from aerohand.core.kinematics import CursorKinematics, isotropic_distance_2d
-from aerohand.core.palm_frame import compute_hand_rotation, compute_pointing_dir_z
+from aerohand.core.palm_frame import (
+    INDEX_TIP,
+    MIDDLE_TIP,
+    PINKY_MCP,
+    PINKY_TIP,
+    RING_TIP,
+    THUMB_TIP,
+    compute_hand_rotation,
+    compute_palm_frame,
+    compute_pointing_dir_z,
+)
 from aerohand.core.palm_wheel import PalmWheelDetector, PalmWheelOutput
 from aerohand.core.pose_state_machine import PoseStateMachine
 from aerohand.core.scroll_controller import ScrollController
@@ -37,6 +47,7 @@ from aerohand.core.types import (
     Handedness,
     HandInput,
     HandOutput,
+    Landmark,
     PipelineTiming,
     PoseName,
     PoseOutput,
@@ -46,9 +57,234 @@ from aerohand.core.types import (
 )
 from aerohand.core.window_tile import WindowTileController
 from aerohand.core.zoom_controller import ZoomController
+from aerohand.i18n import get_lang_pack
 from aerohand.ml.base import PinchClassifier
 
 logger = logging.getLogger(__name__)
+
+CALIBRATION_POSES: Tuple[PoseName, ...] = (
+    PoseName.THUMB_INDEX_PINCH,
+    PoseName.THUMB_MIDDLE_PINCH,
+    PoseName.THUMB_RING_PINCH,
+    PoseName.THUMB_PINKY_PINCH,
+    PoseName.THUMB_PINKY_BASE,
+    PoseName.THUMB_INDEX_MIDDLE_PINCH,
+)
+
+# Safe threshold bounds so calibration can never create hyper-sensitive or unusable settings
+SAFE_PINCH_ON_BOUNDS: Tuple[float, float] = (0.24, 0.46)
+SAFE_PINKY_BASE_ON_BOUNDS: Tuple[float, float] = (0.30, 0.54)
+SAFE_DUAL_PINCH_ON_BOUNDS: Tuple[float, float] = (0.28, 0.50)
+SAFE_ENTER_THRESHOLD_BOUNDS: Tuple[float, float] = (0.65, 0.88)
+
+
+def measure_pose_palm_distance(
+    landmarks_2d: List[Landmark],
+    world_landmarks: Optional[List[Landmark]],
+    handedness: Handedness,
+    pose: PoseName,
+) -> Optional[float]:
+    """Measure fingertip contact distance for `pose` in 3D orthonormal `palm_frame` units."""
+    src = world_landmarks if (world_landmarks is not None and len(world_landmarks) >= 21) else landmarks_2d
+    pf = compute_palm_frame(src, anchor="palm_center", is_left_hand=(handedness == "Left"), scale_metric="palm_width")
+    if pf is None:
+        return None
+    if pose == PoseName.THUMB_INDEX_PINCH:
+        return pf.dist(THUMB_TIP, INDEX_TIP)
+    if pose == PoseName.THUMB_MIDDLE_PINCH:
+        return pf.dist(THUMB_TIP, MIDDLE_TIP)
+    if pose == PoseName.THUMB_RING_PINCH:
+        return pf.dist(THUMB_TIP, RING_TIP)
+    if pose == PoseName.THUMB_PINKY_PINCH:
+        return pf.dist(THUMB_TIP, PINKY_TIP)
+    if pose == PoseName.THUMB_PINKY_BASE:
+        return pf.dist(THUMB_TIP, PINKY_MCP)
+    if pose == PoseName.THUMB_INDEX_MIDDLE_PINCH:
+        return max(pf.dist(THUMB_TIP, INDEX_TIP), pf.dist(THUMB_TIP, MIDDLE_TIP))
+    return None
+
+
+def suggest_calibrated_thresholds(medians: Dict[str, float]) -> Dict[str, Any]:
+    """
+    Convert per-pose median `palm_frame` contact distances into safe suggested overrides.
+    Never suggests values below the documented safe minimum or above the safe maximum.
+    """
+    def _clamp(val: float, lo: float, hi: float) -> float:
+        return round(max(lo, min(hi, float(val))), 3)
+
+    single_vals = [
+        float(medians[p.value])
+        for p in (
+            PoseName.THUMB_INDEX_PINCH,
+            PoseName.THUMB_MIDDLE_PINCH,
+            PoseName.THUMB_RING_PINCH,
+            PoseName.THUMB_PINKY_PINCH,
+        )
+        if p.value in medians and medians[p.value] > 0.0
+    ]
+    if single_vals:
+        med_single = sorted(single_vals)[len(single_vals) // 2]
+        pinch_on = _clamp(med_single + 0.08, *SAFE_PINCH_ON_BOUNDS)
+    else:
+        pinch_on = 0.34
+
+    pb_raw = medians.get(PoseName.THUMB_PINKY_BASE.value)
+    pinky_base_on = _clamp((pb_raw + 0.09) if pb_raw else 0.42, *SAFE_PINKY_BASE_ON_BOUNDS)
+
+    dual_raw = medians.get(PoseName.THUMB_INDEX_MIDDLE_PINCH.value)
+    dual_on = _clamp((dual_raw + 0.08) if dual_raw else 0.38, *SAFE_DUAL_PINCH_ON_BOUNDS)
+
+    enter_thresholds: Dict[str, float] = {}
+    for p in CALIBRATION_POSES:
+        d = medians.get(p.value)
+        if d is None or d <= 0.0:
+            enter_thresholds[p.value] = 0.75
+        else:
+            # Slightly tighter enter threshold if user's natural contact is very tight, looser if wider
+            raw_th = 0.82 - max(0.0, (d - 0.22)) * 0.45
+            enter_thresholds[p.value] = _clamp(raw_th, *SAFE_ENTER_THRESHOLD_BOUNDS)
+
+    return {
+        "pinch_on_dist": pinch_on,
+        "pinky_base_on_dist": pinky_base_on,
+        "dual_pinch_on_dist": dual_on,
+        "enter_thresholds": enter_thresholds,
+        "medians": {k: round(float(v), 3) for k, v in medians.items()},
+    }
+
+
+class PinchCalibrationWizard:
+    """Interactive 30-second per-pose calibration wizard (6 pinch poses x 3s hold)."""
+
+    def __init__(self, hold_seconds: float = 3.0) -> None:
+        self.hold_seconds: float = max(1.0, float(hold_seconds))
+        self.state: str = "idle"  # "idle" | "running" | "done"
+        self.step_index: int = 0
+        self._step_started_s: float = 0.0
+        self._samples: Dict[str, List[float]] = {p.value: [] for p in CALIBRATION_POSES}
+        self.suggestion: Optional[Dict[str, Any]] = None
+
+    def start(self, now_s: Optional[float] = None) -> None:
+        t = time.monotonic() if now_s is None else float(now_s)
+        self.state = "running"
+        self.step_index = 0
+        self._step_started_s = t
+        self._samples = {p.value: [] for p in CALIBRATION_POSES}
+        self.suggestion = None
+
+    def cancel(self) -> None:
+        self.state = "idle"
+        self.step_index = 0
+        self.suggestion = None
+
+    def update(
+        self,
+        landmarks_2d: Optional[List[Landmark]],
+        world_landmarks: Optional[List[Landmark]],
+        handedness: Handedness,
+        now_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        if self.state != "running":
+            return self.status(now_s=now_s)
+        t = time.monotonic() if now_s is None else float(now_s)
+        pose = CALIBRATION_POSES[self.step_index]
+        if landmarks_2d is not None and len(landmarks_2d) >= 21:
+            d = measure_pose_palm_distance(landmarks_2d, world_landmarks, handedness, pose)
+            if d is not None and 0.01 < d < 1.5:
+                self._samples[pose.value].append(d)
+
+        elapsed = t - self._step_started_s
+        if elapsed >= self.hold_seconds:
+            self.step_index += 1
+            self._step_started_s = t
+            if self.step_index >= len(CALIBRATION_POSES):
+                medians: Dict[str, float] = {}
+                for p in CALIBRATION_POSES:
+                    vals = sorted(self._samples[p.value])
+                    if vals:
+                        medians[p.value] = vals[len(vals) // 2]
+                self.suggestion = suggest_calibrated_thresholds(medians)
+                self.state = "done"
+        return self.status(now_s=t)
+
+    def status(self, now_s: Optional[float] = None) -> Dict[str, Any]:
+        t = time.monotonic() if now_s is None else float(now_s)
+        cur_pose = (
+            CALIBRATION_POSES[self.step_index].value
+            if self.state == "running" and self.step_index < len(CALIBRATION_POSES)
+            else None
+        )
+        remaining_s = (
+            max(0.0, self.hold_seconds - (t - self._step_started_s))
+            if self.state == "running"
+            else 0.0
+        )
+        return {
+            "state": self.state,
+            "step_index": self.step_index,
+            "total_steps": len(CALIBRATION_POSES),
+            "current_pose": cur_pose,
+            "remaining_s": round(remaining_s, 1),
+            "sample_counts": {k: len(v) for k, v in self._samples.items()},
+            "suggestion": self.suggestion,
+        }
+
+
+def format_live_hint_toast(
+    hint_key: Optional[str],
+    config: Dict[str, Any],
+    lang: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Build a bilingual contextual toast message reading the LIVE gesture map
+    (`pose_state_machine.tap_actions` / `hold_actions`) with zero hard-coded gesture names.
+    """
+    if not hint_key:
+        return None
+    eff_lang = lang or str((config.get("ui") or {}).get("language", "vi"))
+    pack = get_lang_pack(eff_lang)
+    base_label = (pack.get("hints") or {}).get(hint_key) or hint_key
+    poses_i18n = pack.get("poses") or {}
+
+    psm = config.get("pose_state_machine") or {}
+    tap_map = psm.get("tap_actions") or {}
+    hold_map = psm.get("hold_actions") or {}
+    click_hold = bool(psm.get("enable_click_hold", False))
+
+    action_lookup = {
+        "click": ("tap", "left_click"),
+        "right_click": ("dual_right", "right_click"),
+        "grab": ("hold_drag", "drag"),
+        "scroll": ("hold", "scroll"),
+        "window_tile": ("hold", "window_tile"),
+        "spaces_nav": ("hold", "spaces_nav"),
+        "dictation": ("hold", "dictation"),
+    }
+    entry = action_lookup.get(hint_key)
+    if entry is None:
+        return str(base_label)
+
+    kind, act_name = entry
+    matched_poses: List[str] = []
+    if kind == "tap":
+        matched_poses = [pk for pk, act in tap_map.items() if act == act_name]
+    elif kind == "hold":
+        matched_poses = [pk for pk, act in hold_map.items() if act == act_name]
+    elif kind == "hold_drag":
+        matched_poses = [pk for pk, act in hold_map.items() if act == "drag"]
+        if click_hold:
+            for pk, act in tap_map.items():
+                if act == "left_click" and pk not in matched_poses:
+                    matched_poses.append(pk)
+    elif kind == "dual_right":
+        matched_poses = [pk for pk, act in tap_map.items() if act == "right_click"]
+        if not matched_poses:
+            matched_poses = [pk for pk, act in hold_map.items() if act == "scroll"]
+
+    if not matched_poses:
+        return str(base_label)
+    pose_names = " / ".join(poses_i18n.get(pk, pk) for pk in matched_poses)
+    return f"{base_label} • {pose_names}"
 
 
 @dataclass

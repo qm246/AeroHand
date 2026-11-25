@@ -266,12 +266,13 @@
       tileEl.classList.remove("visible");
     }
 
-    // 3. Gesture Hint Toast
+    // 3. Gesture Hint Toast (reads dynamic live gesture-map text)
     const hintEl = document.getElementById("hint-toast");
     const hintKey = snap.active_hint;
     const hintsCfg = (ui && ui.hints) || {};
     if (hintKey && hintKey !== "dictation" && (hintsCfg[hintKey] !== false)) {
-      document.getElementById("hint-text").textContent = (i18n.hints && i18n.hints[hintKey]) || hintKey;
+      document.getElementById("hint-text").textContent =
+        snap.active_hint_text || (i18n.hints && i18n.hints[hintKey]) || hintKey;
       hintEl.classList.add("visible");
     } else {
       hintEl.classList.remove("visible");

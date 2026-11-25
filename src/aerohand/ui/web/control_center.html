@@ -595,6 +595,18 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       <!-- 8. ONBOARDING & PRACTICE -->
       <div id="tab-onboarding" class="tab-pane">
         <div class="card">
+          <div class="card-title"><span id="t-cal-hdr">HIỆU CHỈNH NHANH 30 GIÂY (THEO BÀN TAY CỦA BẠN)</span><span class="pill-tag" id="cal-step-pill">0 / 6</span></div>
+          <p id="t-cal-sub" style="font-size:12px;color:var(--muted);margin-bottom:10px">Giữ lần lượt 6 cử chỉ chụm trong 3 giây mỗi cử chỉ để đo khoảng cách thực tế trong hệ tọa độ 3D và gợi ý ngưỡng an toàn.</p>
+          <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px">
+            <button class="btn primary" id="btn-cal-start" onclick="post('calibration_start')">🎯 Bắt đầu hiệu chỉnh 30 giây</button>
+            <button class="btn" id="btn-cal-cancel" style="display:none" onclick="post('calibration_cancel')">Hủy</button>
+            <button class="btn primary" id="btn-cal-apply" style="display:none" onclick="post('calibration_apply')">✓ Áp dụng ngưỡng gợi ý</button>
+          </div>
+          <div id="cal-status-txt" style="font-size:12.5px;color:var(--teal);margin-bottom:6px"></div>
+          <div class="code-box" id="cal-preview" style="display:none"></div>
+        </div>
+
+        <div class="card">
           <div class="card-title"><span id="t-practice-hdr">BÀI TẬP THỰC HÀNH 10 CỬ CHỈ CHUẨN (TỰ SÁNG XANH KHI LÀM ĐÚNG)</span><button class="btn sm" id="btn-reset-practice" onclick="post('reset_practice')">↺ Làm lại</button></div>
           <p id="t-practice-sub" style="font-size:12px;color:var(--muted);margin-bottom:10px">Hướng dẫn tự động cập nhật theo bộ cử chỉ bạn đang chọn (mặc định là Chuẩn Airpoint: Ngón trỏ chỉ chuột, Cái + Giữa bấm Click trái). Hoạt động ngay cả khi bật chế độ Chạy thử (Dry-Run)!</p>
           <div class="grid-2" id="practice-grid"></div>
@@ -727,6 +739,12 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     setTxt("t-practice-hdr", "BÀI TẬP THỰC HÀNH 10 CỬ CHỈ CHUẨN (TỰ SÁNG XANH KHI LÀM ĐÚNG)", "INTERACTIVE 10-GESTURE PRACTICE (LIGHTS UP GREEN LIVE)");
     setTxt("t-practice-sub", "Hướng dẫn tự động cập nhật theo bộ cử chỉ bạn đang chọn (mặc định là Chuẩn Airpoint: Ngón trỏ chỉ chuột, Cái + Giữa bấm Click trái). Hoạt động ngay cả khi bật chế độ Chạy thử (Dry-Run)!", "Instructions automatically match your active gesture bindings (Airpoint default: Index points, Thumb + Middle clicks). Works even in Dry-Run mode!");
     setTxt("btn-reset-practice", "↺ Làm lại", "↺ Reset");
+    const calI18n = i18n.calibration || {};
+    setTxt("t-cal-hdr", calI18n.title || "HIỆU CHỈNH NHANH 30 GIÂY", calI18n.title || "30-SECOND CALIBRATION WIZARD");
+    setTxt("t-cal-sub", calI18n.subtitle || "", calI18n.subtitle || "");
+    setTxt("btn-cal-start", calI18n.start || "🎯 Bắt đầu", calI18n.start || "🎯 Start");
+    setTxt("btn-cal-cancel", calI18n.cancel || "Hủy", calI18n.cancel || "Cancel");
+    setTxt("btn-cal-apply", calI18n.apply || "✓ Áp dụng", calI18n.apply || "✓ Apply");
 
     // Helper: find which pose(s) currently trigger a given tap or hold action
     const tapMapNow = getPath(c, "pose_state_machine.tap_actions", {});
@@ -1101,7 +1119,41 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       ).join("");
     }
 
-    // Practice checklist
+    // Practice checklist & 30s Calibration Wizard live status
+    const cal = snap.calibration || {};
+    const calI18n = i18n.calibration || {};
+    const calPill = document.getElementById("cal-step-pill");
+    if (calPill) calPill.textContent = `${cal.step_index || 0} / ${cal.total_steps || 6}`;
+    const btnStart = document.getElementById("btn-cal-start");
+    const btnCancel = document.getElementById("btn-cal-cancel");
+    const btnApply = document.getElementById("btn-cal-apply");
+    const calTxt = document.getElementById("cal-status-txt");
+    const calPrev = document.getElementById("cal-preview");
+    if (calTxt && btnStart && btnCancel && btnApply && calPrev) {
+      if (cal.state === "running") {
+        btnStart.style.display = "none";
+        btnCancel.style.display = "inline-flex";
+        btnApply.style.display = "none";
+        const pLbl = (i18n.poses && i18n.poses[cal.current_pose]) || cal.current_pose || "";
+        const tmpl = calI18n.prompt || "{pose} ({sec}s)";
+        calTxt.textContent = tmpl.replace("{pose}", pLbl).replace("{sec}", String(cal.remaining_s || 0));
+        calPrev.style.display = "none";
+      } else if (cal.state === "done" && cal.suggestion) {
+        btnStart.style.display = "inline-flex";
+        btnCancel.style.display = "inline-flex";
+        btnApply.style.display = "inline-flex";
+        calTxt.textContent = calI18n.done || "";
+        calPrev.style.display = "block";
+        calPrev.textContent = JSON.stringify(cal.suggestion, null, 2);
+      } else {
+        btnStart.style.display = "inline-flex";
+        btnCancel.style.display = "none";
+        btnApply.style.display = "none";
+        calTxt.textContent = calI18n.idle || "";
+        calPrev.style.display = "none";
+      }
+    }
+
     const pr = snap.practice || {};
     for (const [k, done] of Object.entries(pr)) {
       const card = document.getElementById("pr-" + k);

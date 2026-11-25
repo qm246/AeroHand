@@ -923,6 +923,18 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "reset_practice":
             if self.runtime is not None:
                 self.runtime.reset_practice()
+        elif act == "calibration_start":
+            if self.runtime is not None:
+                self.runtime.calibration_start()
+        elif act == "calibration_cancel":
+            if self.runtime is not None:
+                self.runtime.calibration_cancel()
+        elif act == "calibration_apply":
+            if self.runtime is not None:
+                updated = self.runtime.calibration_apply()
+                if updated is not None:
+                    self.config = updated
+                    self._persist_and_apply(rehydrate=True)
         elif act == "reset_defaults":
             self.resetDefaults_(None)
         elif act == "quit":
@@ -1061,6 +1073,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                     "palm_wheels": local_wheels,
                     "window_tile_preview": local_tile,
                     "active_hint": snap.active_hint if is_active_panel else None,
+                    "active_hint_text": snap.active_hint_text if is_active_panel else None,
                     "warning": snap.warning if is_active_panel else None,
                     "dictation": snap.dictation if is_active_panel else {},
                 }
@@ -1099,6 +1112,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 "timing": snap.timing,
                 "vitals": snap.vitals,
                 "collector": snap.collector,
+                "calibration": snap.calibration,
                 "practice": snap.practice,
                 "error": snap.error,
             }

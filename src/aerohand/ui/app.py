@@ -17,7 +17,7 @@ import sys
 import threading
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import AppKit
 import cv2
@@ -179,6 +179,13 @@ def detect_hotkey_conflicts(hk_cfg: Dict[str, Any]) -> List[str]:
         else:
             seen[parsed] = action
     return conflicts
+
+
+def screen_frames_signature(
+    frames: Sequence[Tuple[float, float, float, float]],
+) -> Tuple[Tuple[int, int, int, int], ...]:
+    """Stable geometry signature of display frames so Dock/Space animations do not rebuild overlays."""
+    return tuple((int(round(x)), int(round(y)), int(round(w)), int(round(h))) for x, y, w, h in frames)
 
 
 class OverlayPayloadBuilder:
@@ -392,6 +399,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self.overlay_panel = None
         self.overlay_webview = None
         self._overlay_entries: list[Dict[str, Any]] = []
+        self._overlay_bridge_handler = None
+        self._overlay_screen_signature: Tuple[Tuple[int, int, int, int], ...] = ()
+        self._overlay_had_visuals: bool = False
         self._screen_geom = ScreenGeometry()
         self.camera_panel = None
         self.camera_container = None
@@ -686,12 +696,16 @@ class AeroHandAppDelegate(AppKit.NSObject):
             file_url = Foundation.NSURL.fileURLWithPath_(str(html_path))
             dir_url = Foundation.NSURL.fileURLWithPath_(str(html_path.parent))
             style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
+            if self._overlay_bridge_handler is None:
+                self._overlay_bridge_handler = WebBridgeHandler.alloc().initWithCallback_(self._on_js_message)
 
+            raw_frames: List[Tuple[float, float, float, float]] = []
             for idx, sc in enumerate(screens):
                 sf = sc.frame()
-                q_rect = self._screen_geom.to_quartz_rect(
+                raw_frames.append(
                     (float(sf.origin.x), float(sf.origin.y), float(sf.size.width), float(sf.size.height))
                 )
+                q_rect = self._screen_geom.to_quartz_rect(raw_frames[-1])
                 panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
                     sf, style, AppKit.NSBackingStoreBuffered, False
                 )
@@ -707,6 +721,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 )
 
                 wk_cfg = WebKit.WKWebViewConfiguration.alloc().init()
+                ucc = WebKit.WKUserContentController.alloc().init()
+                ucc.addScriptMessageHandler_name_(self._overlay_bridge_handler, "aerohand")
+                wk_cfg.setUserContentController_(ucc)
                 wv = WebKit.WKWebView.alloc().initWithFrame_configuration_(
                     Foundation.NSMakeRect(0, 0, sf.size.width, sf.size.height), wk_cfg
                 )
@@ -725,10 +742,12 @@ class AeroHandAppDelegate(AppKit.NSObject):
                         "webview": wv,
                         "quartz_rect": q_rect,
                         "is_primary": is_primary or idx == 0,
+                        "ready": False,
                         "payload_builder": OverlayPayloadBuilder(),
                     }
                 )
 
+            self._overlay_screen_signature = screen_frames_signature(raw_frames)
             if self._overlay_entries:
                 prim = next((e for e in self._overlay_entries if e["is_primary"]), self._overlay_entries[0])
                 self.overlay_panel = prim["panel"]
@@ -736,7 +755,25 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 self._overlay_ready = True
 
     def onScreenParametersChanged_(self, _notification) -> None:
-        logger.info("[UI] Display configuration changed; rebuilding per-display click-through overlays.")
+        screens = list(AppKit.NSScreen.screens() or [])
+        cur_sig = screen_frames_signature(
+            [
+                (
+                    float(sc.frame().origin.x),
+                    float(sc.frame().origin.y),
+                    float(sc.frame().size.width),
+                    float(sc.frame().size.height),
+                )
+                for sc in screens
+            ]
+        )
+        if cur_sig and cur_sig == self._overlay_screen_signature:
+            # Dock/menu bar/Space change without display topology change — keep existing WebViews alive!
+            self._apply_camera_hud_layout()
+            if self.runtime is not None:
+                self.runtime._refresh_display_bounds()
+            return
+        logger.info("[UI] Display geometry changed; rebuilding per-display click-through overlays.")
         self._build_screen_overlay()
         for entry in self._overlay_entries:
             entry["panel"].orderFront_(None)
@@ -864,6 +901,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
         if act == "ready":
             self._control_ready = True
             self._hydrate_control_center()
+        elif act in ("overlay_ready", "overlay_need_sync"):
+            for entry in self._overlay_entries:
+                entry["ready"] = True
+                entry["payload_builder"].reset()
         elif act == "set_key":
             key = str(msg.get("key", ""))
             val = msg.get("value")
@@ -991,9 +1032,13 @@ class AeroHandAppDelegate(AppKit.NSObject):
             or (snap.window_tile_preview is not None)
             or bool(snap.dictation.get("recording"))
             or bool(snap.dictation.get("transcribing"))
+            or (snap.active_hint is not None)
+            or (snap.warning is not None)
         )
+        need_clear_overlay = self._overlay_had_visuals and (not has_urgent_overlay)
+        self._overlay_had_visuals = has_urgent_overlay
         # Drop tick rate from 20 Hz to 5 Hz when Control Center is hidden and overlays are idle
-        if (not window_visible) and (not has_urgent_overlay) and ((self._tick_count % 4) != 0):
+        if (not window_visible) and (not has_urgent_overlay) and (not need_clear_overlay) and ((self._tick_count % 4) != 0):
             return
 
         lang = str((self.config.get("ui") or {}).get("language", "vi"))
@@ -1047,13 +1092,19 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 if self._rect_contains(entry["quartz_rect"], snap.cursor_x, snap.cursor_y):
                     active_idx = idx
                     break
+            single_display = len(self._overlay_entries) == 1
             for idx, entry in enumerate(self._overlay_entries):
+                if not entry.get("ready", False):
+                    continue
                 qx, qy, _qw, _qh = entry["quartz_rect"]
-                is_active_panel = idx == active_idx
+                is_active_panel = single_display or (idx == active_idx)
 
                 local_click = None
-                if snap.click_event is not None and self._rect_contains(
-                    entry["quartz_rect"], float(snap.click_event["x"]), float(snap.click_event["y"])
+                if snap.click_event is not None and (
+                    single_display
+                    or self._rect_contains(
+                        entry["quartz_rect"], float(snap.click_event["x"]), float(snap.click_event["y"])
+                    )
                 ):
                     local_click = dict(snap.click_event)
                     local_click["x"] = round(float(snap.click_event["x"]) - qx, 1)
@@ -1063,7 +1114,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 if snap.window_tile_preview is not None:
                     tcx = float(snap.window_tile_preview["x"]) + float(snap.window_tile_preview["w"]) * 0.5
                     tcy = float(snap.window_tile_preview["y"]) + float(snap.window_tile_preview["h"]) * 0.5
-                    if self._rect_contains(entry["quartz_rect"], tcx, tcy):
+                    if single_display or self._rect_contains(entry["quartz_rect"], tcx, tcy):
                         local_tile = dict(snap.window_tile_preview)
                         local_tile["x"] = round(float(snap.window_tile_preview["x"]) - qx, 1)
                         local_tile["y"] = round(float(snap.window_tile_preview["y"]) - qy, 1)
@@ -1072,9 +1123,15 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 for pw in snap.palm_wheels:
                     px_w = float(pw.get("cursor_x", snap.cursor_x))
                     py_w = float(pw.get("cursor_y", snap.cursor_y))
-                    if self._rect_contains(entry["quartz_rect"], px_w, py_w) or (
-                        is_active_panel and not any(
-                            self._rect_contains(e2["quartz_rect"], px_w, py_w) for e2 in self._overlay_entries
+                    if (
+                        single_display
+                        or self._rect_contains(entry["quartz_rect"], px_w, py_w)
+                        or (
+                            is_active_panel
+                            and not any(
+                                self._rect_contains(e2["quartz_rect"], px_w, py_w)
+                                for e2 in self._overlay_entries
+                            )
                         )
                     ):
                         pw_local = dict(pw)

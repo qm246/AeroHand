@@ -1874,3 +1874,30 @@ def test_buffers_cleared_on_hand_loss(tmp_path: Path, monkeypatch):
     # Switching classifier clears all remaining buffers cleanly
     eng.set_classifier(Heuristic3DPinchClassifier())
     assert len(clf._buffers["Left"]) == 0
+
+
+def test_overlay_hydration_reset_and_screen_signature():
+    from aerohand.i18n import get_lang_pack
+    from aerohand.ui.app import OverlayPayloadBuilder, screen_frames_signature
+
+    builder = OverlayPayloadBuilder()
+    ui_cfg = {"language": "vi", "show_palm_wheel_overlay": True, "palm_wheel_fixed": False}
+    pack_vi = get_lang_pack("vi")
+
+    # Initial sync delivers full ui + i18n; subsequent tick sends delta only
+    p1 = builder.build({"palm_wheels": []}, ui_cfg, "vi", pack_vi)
+    assert p1["ui"]["show_palm_wheel_overlay"] is True and "i18n" in p1
+    p2 = builder.build({"palm_wheels": [{"hand": "Right", "state": "active"}]}, ui_cfg, "vi", pack_vi)
+    assert "ui" not in p2 and "i18n" not in p2
+
+    # When overlay_ready / overlay_need_sync triggers builder.reset(), next tick MUST re-deliver full ui + i18n
+    builder.reset()
+    p3 = builder.build({"palm_wheels": [{"hand": "Right", "state": "active"}]}, ui_cfg, "vi", pack_vi)
+    assert p3["ui"]["show_palm_wheel_overlay"] is True and "i18n" in p3
+
+    # Identical screen geometry (modulo sub-pixel Dock/menu bar noise) keeps the same signature
+    s1 = screen_frames_signature([(0.0, 0.0, 1512.0, 982.0)])
+    s2 = screen_frames_signature([(0.0, 0.0, 1512.1, 982.0)])
+    s3 = screen_frames_signature([(0.0, 0.0, 1512.0, 982.0), (-1920.0, 0.0, 1920.0, 1080.0)])
+    assert s1 == s2
+    assert s1 != s3

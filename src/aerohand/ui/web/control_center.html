@@ -504,7 +504,8 @@
               </select>
             </div>
           </div>
-          <div style="margin-top:10px;font-size:12px;color:var(--muted)" id="dict-last-out">Bản ghi gần nhất: —</div>
+          <div style="margin-top:8px;font-size:11.5px;color:var(--teal)" id="dict-notice-out"></div>
+          <div style="margin-top:6px;font-size:12px;color:var(--muted)" id="dict-last-out">Bản ghi gần nhất: —</div>
         </div>
 
         <div class="card">
@@ -1085,9 +1086,16 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     setPerm("p-mic-st", !!perms.microphone);
     setPerm("p-sp-st", !!perms.speech);
 
-    // Dictation status
+    // Dictation status & on-device availability notice
     const d = snap.dictation || {};
     document.getElementById("btn-test-dict").textContent = d.recording ? (isVi ? "⏹ Dừng & Chuyển chữ" : "⏹ Stop & Transcribe") : (isVi ? "🎙 Thử ghi âm" : "🎙 Test Dictation");
+    const dictNoticeEl = document.getElementById("dict-notice-out");
+    if (dictNoticeEl) {
+      const nMap = i18n.dictation_notices || {};
+      const code = d.notice_code || (d.on_device_supported ? "on_device_ok" : "on_device_unavailable");
+      dictNoticeEl.textContent = nMap[code] || "";
+      dictNoticeEl.style.color = code === "on_device_unavailable" ? "var(--amber)" : "var(--teal)";
+    }
     document.getElementById("dict-last-out").textContent = d.last_error
       ? `⚠ ${d.last_error}`
       : ((isVi ? "Bản ghi gần nhất: " : "Last transcript: ") + (d.last_transcript || "—"));

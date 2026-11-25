@@ -140,6 +140,11 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "done": "Hoàn tất đo! Xem trước ngưỡng gợi ý bên dưới rồi nhấn Áp dụng.",
             "applied": "Đã áp dụng ngưỡng hiệu chỉnh vào cấu hình cá nhân.",
         },
+        "dictation_notices": {
+            "on_device_ok": "✓ Apple Speech On-Device sẵn sàng 100% cục bộ (không gửi âm thanh ra ngoài).",
+            "fallback_mlx_whisper": "ℹ Apple Speech On-Device chưa hỗ trợ ngôn ngữ này — đang tự động dùng mlx_whisper cục bộ.",
+            "on_device_unavailable": "⚠ Apple Speech On-Device chưa có cho ngôn ngữ này & chưa cài mlx_whisper. Hãy tải gói giọng nói Offline trong Cài đặt macOS hoặc cài `mlx-whisper`.",
+        },
     },
     "en": {
         "app_tagline": "Touchless macOS Control • Airpoint Ergonomics × GestureCtl Safety",
@@ -273,6 +278,11 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "prompt": "Hold pose: {pose} ({sec}s left)",
             "done": "Measurement complete! Review suggested thresholds below and click Apply.",
             "applied": "Applied calibrated thresholds to user overrides.",
+        },
+        "dictation_notices": {
+            "on_device_ok": "✓ Apple Speech On-Device ready 100% locally (no audio leaves your Mac).",
+            "fallback_mlx_whisper": "ℹ On-device Apple Speech unavailable for this locale — automatically using local mlx_whisper fallback.",
+            "on_device_unavailable": "⚠ On-device Apple Speech unavailable for this locale and mlx_whisper is not installed. Download offline dictation in macOS Settings or install `mlx-whisper`.",
         },
     },
 }

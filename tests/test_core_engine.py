@@ -1447,3 +1447,74 @@ def test_toast_uses_live_gesture_map():
     msg_en_cl = format_live_hint_toast("click", cfg_cl, lang="en")
     assert msg_vi_cl and "Cái + Trỏ" in msg_vi_cl
     assert msg_en_cl and "Thumb + Index" in msg_en_cl
+
+
+def test_pasteboard_snapshot_restores_non_string_types():
+    from aerohand.platform.input_macos import (
+        clipboard_restore_delay_s,
+        restore_pasteboard,
+        snapshot_pasteboard,
+    )
+
+    class _FakePBItem:
+        def __init__(self, data_map: dict[str, bytes]) -> None:
+            self._map = dict(data_map)
+
+        def types(self):
+            return list(self._map.keys())
+
+        def dataForType_(self, ptype: str):
+            return self._map.get(ptype)
+
+    class _FakePasteboard:
+        def __init__(self) -> None:
+            self.items: List[_FakePBItem] = []
+
+        def pasteboardItems(self):
+            return list(self.items)
+
+        def types(self):
+            return self.items[0].types() if self.items else []
+
+        def clearContents(self) -> None:
+            self.items = []
+
+        def setString_forType_(self, text: str, ptype: str) -> None:
+            self.items = [_FakePBItem({ptype: text.encode("utf-8")})]
+
+        def stringForType_(self, ptype: str) -> str | None:
+            if not self.items:
+                return None
+            raw = self.items[0].dataForType_(ptype)
+            return raw.decode("utf-8") if raw is not None else None
+
+        def restore_snapshot_items(self, snap: List[dict[str, bytes]]) -> None:
+            self.items = [_FakePBItem(m) for m in snap]
+
+    png_bytes = b"\x89PNG\r\n\x1a\nFAKE_IMAGE_BYTES"
+    file_url_bytes = b"file:///Users/macos/Desktop/demo.png"
+    pb = _FakePasteboard()
+    pb.items = [
+        _FakePBItem({"public.png": png_bytes, "public.utf8-plain-text": b"caption"}),
+        _FakePBItem({"public.file-url": file_url_bytes}),
+    ]
+
+    snap = snapshot_pasteboard(pb)
+    assert len(snap) == 2 and snap[0]["public.png"] == png_bytes
+
+    ctl = MacOSInputController(dry_run=True)
+    ok = ctl.paste_text_utf8("Xin chào tiếng Việt!", pasteboard=pb, restore_delay_s=0.0, sync_restore=True)
+    assert ok is True
+    # Original image & file URL items must be completely preserved!
+    assert len(pb.items) == 2
+    assert pb.items[0].dataForType_("public.png") == png_bytes
+    assert pb.items[0].dataForType_("public.utf8-plain-text") == b"caption"
+    assert pb.items[1].dataForType_("public.file-url") == file_url_bytes
+
+    # Also test direct restore_pasteboard + Electron/Chromium restore delay
+    pb.clearContents()
+    restore_pasteboard(pb, snap)
+    assert pb.items[0].dataForType_("public.png") == png_bytes
+    assert clipboard_restore_delay_s("com.microsoft.VSCode") == 0.35
+    assert clipboard_restore_delay_s("com.google.Chrome") == 0.35
+    assert clipboard_restore_delay_s("com.apple.Notes") == 0.15

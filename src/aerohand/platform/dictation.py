@@ -36,8 +36,48 @@ def _write_pcm16_wav(path: Path, audio_f32: np.ndarray, sr: int = SAMPLE_RATE) -
         wf.writeframes(pcm.tobytes())
 
 
-def _transcribe_apple_speech(wav_path: Path, language: str = "vi-VN", timeout_s: float = 15.0) -> str:
-    """Transcribe a short WAV clip via macOS native Speech.framework (`SFSpeechRecognizer`)."""
+def _is_mlx_whisper_installed() -> bool:
+    try:
+        import importlib.util
+
+        return importlib.util.find_spec("mlx_whisper") is not None
+    except Exception:
+        return False
+
+
+def check_apple_speech_on_device(language: str = "vi-VN") -> Dict[str, Any]:
+    """Inspect local macOS on-device Speech availability for `language` without network access."""
+    info: Dict[str, Any] = {
+        "language": language,
+        "available": False,
+        "supports_on_device": False,
+        "mlx_whisper_available": _is_mlx_whisper_installed(),
+    }
+    try:
+        import Foundation
+        import Speech
+
+        locale = Foundation.NSLocale.localeWithLocaleIdentifier_(language)
+        recognizer = Speech.SFSpeechRecognizer.alloc().initWithLocale_(locale)
+        if recognizer is not None:
+            info["available"] = bool(recognizer.isAvailable())
+            try:
+                info["supports_on_device"] = bool(recognizer.supportsOnDeviceRecognition())
+            except Exception:
+                info["supports_on_device"] = False
+    except Exception:
+        pass
+    return info
+
+
+def _transcribe_apple_speech(
+    wav_path: Path,
+    language: str = "vi-VN",
+    timeout_s: float = 15.0,
+    *,
+    require_on_device: bool = True,
+) -> str:
+    """Transcribe a short WAV clip via macOS native Speech.framework (`SFSpeechRecognizer`, local-only)."""
     import Foundation
     import Speech
 
@@ -63,10 +103,19 @@ def _transcribe_apple_speech(wav_path: Path, language: str = "vi-VN", timeout_s:
     if recognizer is None or not recognizer.isAvailable():
         raise RuntimeError(f"Apple Speech Recognizer unavailable for locale '{language}'.")
 
+    supports_local = False
+    try:
+        supports_local = bool(recognizer.supportsOnDeviceRecognition())
+    except Exception:
+        supports_local = False
+
+    if require_on_device and not supports_local:
+        raise RuntimeError(f"On-device Apple Speech is unavailable for locale '{language}'.")
+
     url = Foundation.NSURL.fileURLWithPath_(str(wav_path))
     req = Speech.SFSpeechURLRecognitionRequest.alloc().initWithURL_(url)
     try:
-        if recognizer.supportsOnDeviceRecognition():
+        if supports_local:
             req.setRequiresOnDeviceRecognition_(True)
     except Exception:
         pass
@@ -133,6 +182,9 @@ class VoiceDictationController:
         self._audio_level: float = 0.0
         self._last_transcript: str = ""
         self._last_error: Optional[str] = None
+        self._on_device_info: Dict[str, Any] = {}
+        self._notice_code: str = "on_device_ok"
+        self._active_backend: str = "apple_speech"
         self.update_config(cfg)
 
     def update_config(self, cfg: Optional[Dict[str, Any]]) -> None:
@@ -141,6 +193,23 @@ class VoiceDictationController:
         self.engine: str = str(c.get("engine", "auto")).lower()
         self.language: str = str(c.get("language", "vi-VN"))
         self.max_duration_s: float = float(c.get("max_duration_s", 30.0))
+        self._refresh_on_device_status()
+
+    def _refresh_on_device_status(self) -> None:
+        info = check_apple_speech_on_device(self.language)
+        self._on_device_info = info
+        if self.engine == "mlx_whisper":
+            self._active_backend = "mlx_whisper"
+            self._notice_code = "fallback_mlx_whisper" if info.get("mlx_whisper_available") else "on_device_unavailable"
+        elif info.get("supports_on_device"):
+            self._active_backend = "apple_speech"
+            self._notice_code = "on_device_ok"
+        elif info.get("mlx_whisper_available"):
+            self._active_backend = "mlx_whisper"
+            self._notice_code = "fallback_mlx_whisper"
+        else:
+            self._active_backend = "none"
+            self._notice_code = "on_device_unavailable"
 
     @property
     def is_recording(self) -> bool:
@@ -158,6 +227,10 @@ class VoiceDictationController:
             "audio_level": round(self._audio_level, 3),
             "language": self.language,
             "engine": self.engine,
+            "active_backend": self._active_backend,
+            "on_device_supported": bool(self._on_device_info.get("supports_on_device", False)),
+            "mlx_whisper_available": bool(self._on_device_info.get("mlx_whisper_available", False)),
+            "notice_code": self._notice_code,
             "last_transcript": self._last_transcript,
             "last_error": self._last_error,
         }
@@ -248,17 +321,26 @@ class VoiceDictationController:
             text = ""
             if self.engine == "mlx_whisper":
                 text = _transcribe_mlx_whisper(tmp_path, self.language)
+                self._active_backend = "mlx_whisper"
+                self._notice_code = "fallback_mlx_whisper"
             elif self.engine == "apple_speech":
-                text = _transcribe_apple_speech(tmp_path, self.language)
+                text = _transcribe_apple_speech(tmp_path, self.language, require_on_device=True)
+                self._active_backend = "apple_speech"
+                self._notice_code = "on_device_ok"
             else:
-                # auto: Apple Speech on-device first -> mlx_whisper fallback
+                # auto (strictly 100% local): Apple Speech on-device first -> local mlx_whisper fallback
                 try:
-                    text = _transcribe_apple_speech(tmp_path, self.language)
+                    text = _transcribe_apple_speech(tmp_path, self.language, require_on_device=True)
+                    self._active_backend = "apple_speech"
+                    self._notice_code = "on_device_ok"
                 except Exception as exc_sp:
-                    logger.debug(f"[DICTATION] Apple Speech fallback ({exc_sp}); trying mlx_whisper...")
+                    logger.debug(f"[DICTATION] Apple Speech on-device unavailable ({exc_sp}); trying mlx_whisper...")
                     try:
                         text = _transcribe_mlx_whisper(tmp_path, self.language)
+                        self._active_backend = "mlx_whisper"
+                        self._notice_code = "fallback_mlx_whisper"
                     except Exception:
+                        self._notice_code = "on_device_unavailable"
                         raise exc_sp
 
             if text:

@@ -314,6 +314,118 @@ def get_frontmost_app_bundle_id() -> Optional[str]:
     return None
 
 
+_ELECTRON_CHROMIUM_BUNDLES = frozenset(
+    {
+        "com.microsoft.vscode",
+        "com.microsoft.vscodeinsiders",
+        "com.todesktop.230313mzl4w4u92",  # Cursor
+        "com.google.chrome",
+        "com.google.chrome.canary",
+        "org.chromium.chromium",
+        "com.microsoft.edgemac",
+        "com.brave.browser",
+        "company.thebrowser.browser",  # Arc
+        "com.tinyspeck.slackmacgap",
+        "com.hnc.discord",
+        "md.obsidian",
+        "notion.id",
+        "com.figma.desktop",
+        "com.linear",
+        "com.spotify.client",
+    }
+)
+
+
+def clipboard_restore_delay_s(frontmost_bundle_id: Optional[str]) -> float:
+    """Use a 0.35s clipboard restore delay for Electron/Chromium apps, 0.15s for native apps."""
+    if not frontmost_bundle_id:
+        return 0.15
+    bid = frontmost_bundle_id.strip().lower()
+    if bid in _ELECTRON_CHROMIUM_BUNDLES or "electron" in bid or "chromium" in bid or "chrome" in bid:
+        return 0.35
+    return 0.15
+
+
+def snapshot_pasteboard(pb: Any) -> List[Dict[str, bytes]]:
+    """
+    Snapshot EVERY item and EVERY data type on an `NSPasteboard` (or compatible test fake)
+    so images, PDFs, RTF, file URLs, and binary payloads survive UTF-8 text insertion.
+    """
+    items_out: List[Dict[str, bytes]] = []
+    raw_items = None
+    if hasattr(pb, "pasteboardItems"):
+        try:
+            raw_items = pb.pasteboardItems()
+        except Exception:
+            raw_items = None
+
+    if raw_items:
+        for item in list(raw_items):
+            item_map: Dict[str, bytes] = {}
+            types = list(item.types() or []) if hasattr(item, "types") else []
+            for ptype in types:
+                try:
+                    data = item.dataForType_(ptype)
+                    if data is not None:
+                        item_map[str(ptype)] = bytes(data)
+                except Exception:
+                    continue
+            if item_map:
+                items_out.append(item_map)
+        if items_out:
+            return items_out
+
+    # Fallback: single-item read across all pasteboard types
+    fallback_map: Dict[str, bytes] = {}
+    types = list(pb.types() or []) if hasattr(pb, "types") else []
+    for ptype in types:
+        try:
+            data = pb.dataForType_(ptype)
+            if data is not None:
+                fallback_map[str(ptype)] = bytes(data)
+        except Exception:
+            continue
+    if fallback_map:
+        items_out.append(fallback_map)
+    return items_out
+
+
+def restore_pasteboard(pb: Any, snapshot: List[Dict[str, bytes]]) -> None:
+    """Restore a multi-item, multi-type snapshot back onto `NSPasteboard` (or compatible test fake)."""
+    pb.clearContents()
+    if not snapshot:
+        return
+    if hasattr(pb, "restore_snapshot_items"):
+        pb.restore_snapshot_items(snapshot)
+        return
+    try:
+        import AppKit
+        import Foundation
+
+        ns_items = []
+        for item_map in snapshot:
+            ns_item = AppKit.NSPasteboardItem.alloc().init()
+            added = False
+            for ptype, raw_bytes in item_map.items():
+                ns_data = Foundation.NSData.dataWithBytes_length_(raw_bytes, len(raw_bytes))
+                if ns_item.setData_forType_(ns_data, ptype):
+                    added = True
+            if added:
+                ns_items.append(ns_item)
+        if ns_items:
+            pb.writeObjects_(ns_items)
+            return
+    except Exception:
+        pass
+
+    # Generic fallback for simple pasteboards / test doubles supporting `setData_forType_`
+    for ptype, raw_bytes in snapshot[0].items():
+        try:
+            pb.setData_forType_(raw_bytes, ptype)
+        except Exception:
+            continue
+
+
 def _visible_frame_quartz_for_point(px: float, py: float) -> Tuple[float, float, float, float]:
     """Find the active screen visible frame in Quartz top-left coordinates for point `(px, py)`."""
     return ScreenGeometry().target_display_for((px, py)).visible_tuple()
@@ -779,33 +891,57 @@ class MacOSInputController:
     def volume_mute(self) -> bool:
         return self.post_media_key(NX_KEYTYPE_MUTE)
 
-    def paste_text_utf8(self, text: str) -> bool:
-        """Insert arbitrary UTF-8 text (full Vietnamese diacritics safe) preserving clipboard."""
+    def paste_text_utf8(
+        self,
+        text: str,
+        *,
+        pasteboard: Any = None,
+        restore_delay_s: Optional[float] = None,
+        sync_restore: bool = False,
+    ) -> bool:
+        """
+        Insert arbitrary UTF-8 text (full Vietnamese diacritics safe) while snapshotting and
+        restoring ALL pasteboard items and non-string data types (images, RTF, file URLs, etc.).
+        """
         if not text:
             return False
-        if self.dry_run:
+        if self.dry_run and pasteboard is None:
             return True
         try:
-            import AppKit
+            if pasteboard is None:
+                import AppKit
 
-            pb = AppKit.NSPasteboard.generalPasteboard()
-            prev = pb.stringForType_(AppKit.NSPasteboardTypeString)
+                pb = AppKit.NSPasteboard.generalPasteboard()
+                str_type = AppKit.NSPasteboardTypeString
+            else:
+                pb = pasteboard
+                str_type = "public.utf8-plain-text"
+
+            saved_snapshot = snapshot_pasteboard(pb)
             pb.clearContents()
-            pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
-            ok = self.edit_paste()
+            pb.setString_forType_(text, str_type)
+            ok = True if self.dry_run else self.edit_paste()
 
-            def _restore(saved: Optional[str]) -> None:
-                time.sleep(0.15)
+            delay = (
+                float(restore_delay_s)
+                if restore_delay_s is not None
+                else clipboard_restore_delay_s(get_frontmost_app_bundle_id())
+            )
+
+            def _restore(snap_items: List[Dict[str, bytes]]) -> None:
+                if delay > 0.0:
+                    time.sleep(delay)
                 try:
-                    pb2 = AppKit.NSPasteboard.generalPasteboard()
-                    if pb2.stringForType_(AppKit.NSPasteboardTypeString) == text:
-                        pb2.clearContents()
-                        if saved is not None:
-                            pb2.setString_forType_(saved, AppKit.NSPasteboardTypeString)
+                    pb2 = pb if pasteboard is not None else __import__("AppKit").NSPasteboard.generalPasteboard()
+                    if pb2.stringForType_(str_type) == text:
+                        restore_pasteboard(pb2, snap_items)
                 except Exception:
                     pass
 
-            threading.Thread(target=_restore, args=(prev,), daemon=True).start()
+            if sync_restore:
+                _restore(saved_snapshot)
+            else:
+                threading.Thread(target=_restore, args=(saved_snapshot,), daemon=True).start()
             return ok
         except Exception as exc:
             logger.warning(f"[INPUT] paste_text_utf8 failed: {exc}")

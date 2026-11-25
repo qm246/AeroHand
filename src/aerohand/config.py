@@ -22,6 +22,9 @@ SETTING_KEY_ALIASES: Dict[str, str] = {
     "scroll.inertia": "scroll.enable_inertia",
     "language": "ui.language",
     "dictation.lang": "dictation.language",
+    "ui.hotkeys.toggle_tracking": "hotkeys.toggle_pause",
+    "ui.hotkeys.recenter": "hotkeys.recenter",
+    "ui.hotkeys.toggle_hud": "hotkeys.toggle_hud",
 }
 
 GESTURE_PRESETS: Dict[str, Dict[str, Any]] = {

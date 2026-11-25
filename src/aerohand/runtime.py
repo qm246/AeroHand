@@ -203,6 +203,7 @@ class AeroHandRuntime:
         )
         self.vitals_mon = SystemVitalsMonitor()
         self.collector: PinchDataCollector = PinchDataCollector()
+        self._cached_saved_sessions: Optional[List[str]] = None
 
         self._api_server: Optional[LocalControlAPIServer] = None
         self._stop_event = threading.Event()
@@ -405,8 +406,14 @@ class AeroHandRuntime:
     # Data Collector Studio Controls (callable from WKWebView UI)
     # ------------------------------------------------------------------
 
+    def _refresh_saved_sessions_cache(self) -> List[str]:
+        sessions = sorted(self.collect_dir.glob("*.json")) if self.collect_dir.is_dir() else []
+        self._cached_saved_sessions = [fp.name for fp in sessions[-10:]]
+        return self._cached_saved_sessions
+
     def collector_toggle_recording(self) -> Dict[str, Any]:
         self.collector.toggle_recording()
+        self._refresh_saved_sessions_cache()
         return self.collector_status()
 
     def collector_set_pose(self, pose_name: str) -> Dict[str, Any]:
@@ -419,24 +426,27 @@ class AeroHandRuntime:
     def collector_save(self) -> Dict[str, Any]:
         out = self.collector.save(self.collect_dir)
         self._last_action_text = f"Saved dataset: {out.name}"
+        self._refresh_saved_sessions_cache()
         st = self.collector_status()
         st["saved_path"] = str(out)
         return st
 
     def collector_clear(self) -> Dict[str, Any]:
         self.collector.clear()
+        self._refresh_saved_sessions_cache()
         return self.collector_status()
 
     def collector_status(self) -> Dict[str, Any]:
         counts = self.collector.counts()
-        sessions = sorted(self.collect_dir.glob("*.json")) if self.collect_dir.is_dir() else []
+        if self._cached_saved_sessions is None:
+            self._refresh_saved_sessions_cache()
         return {
             "recording": self.collector.is_recording,
             "current_pose": self.collector.current_pose.value,
             "counts": counts,
             "total": sum(counts.values()),
             "sessions_dir": str(self.collect_dir),
-            "saved_sessions": [fp.name for fp in sessions[-10:]],
+            "saved_sessions": list(self._cached_saved_sessions or []),
         }
 
     def reset_practice(self) -> Dict[str, bool]:

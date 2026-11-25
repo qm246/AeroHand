@@ -1262,3 +1262,56 @@ def test_adaptive_lerp_speed_monotonic():
     # 6th frame drops drag cleanly
     evs6 = psm.process(lo, 450.0, cursor_speed_px_s=500.0)
     assert [e.type for e in evs6] == ["hold_end"]
+
+
+def test_override_save_is_debounced():
+    import time
+
+    from aerohand.ui.app import DebouncedConfigPersister, detect_hotkey_conflicts, parse_hotkey_spec
+
+    writes: List[float] = []
+    persister = DebouncedConfigPersister(
+        lambda cfg: writes.append(float(cfg["cursor"]["pointer_sensitivity"])),
+        delay_s=0.12,
+    )
+    for i in range(20):
+        persister.schedule({"cursor": {"pointer_sensitivity": 1.0 + i * 0.1}})
+        time.sleep(0.005)
+    time.sleep(0.22)
+    assert len(writes) == 1
+    assert writes[0] == pytest.approx(2.9)
+
+    # Also verify hotkey parsing & conflict detection
+    assert parse_hotkey_spec("Cmd+Shift+A") == (frozenset({"cmd", "shift"}), "a")
+    assert detect_hotkey_conflicts(
+        {"toggle_pause": "cmd+shift+a", "recenter": "cmd+shift+a", "toggle_hud": "cmd+shift+h"}
+    ) == ["toggle_pause", "recenter"]
+
+
+def test_ui_tick_payload_excludes_static_i18n():
+    from aerohand.i18n import get_lang_pack
+    from aerohand.ui.app import OverlayPayloadBuilder
+
+    builder = OverlayPayloadBuilder()
+    ui_cfg = {"language": "vi", "show_click_feedback": True, "show_palm_wheel_overlay": True}
+    pack_vi = get_lang_pack("vi")
+
+    # First tick sends i18n + full ui
+    p1 = builder.build({"click_event_seq": 0}, ui_cfg, "vi", pack_vi)
+    assert "i18n" in p1 and "ui" in p1
+
+    # Second tick with unchanged language & ui excludes static i18n and ui
+    p2 = builder.build({"click_event_seq": 1}, ui_cfg, "vi", pack_vi)
+    assert "i18n" not in p2
+    assert "ui" not in p2
+    assert "ui_delta" not in p2
+
+    # Changing a single ui key sends only that key in ui_delta (still no static i18n)
+    ui_cfg2 = dict(ui_cfg, show_click_feedback=False)
+    p3 = builder.build({"click_event_seq": 1}, ui_cfg2, "vi", pack_vi)
+    assert "i18n" not in p3
+    assert p3.get("ui_delta") == {"show_click_feedback": False}
+
+    # Changing language re-sends new i18n pack
+    p4 = builder.build({"click_event_seq": 1}, dict(ui_cfg2, language="en"), "en", get_lang_pack("en"))
+    assert "i18n" in p4 and p4["i18n"]["tabs"]["dashboard"] == "Dashboard"

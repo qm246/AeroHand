@@ -518,9 +518,24 @@
             <label class="switch"><input type="checkbox" id="cfg-profiles-en" onchange="setKey('profiles.enabled', this.checked)"><span class="track"></span></label>
           </div>
           <div class="row">
-            <div class="row-label"><strong>Phím tắt toàn cục</strong><span>Cmd+Shift+A (Tạm dừng) • Cmd+Shift+R (Căn giữa) • Cmd+Shift+H (Camera HUD)</span></div>
-            <span class="pill-tag">Đang bật</span>
+            <div class="row-label"><strong id="lbl-hk-en">Phím tắt toàn cục</strong><span id="sub-hk-en">Tùy chỉnh tổ hợp phím (ví dụ: cmd+shift+a)</span></div>
+            <div style="display:flex;align-items:center;gap:10px">
+              <span class="pill-tag" id="hk-mode-pill">Đang bật</span>
+              <label class="switch"><input type="checkbox" id="cfg-hk-en" onchange="setKey('hotkeys.enabled', this.checked)"><span class="track"></span></label>
+            </div>
           </div>
+          <div class="grid-3" style="margin-top:6px">
+            <div class="row"><div class="row-label"><strong id="lbl-hk-pause">Tạm dừng / Tiếp tục</strong></div>
+              <input type="text" id="cfg-hk-pause" style="width:130px" onchange="setKey('hotkeys.toggle_pause', this.value.trim().toLowerCase())" />
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-hk-recenter">Căn giữa con trỏ</strong></div>
+              <input type="text" id="cfg-hk-recenter" style="width:130px" onchange="setKey('hotkeys.recenter', this.value.trim().toLowerCase())" />
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-hk-hud">Bật/Tắt Camera HUD</strong></div>
+              <input type="text" id="cfg-hk-hud" style="width:130px" onchange="setKey('hotkeys.toggle_hud', this.value.trim().toLowerCase())" />
+            </div>
+          </div>
+          <div id="hk-conflict-msg" style="font-size:11.5px;color:var(--amber);margin-top:6px;display:none"></div>
         </div>
 
         <div class="card">
@@ -911,11 +926,41 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       makeSliderRow("au-vol", isVi ? "Âm lượng" : "Click Volume", "", "audio.volume", 0.0, 1.0, 0.05, getPath(c, "audio.volume", 0.50)),
     ].join("");
 
-    // Dictation & System
+    // Dictation & System + Configurable Hotkeys
     document.getElementById("cfg-dict-lang").value = getPath(c, "dictation.language", "vi-VN");
     document.getElementById("cfg-dict-eng").value = getPath(c, "dictation.engine", "auto");
     document.getElementById("cfg-launch-login").checked = !!STATE.launch_at_login;
     document.getElementById("cfg-profiles-en").checked = !!getPath(c, "profiles.enabled", true);
+    document.getElementById("cfg-hk-en").checked = !!getPath(c, "hotkeys.enabled", true);
+    document.getElementById("cfg-hk-pause").value = getPath(c, "hotkeys.toggle_pause", "cmd+shift+a");
+    document.getElementById("cfg-hk-recenter").value = getPath(c, "hotkeys.recenter", "cmd+shift+r");
+    document.getElementById("cfg-hk-hud").value = getPath(c, "hotkeys.toggle_hud", "cmd+shift+h");
+    setTxt("lbl-hk-en", "Phím tắt điều khiển", "Control Hotkeys");
+    setTxt("sub-hk-en", "Tùy chỉnh tổ hợp phím (ví dụ: cmd+shift+a)", "Customize combos (e.g. cmd+shift+a)");
+    setTxt("lbl-hk-pause", "Tạm dừng", "Toggle Pause");
+    setTxt("lbl-hk-recenter", "Căn giữa", "Recenter");
+    setTxt("lbl-hk-hud", "Camera HUD", "Camera HUD");
+    const hkPill = document.getElementById("hk-mode-pill");
+    if (hkPill) {
+      hkPill.textContent = STATE.hotkeys_local_only
+        ? (isVi ? "Chỉ trong cửa sổ (0 quyền)" : "Local-Only (Zero-Perm)")
+        : (isVi ? "Toàn cục" : "Global");
+    }
+    const hkWarn = document.getElementById("hk-conflict-msg");
+    if (hkWarn) {
+      const conflicts = STATE.hotkey_conflicts || [];
+      if (conflicts.length) {
+        hkWarn.style.display = "block";
+        hkWarn.textContent = (isVi ? "⚠ Trùng phím tắt: " : "⚠ Hotkey conflict: ") + conflicts.join(", ");
+      } else if (STATE.hotkeys_local_only) {
+        hkWarn.style.display = "block";
+        hkWarn.textContent = isVi
+          ? "ℹ Phím tắt chạy cục bộ khi mở cửa sổ AeroHand (không yêu cầu quyền Input Monitoring)."
+          : "ℹ Hotkeys run in local-only mode when AeroHand is focused (no Input Monitoring permission required).";
+      } else {
+        hkWarn.style.display = "none";
+      }
+    }
 
     // ML Studio
     document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");

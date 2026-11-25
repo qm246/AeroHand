@@ -157,6 +157,8 @@
 
 <script>
   let lastClickSeq = 0;
+  let CACHED_UI = {};
+  let CACHED_I18N = {};
 
   const FINGER_NAMES_VI = { thumb: "Ngón cái", index: "Ngón trỏ", middle: "Ngón giữa", ring: "Áp út", pinky: "Ngón út" };
   const FINGER_NAMES_EN = { thumb: "Thumb", index: "Index", middle: "Middle", ring: "Ring", pinky: "Pinky" };
@@ -235,7 +237,12 @@
   }
 
   window.updateOverlay = function(payload) {
-    const { snap, ui, i18n } = payload;
+    const snap = payload.snap || {};
+    if (payload.i18n) CACHED_I18N = payload.i18n;
+    if (payload.ui) CACHED_UI = payload.ui;
+    if (payload.ui_delta) CACHED_UI = Object.assign({}, CACHED_UI, payload.ui_delta);
+    const ui = CACHED_UI;
+    const i18n = CACHED_I18N;
     const lang = (ui && ui.language) || "vi";
 
     // 1. Click pulse ripple

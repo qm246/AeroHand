@@ -14,8 +14,10 @@ import os
 import queue
 import subprocess
 import sys
+import threading
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import AppKit
 import cv2
@@ -44,9 +46,180 @@ from aerohand.runtime import AeroHandRuntime, RuntimeSnapshot
 
 logger = logging.getLogger("aerohand.app")
 
-_LOCK_PATH = "/tmp/aerohand_app.lock"
-_SHOW_TRIGGER_PATH = "/tmp/aerohand_show_window"
+
+def _app_support_dir() -> Path:
+    d = Path.home() / "Library" / "Application Support" / "AeroHand"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _app_logs_dir() -> Path:
+    d = Path.home() / "Library" / "Logs" / "AeroHand"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _lock_path() -> Path:
+    return _app_support_dir() / "aerohand.lock"
+
+
+def _show_trigger_path() -> Path:
+    return _app_support_dir() / "show_window.trigger"
+
+
+def _log_path() -> Path:
+    return _app_logs_dir() / "aerohand.log"
+
+
 _LOCK_FD = None
+
+
+class DebouncedConfigPersister:
+    """Coalesces rapid slider updates into a single trailing disk write (default 500 ms)."""
+
+    def __init__(self, save_fn: Callable[[Dict[str, Any]], Any], delay_s: float = 0.5) -> None:
+        self._save_fn = save_fn
+        self._delay_s = max(0.01, float(delay_s))
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._pending_cfg: Optional[Dict[str, Any]] = None
+
+    def schedule(self, cfg: Dict[str, Any]) -> None:
+        snap = deepcopy(cfg)
+        with self._lock:
+            self._pending_cfg = snap
+            if self._timer is not None:
+                self._timer.cancel()
+            t = threading.Timer(self._delay_s, self._run)
+            t.daemon = True
+            self._timer = t
+            t.start()
+
+    def _run(self) -> None:
+        with self._lock:
+            cfg = self._pending_cfg
+            self._pending_cfg = None
+            self._timer = None
+        if cfg is not None:
+            try:
+                self._save_fn(cfg)
+            except Exception as exc:
+                logger.debug(f"[UI] Debounced override save failed: {exc}")
+
+    def flush(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+            cfg = self._pending_cfg
+            self._pending_cfg = None
+        if cfg is not None:
+            try:
+                self._save_fn(cfg)
+            except Exception as exc:
+                logger.debug(f"[UI] Flush override save failed: {exc}")
+
+
+_MOD_NAME_MAP = {
+    "cmd": "cmd",
+    "command": "cmd",
+    "meta": "cmd",
+    "shift": "shift",
+    "ctrl": "ctrl",
+    "control": "ctrl",
+    "alt": "opt",
+    "opt": "opt",
+    "option": "opt",
+}
+
+
+def parse_hotkey_spec(spec: str) -> Optional[Tuple[frozenset[str], str]]:
+    """Parse `'cmd+shift+a'` into `(frozenset({'cmd', 'shift'}), 'a')`."""
+    raw = str(spec or "").strip().lower()
+    if not raw:
+        return None
+    parts = [p.strip() for p in raw.split("+") if p.strip()]
+    if len(parts) < 2:
+        return None
+    mods = set()
+    key = ""
+    for p in parts:
+        mapped = _MOD_NAME_MAP.get(p)
+        if mapped is not None:
+            mods.add(mapped)
+        elif not key and len(p) == 1 and p.isalnum():
+            key = p
+        else:
+            return None
+    if not mods or not key:
+        return None
+    return frozenset(mods), key
+
+
+def detect_hotkey_conflicts(hk_cfg: Dict[str, Any]) -> List[str]:
+    """Return list of action names that collide on the exact same normalized hotkey."""
+    seen: Dict[Tuple[frozenset[str], str], str] = {}
+    conflicts: List[str] = []
+    for action in ("toggle_pause", "recenter", "toggle_hud"):
+        parsed = parse_hotkey_spec(str(hk_cfg.get(action, "")))
+        if parsed is None:
+            continue
+        if parsed in seen:
+            if seen[parsed] not in conflicts:
+                conflicts.append(seen[parsed])
+            conflicts.append(action)
+        else:
+            seen[parsed] = action
+    return conflicts
+
+
+class OverlayPayloadBuilder:
+    """
+    Incremental overlay payload builder:
+    - Sends static `i18n` pack ONLY on initial sync or when language changes.
+    - Sends ONLY changed `ui` keys per tick (empty dict omitted) to minimize JS bridge JSON overhead.
+    """
+
+    def __init__(self) -> None:
+        self._last_lang: Optional[str] = None
+        self._last_ui: Dict[str, Any] = {}
+
+    def reset(self) -> None:
+        self._last_lang = None
+        self._last_ui = {}
+
+    def build(
+        self,
+        snap_payload: Dict[str, Any],
+        ui_cfg: Dict[str, Any],
+        lang: str,
+        i18n_pack: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        payload: Dict[str, Any] = {"snap": snap_payload}
+        if lang != self._last_lang:
+            payload["i18n"] = i18n_pack
+            payload["ui"] = deepcopy(ui_cfg)
+            self._last_lang = lang
+            self._last_ui = deepcopy(ui_cfg)
+            return payload
+
+        ui_delta: Dict[str, Any] = {}
+        for k, v in ui_cfg.items():
+            if self._last_ui.get(k) != v:
+                ui_delta[k] = deepcopy(v)
+        if ui_delta:
+            payload["ui_delta"] = ui_delta
+            self._last_ui = deepcopy(ui_cfg)
+        return payload
+
 
 _HUD_SIZES = {
     "small": (220, 154),
@@ -57,16 +230,30 @@ _HUD_SIZES = {
 
 def _acquire_single_instance() -> bool:
     global _LOCK_FD
+    lock_fp = _lock_path()
     try:
-        _LOCK_FD = open(_LOCK_PATH, "w")
+        fd = os.open(str(lock_fp), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            os.chmod(lock_fp, 0o600)
+        except OSError:
+            pass
+        _LOCK_FD = os.fdopen(fd, "w+", encoding="utf-8")
         fcntl.flock(_LOCK_FD, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        _LOCK_FD.seek(0)
+        _LOCK_FD.truncate()
         _LOCK_FD.write(str(os.getpid()))
         _LOCK_FD.flush()
         atexit.register(_release_lock)
         return True
     except OSError:
+        trig = _show_trigger_path()
         try:
-            Path(_SHOW_TRIGGER_PATH).write_text("show", encoding="utf-8")
+            tfd = os.open(str(trig), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.write(tfd, b"show")
+            finally:
+                os.close(tfd)
+            os.chmod(trig, 0o600)
         except OSError:
             pass
         return False
@@ -74,13 +261,14 @@ def _acquire_single_instance() -> bool:
 
 def _release_lock() -> None:
     global _LOCK_FD
+    lock_fp = _lock_path()
     try:
         if _LOCK_FD is not None:
             fcntl.flock(_LOCK_FD, fcntl.LOCK_UN)
             _LOCK_FD.close()
             _LOCK_FD = None
-        if os.path.exists(_LOCK_PATH):
-            os.unlink(_LOCK_PATH)
+        if lock_fp.exists():
+            lock_fp.unlink(missing_ok=True)
     except OSError:
         pass
 
@@ -217,7 +405,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self._tick_count: int = 0
         self._global_hotkey_mon = None
         self._local_hotkey_mon = None
+        self._hotkeys_local_only: bool = False
         self._hud_size_px = (300, 210)
+        self._persister = DebouncedConfigPersister(save_user_overrides, delay_s=0.5)
+        self._last_click_dispatched_seq: int = 0
         return self
 
     def _enqueue_ui(self, fn: Callable[[], None]) -> None:
@@ -305,30 +496,47 @@ class AeroHandAppDelegate(AppKit.NSObject):
                     AppKit.NSEvent.removeMonitor_(mon)
                 except Exception:
                     pass
+        self._persister.flush()
         if self.runtime is not None:
             self.runtime.stop()
 
     # ------------------------------------------------------------------
-    # Global & Local Hotkeys (`Cmd+Shift+A/R/H`)
+    # Configurable Global & Local Hotkeys (graceful local-only fallback)
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _event_matches_spec(event, spec: str) -> bool:
+        parsed = parse_hotkey_spec(spec)
+        if parsed is None:
+            return False
+        mods_req, key_req = parsed
+        flags = int(event.modifierFlags())
+        active_mods = set()
+        if flags & AppKit.NSEventModifierFlagCommand:
+            active_mods.add("cmd")
+        if flags & AppKit.NSEventModifierFlagShift:
+            active_mods.add("shift")
+        if flags & AppKit.NSEventModifierFlagControl:
+            active_mods.add("ctrl")
+        if flags & AppKit.NSEventModifierFlagOption:
+            active_mods.add("opt")
+        if active_mods != mods_req:
+            return False
+        chars = str(event.charactersIgnoringModifiers() or "").lower()
+        return chars == key_req
 
     def _handle_hotkey_event(self, event) -> bool:
         try:
             hk_cfg = self.config.get("hotkeys") or {}
             if not hk_cfg.get("enabled", True):
                 return False
-            flags = int(event.modifierFlags())
-            need = AppKit.NSEventModifierFlagCommand | AppKit.NSEventModifierFlagShift
-            if (flags & need) != need:
-                return False
-            chars = str(event.charactersIgnoringModifiers() or "").lower()
-            if chars == "a":
+            if self._event_matches_spec(event, str(hk_cfg.get("toggle_pause", "cmd+shift+a"))):
                 self.togglePause_(None)
                 return True
-            if chars == "r":
+            if self._event_matches_spec(event, str(hk_cfg.get("recenter", "cmd+shift+r"))):
                 self.recenterCursor_(None)
                 return True
-            if chars == "h":
+            if self._event_matches_spec(event, str(hk_cfg.get("toggle_hud", "cmd+shift+h"))):
                 self.toggleCameraHud_(None)
                 return True
         except Exception:
@@ -336,17 +544,24 @@ class AeroHandAppDelegate(AppKit.NSObject):
         return False
 
     def _register_hotkeys(self) -> None:
+        self._hotkeys_local_only = False
         try:
             self._global_hotkey_mon = AppKit.NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
                 AppKit.NSEventMaskKeyDown,
                 lambda ev: self._handle_hotkey_event(ev),
             )
+            if self._global_hotkey_mon is None:
+                self._hotkeys_local_only = True
+        except Exception as exc:
+            self._hotkeys_local_only = True
+            logger.debug(f"[HOTKEYS] Global monitor unavailable (falling back to local-only): {exc}")
+        try:
             self._local_hotkey_mon = AppKit.NSEvent.addLocalMonitorForEventsMatchingMask_handler_(
                 AppKit.NSEventMaskKeyDown,
                 lambda ev: (None if self._handle_hotkey_event(ev) else ev),
             )
         except Exception as exc:
-            logger.debug(f"[HOTKEYS] Unable to register monitors: {exc}")
+            logger.debug(f"[HOTKEYS] Unable to register local monitor: {exc}")
 
     # ------------------------------------------------------------------
     # Localized Menu Bar (`NSStatusBar`)
@@ -510,6 +725,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                         "webview": wv,
                         "quartz_rect": q_rect,
                         "is_primary": is_primary or idx == 0,
+                        "payload_builder": OverlayPayloadBuilder(),
                     }
                 )
 
@@ -624,6 +840,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
             "i18n": get_lang_pack(lang),
             "cameras": self.runtime.list_available_cameras() if self.runtime else [],
             "launch_at_login": is_launch_at_login_enabled(),
+            "hotkeys_local_only": self._hotkeys_local_only,
+            "hotkey_conflicts": detect_hotkey_conflicts(self.config.get("hotkeys") or {}),
         }
         js = f"window.hydrateState && window.hydrateState({json.dumps(payload, ensure_ascii=False)});"
         self.control_webview.evaluateJavaScript_completionHandler_(js, None)
@@ -637,10 +855,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         if self.runtime is not None:
             self.runtime.apply_live_settings(self.config)
         self._apply_camera_hud_layout()
-        try:
-            save_user_overrides(self.config)
-        except Exception as exc:
-            logger.debug(f"[UI] Could not persist overrides: {exc}")
+        self._persister.schedule(self.config)
         if rehydrate:
             self._hydrate_control_center()
 
@@ -654,7 +869,11 @@ class AeroHandAppDelegate(AppKit.NSObject):
             val = msg.get("value")
             if key:
                 set_nested_key(self.config, key, val)
-                need_rehydrate = key in ("ui.language", "hand.gesture_preset") or key.startswith("palm_wheel.bindings.")
+                need_rehydrate = (
+                    key in ("ui.language", "hand.gesture_preset")
+                    or key.startswith("palm_wheel.bindings.")
+                    or key.startswith("hotkeys.")
+                )
                 self._persist_and_apply(rehydrate=need_rehydrate)
         elif act == "set_keys":
             updates = msg.get("updates") or {}
@@ -714,6 +933,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
     # ------------------------------------------------------------------
 
     def onUiTick_(self, _timer) -> None:
+        with objc.autorelease_pool():
+            self._on_ui_tick_inner()
+
+    def _on_ui_tick_inner(self) -> None:
         self._tick_count += 1
 
         while not self._ui_queue.empty():
@@ -723,9 +946,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
             except Exception as exc:
                 logger.debug(f"[UI] Queued callback error: {exc}")
 
-        if os.path.exists(_SHOW_TRIGGER_PATH):
+        trig_fp = _show_trigger_path()
+        if trig_fp.exists():
             try:
-                os.unlink(_SHOW_TRIGGER_PATH)
+                trig_fp.unlink(missing_ok=True)
             except OSError:
                 pass
             self.showControlCenter_(None)
@@ -733,38 +957,53 @@ class AeroHandAppDelegate(AppKit.NSObject):
         if self.runtime is None:
             return
         snap: RuntimeSnapshot = self.runtime.get_snapshot()
+        window_visible = bool(self.window is not None and self.window.isVisible())
+        has_urgent_overlay = (
+            snap.click_event_seq != self._last_click_dispatched_seq
+            or bool(snap.palm_wheels)
+            or (snap.window_tile_preview is not None)
+            or bool(snap.dictation.get("recording"))
+            or bool(snap.dictation.get("transcribing"))
+        )
+        # Drop tick rate from 20 Hz to 5 Hz when Control Center is hidden and overlays are idle
+        if (not window_visible) and (not has_urgent_overlay) and ((self._tick_count % 4) != 0):
+            return
+
         lang = str((self.config.get("ui") or {}).get("language", "vi"))
         pack = get_lang_pack(lang)
         mtxt = pack.get("menu") or {}
 
-        # 1. Menu Bar title & localized labels
-        btn = self.status_item.button()
-        if btn is not None:
-            if snap.paused:
-                btn.setTitle_("⏸ AeroHand")
-            elif snap.dictation.get("recording"):
-                btn.setTitle_("🎙 AeroHand")
-            elif snap.guard_reason:
-                btn.setTitle_("⌨ AeroHand")
-            elif snap.dry_run:
-                btn.setTitle_("◌ AeroHand")
-            else:
-                btn.setTitle_("✦ AeroHand")
+        # 1. Menu Bar title & localized labels (at 5 Hz to minimize AppKit layout churn)
+        if (self._tick_count % 4) == 0 or self._tick_count == 1:
+            btn = self.status_item.button()
+            if btn is not None:
+                if snap.paused:
+                    btn.setTitle_("⏸ AeroHand")
+                elif snap.dictation.get("recording"):
+                    btn.setTitle_("🎙 AeroHand")
+                elif snap.guard_reason:
+                    btn.setTitle_("⌨ AeroHand")
+                elif snap.dry_run:
+                    btn.setTitle_("◌ AeroHand")
+                else:
+                    btn.setTitle_("✦ AeroHand")
 
-        hud_vis = bool(((self.config.get("ui") or {}).get("camera_hud") or {}).get("visible", True))
-        self._menu_items["status"].setTitle_(
-            f"AeroHand v{__version__} • {snap.fps:.0f} FPS ({snap.delegate})"
-        )
-        self._menu_items["toggle_pause"].setTitle_(mtxt.get("resume" if snap.paused else "pause", "Pause"))
-        self._menu_items["toggle_mode"].setTitle_(mtxt.get("to_live" if snap.dry_run else "to_dry", "Mode"))
-        self._menu_items["toggle_cam"].setTitle_(mtxt.get("hide_hud" if hud_vis else "show_hud", "Camera HUD"))
-        self._menu_items["recenter"].setTitle_(mtxt.get("recenter", "Recenter"))
-        self._menu_items["dictation"].setTitle_(mtxt.get("dictation", "Dictation"))
-        self._menu_items["open_cc"].setTitle_(mtxt.get("open_cc", "Control Center"))
-        self._menu_items["open_acc"].setTitle_(mtxt.get("open_acc", "Accessibility"))
-        self._menu_items["quit"].setTitle_(mtxt.get("quit", "Quit"))
+            hud_vis = bool(((self.config.get("ui") or {}).get("camera_hud") or {}).get("visible", True))
+            self._menu_items["status"].setTitle_(
+                f"AeroHand v{__version__} • {snap.fps:.0f} FPS ({snap.delegate})"
+            )
+            self._menu_items["toggle_pause"].setTitle_(mtxt.get("resume" if snap.paused else "pause", "Pause"))
+            self._menu_items["toggle_mode"].setTitle_(mtxt.get("to_live" if snap.dry_run else "to_dry", "Mode"))
+            self._menu_items["toggle_cam"].setTitle_(mtxt.get("hide_hud" if hud_vis else "show_hud", "Camera HUD"))
+            self._menu_items["recenter"].setTitle_(mtxt.get("recenter", "Recenter"))
+            self._menu_items["dictation"].setTitle_(mtxt.get("dictation", "Dictation"))
+            self._menu_items["open_cc"].setTitle_(mtxt.get("open_cc", "Control Center"))
+            self._menu_items["open_acc"].setTitle_(mtxt.get("open_acc", "Accessibility"))
+            self._menu_items["quit"].setTitle_(mtxt.get("quit", "Quit"))
+        else:
+            hud_vis = bool(((self.config.get("ui") or {}).get("camera_hud") or {}).get("visible", True))
 
-        # 2. Floating Camera HUD image (20 Hz) — explicit autorelease pool avoids ObjC bitmap buildup
+        # 2. Floating Camera HUD image — explicit autorelease pool avoids ObjC bitmap buildup
         if hud_vis and snap.frame_bgr is not None and self.camera_image_view is not None:
             pw, ph = self._hud_size_px
             with objc.autorelease_pool():
@@ -772,8 +1011,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 if ns_img is not None:
                     self.camera_image_view.setImage_(ns_img)
 
-        # 3. Transparent Screen Overlays (routed per display in panel-local coordinates)
+        # 3. Transparent Screen Overlays (incremental i18n/ui, routed per display)
         if self._overlay_ready and self._overlay_entries:
+            self._last_click_dispatched_seq = snap.click_event_seq
+            ui_cfg = self.config.get("ui") or {}
             active_idx = 0
             for idx, entry in enumerate(self._overlay_entries):
                 if self._rect_contains(entry["quartz_rect"], snap.cursor_x, snap.cursor_y):
@@ -814,19 +1055,17 @@ class AeroHandAppDelegate(AppKit.NSObject):
                         pw_local["cursor_y"] = round(py_w - qy, 1)
                         local_wheels.append(pw_local)
 
-                ov_payload = {
-                    "snap": {
-                        "click_event_seq": snap.click_event_seq if local_click is not None else 0,
-                        "click_event": local_click,
-                        "palm_wheels": local_wheels,
-                        "window_tile_preview": local_tile,
-                        "active_hint": snap.active_hint if is_active_panel else None,
-                        "warning": snap.warning if is_active_panel else None,
-                        "dictation": snap.dictation if is_active_panel else {},
-                    },
-                    "ui": self.config.get("ui") or {},
-                    "i18n": pack,
+                snap_payload = {
+                    "click_event_seq": snap.click_event_seq if local_click is not None else 0,
+                    "click_event": local_click,
+                    "palm_wheels": local_wheels,
+                    "window_tile_preview": local_tile,
+                    "active_hint": snap.active_hint if is_active_panel else None,
+                    "warning": snap.warning if is_active_panel else None,
+                    "dictation": snap.dictation if is_active_panel else {},
                 }
+                builder: OverlayPayloadBuilder = entry["payload_builder"]
+                ov_payload = builder.build(snap_payload, ui_cfg, lang, pack)
                 js_ov = f"window.updateOverlay && window.updateOverlay({json.dumps(ov_payload, ensure_ascii=False)});"
                 entry["webview"].evaluateJavaScript_completionHandler_(js_ov, None)
 
@@ -835,8 +1074,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
             (self._tick_count % 2) == 0
             and self._control_ready
             and self.control_webview is not None
-            and self.window is not None
-            and self.window.isVisible()
+            and window_visible
         ):
             tel = {
                 "running": snap.running,
@@ -914,12 +1152,19 @@ class AeroHandAppDelegate(AppKit.NSObject):
 
 
 def main() -> None:
+    log_fp = _log_path()
+    try:
+        lfd = os.open(str(log_fp), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(lfd)
+        os.chmod(log_fp, 0o600)
+    except OSError:
+        pass
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
         handlers=[
             logging.StreamHandler(sys.stderr),
-            logging.FileHandler("/tmp/aerohand.log", encoding="utf-8"),
+            logging.FileHandler(str(log_fp), encoding="utf-8"),
         ],
         force=True,
     )

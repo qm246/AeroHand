@@ -2715,12 +2715,11 @@ def test_guided_targets_cover_all_classes_and_conditions(tmp_path: Path):
         default_guided_steps,
     )
 
-    assert CORPUS_TOTAL_TARGET == 26000
-    assert COLLECTOR_CLASS_TARGETS["idle"]["total"] == 8000
+    assert CORPUS_TOTAL_TARGET == 21000
+    assert COLLECTOR_CLASS_TARGETS["idle"]["total"] == 3000
     for p in ALL_POSE_NAMES:
         assert p.value in COLLECTOR_CLASS_TARGETS
-        if p != PoseName.IDLE:
-            assert COLLECTOR_CLASS_TARGETS[p.value] == {"total": 3000, "Right": 2000, "Left": 1000}
+        assert COLLECTOR_CLASS_TARGETS[p.value] == {"total": 3000, "Right": 2000, "Left": 1000}
 
     steps = default_guided_steps()
     covered_poses = {s.pose for s in steps}
@@ -3480,3 +3479,125 @@ def test_gates_do_not_block_clean_pinch_fixture():
         moved = [Landmark(p.x + 0.04, p.y - 0.02, p.z) for p in pinched]
         pred_hold = clf.predict(moved, moved, "Right", 133.0)
         assert pred_hold.pose == target_pose
+
+
+
+def test_seal_heldout_manifest_and_counter(tmp_path_factory):
+    import json
+
+    tmp_path = tmp_path_factory.mktemp("seal_manifest")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_heldout_test")
+    replay_mod = _load_replay_eval_module("replay_eval_seal_test")
+
+    src_dir = tmp_path / "raw_sessions"
+    col = PinchDataCollector(session_meta={"subject": "minh", "wrist_angle": "0", "distance": "mid", "lighting": "bright"})
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    for i in range(15):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    src_fp = col.save(src_dir)
+
+    ho_dir = tmp_path / "heldout_aerohand"
+    manifest = seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir)
+    assert manifest["touched"] == 0
+    assert manifest["evaluated_model_hashes"] == []
+    assert len(manifest["files"]) == 1
+    assert len(manifest["files"][0]["sha256"]) == 64
+
+    # Single-touch eval verifies checksums, runs replay, and increments touched -> 1
+    rep = replay_mod.evaluate_sealed_heldout(
+        ho_dir,
+        model_hash="model_v1_abc",
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=100.0,
+    )
+    assert rep["heldout_audit"]["touched"] == 1
+    assert rep["heldout_audit"]["model_hash"] == "model_v1_abc"
+
+    persisted = json.loads((ho_dir / "sealed_manifest.json").read_text(encoding="utf-8"))
+    assert persisted["touched"] == 1
+    assert persisted["evaluated_model_hashes"] == ["model_v1_abc"]
+
+    # Tampering with a sealed file MUST be detected and refused!
+    sealed_fp = ho_dir / manifest["files"][0]["filename"]
+    sealed_fp.write_text(sealed_fp.read_text(encoding="utf-8") + " ", encoding="utf-8")
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        seal_mod.verify_sealed_heldout_manifest(ho_dir)
+
+
+def test_heldout_second_run_refused_for_same_model(tmp_path_factory):
+    tmp_path = tmp_path_factory.mktemp("seal_dup")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_heldout_dup")
+    replay_mod = _load_replay_eval_module("replay_eval_seal_dup")
+
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    for i in range(12):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    src_fp = col.save(tmp_path / "src")
+
+    ho_dir = tmp_path / "heldout_aerohand"
+    seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir)
+
+    # First run succeeds
+    rep1 = replay_mod.evaluate_sealed_heldout(
+        ho_dir, model_hash="same_hash_999", min_exposure_hours_for_claim=0.0
+    )
+    assert rep1["heldout_audit"]["touched"] == 1
+
+    # Second run with the exact same model hash MUST be refused!
+    with pytest.raises(ValueError, match="already evaluated"):
+        replay_mod.evaluate_sealed_heldout(
+            ho_dir, model_hash="same_hash_999", min_exposure_hours_for_claim=0.0
+        )
+
+    # A distinct new model hash is permitted and increments touched -> 2
+    rep2 = replay_mod.evaluate_sealed_heldout(
+        ho_dir, model_hash="new_model_hash_002", min_exposure_hours_for_claim=0.0
+    )
+    assert rep2["heldout_audit"]["touched"] == 2
+
+
+def test_balanced_sampler_caps_scenario_share():
+    mod = _load_train_tcn_module("train_tcn_balance_test")
+    h = _make_open_hand()
+
+    def _make_bundle(sc_name: str, n_idle: int, n_pos: int = 0, subject: str = "minh"):
+        wins = []
+        lbls = []
+        for _ in range(n_idle):
+            wins.append([mod.ParsedSample(0, h, h, "Right", "Right", 0.0)] * 5)
+            lbls.append(0)
+        for _ in range(n_pos):
+            wins.append([mod.ParsedSample(2, h, h, "Right", "Right", 0.0)] * 5)
+            lbls.append(2)
+        return mod.SessionBundle(
+            name=f"{sc_name}.json",
+            group_key=f"{subject}::{sc_name}",
+            windows=wins,
+            labels=np.asarray(lbls, dtype=np.int64),
+            scenario=sc_name,
+            subject=subject,
+        )
+
+    # 1 dominant scenario with 5,000 idle windows + 9 smaller scenarios with 100 idle each (+ 40 positives)
+    bundles = [_make_bundle("dominant_typing", 5000, n_pos=40)] + [
+        _make_bundle(f"scenario_{i}", 100, n_pos=5) for i in range(9)
+    ]
+    balanced, stats = mod.balance_scenario_samples(bundles, max_scenario_share=0.15, seed=42)
+    assert stats["max_share_before"] > 0.80
+    assert stats["max_share_after"] <= 0.15 + 1e-9
+    assert "dominant_typing" in stats["capped_scenarios"]
+
+    # Positive windows MUST be 100% preserved (40 + 9*5 = 85)
+    pos_after = sum(int(np.sum(b.labels != 0)) for b in balanced)
+    assert pos_after == 85
+
+    # Subject-held-out splitter separates non-primary volunteer subjects cleanly
+    b_vol = _make_bundle("vol_session", 50, n_pos=10, subject="volunteer_a")
+    dev_b, ho_b = mod.split_subject_heldout(bundles + [b_vol], primary_subject="minh")
+    assert len(ho_b) == 1 and ho_b[0].subject == "volunteer_a"
+    assert all(b.subject == "minh" for b in dev_b)

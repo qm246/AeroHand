@@ -19,9 +19,10 @@ from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 
 POSE_TO_ID: Dict[PoseName, int] = {pose: i for i, pose in enumerate(ALL_POSE_NAMES)}
 
-# Target frame counts (Section 4.2 of engineering plan)
+# Target new AeroHand frame counts (V050-02: ~31.6k 3D negatives already exist from GestureCtl,
+# so only 3,000 new AeroHand idle frames + 18,000 positive frames = 21,000 new frames are needed)
 COLLECTOR_CLASS_TARGETS: Dict[str, Dict[str, int]] = {
-    PoseName.IDLE.value: {"total": 8000, "Right": 5000, "Left": 3000},
+    PoseName.IDLE.value: {"total": 3000, "Right": 2000, "Left": 1000},
     PoseName.THUMB_INDEX_PINCH.value: {"total": 3000, "Right": 2000, "Left": 1000},
     PoseName.THUMB_MIDDLE_PINCH.value: {"total": 3000, "Right": 2000, "Left": 1000},
     PoseName.THUMB_RING_PINCH.value: {"total": 3000, "Right": 2000, "Left": 1000},
@@ -46,7 +47,7 @@ DISTANCE_BUCKETS: Tuple[str, ...] = ("near", "mid", "far")
 LIGHTING_BUCKETS: Tuple[str, ...] = ("bright", "backlit", "dim")
 HARD_NEGATIVE_MIN_PER_GROUP: int = 500
 MIN_ANGLE_SHARE: float = 0.15
-CORPUS_TOTAL_TARGET: int = sum(v["total"] for v in COLLECTOR_CLASS_TARGETS.values())  # 26000
+CORPUS_TOTAL_TARGET: int = sum(v["total"] for v in COLLECTOR_CLASS_TARGETS.values())  # 21000
 
 
 class QualityGateError(ValueError):

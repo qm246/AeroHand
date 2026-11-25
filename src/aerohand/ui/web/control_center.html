@@ -619,6 +619,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             </div>
           </div>
 
+          <div id="col-consent-notice" style="font-size:11px;color:var(--muted);margin-bottom:8px;padding:6px 10px;border-radius:8px;background:rgba(45,212,191,0.06);border:1px solid rgba(45,212,191,0.16)"></div>
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
             <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
             <button class="btn" id="btn-col-guided" onclick="toggleGuided()">🎬 Quay theo kịch bản hướng dẫn</button>
@@ -633,7 +634,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
           <div id="col-quality-banner" style="font-size:11.5px;color:var(--green);margin-bottom:6px"></div>
           <div id="col-hold-hint" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
           <div id="col-bars"></div>
-          <div style="margin-top:8px;font-size:11px;color:var(--muted)" id="lbl-col-matrix">Ma trận phủ điều kiện (26k mục tiêu)</div>
+          <div style="margin-top:8px;font-size:11px;color:var(--muted)" id="lbl-col-matrix">Ma trận phủ điều kiện (21k mục tiêu mới)</div>
           <div class="code-box" id="col-matrix-box" style="margin-top:4px;max-height:110px;overflow-y:auto">—</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;margin-bottom:4px">
             <span style="font-size:11px;color:var(--muted)" id="lbl-train-cmd">Lệnh huấn luyện ONNX 1D-TCN (invariant348 mặc định):</span>
@@ -1347,6 +1348,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         }
       }
 
+      const consentEl = document.getElementById("col-consent-notice");
+      if (consentEl) consentEl.textContent = colI18n.consent_notice || "";
       const matLbl = document.getElementById("lbl-col-matrix");
       if (matLbl) matLbl.textContent = colI18n.matrix_title || "Condition Matrix";
       const matBox = document.getElementById("col-matrix-box");
@@ -1359,7 +1362,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         const hn = mat.by_hard_negative_group || {};
         const tot = mat.total_frames || 0;
         matBox.textContent =
-          `Total: ${tot} / ${mat.target_total || 26000}\n` +
+          `Total: ${tot} / ${mat.target_total || 21000}\n` +
           `Angles: 0°=${ang["0"] || 0} (${Math.round((sh["0"] || 0)*100)}%) | 30°=${ang["30"] || 0} (${Math.round((sh["30"] || 0)*100)}%) | 45°=${ang["45"] || 0} (${Math.round((sh["45"] || 0)*100)}%) | 60°=${ang["60"] || 0} (${Math.round((sh["60"] || 0)*100)}%)\n` +
           `Dist: near=${dist.near || 0} mid=${dist.mid || 0} far=${dist.far || 0} | Light: bright=${lt.bright || 0} backlit=${lt.backlit || 0} dim=${lt.dim || 0}\n` +
           `Hard-neg (≥500): ` + Object.entries(hn).map(([k, v]) => `${k}:${v}`).join(" ");
@@ -1368,7 +1371,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       const prog = col.corpus_progress || {};
       const cnts = col.counts || {};
       for (const p of POSE_KEYS) {
-        const entry = prog[p] || { total: cnts[p] || 0, Right: 0, Left: 0, target: p === "idle" ? 8000 : 3000 };
+        const entry = prog[p] || { total: cnts[p] || 0, Right: 0, Left: 0, target: 3000 };
         const n = entry.total || 0;
         const tgt = entry.target || 3000;
         const pct = Math.min(100, Math.round((n / tgt) * 100));

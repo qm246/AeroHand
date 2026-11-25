@@ -4,20 +4,30 @@ Tài liệu này quy định quy trình thu thập dữ liệu, huấn luyện C
 
 ---
 
-## 1. Mục tiêu Bộ dữ liệu 26.000 khung hình (Landmarks-Only)
+## 1. Mục tiêu Bộ dữ liệu 21.000 khung hình mới (Landmarks-Only — `V050-02`)
 
-AeroHand **không bao giờ lưu điểm ảnh camera** — chỉ lưu tọa độ 21 khớp tay 2D/3D, tay trái/phải, độ tin cậy và siêu dữ liệu điều kiện.
+AeroHand **không bao giờ lưu điểm ảnh camera** — chỉ lưu tọa độ 21 khớp tay 2D/3D, tay trái/phải, độ tin cậy và siêu dữ liệu điều kiện. Vì kho âm tính 3D đã quy đổi từ GestureCtl (`data/converted/negatives/`) có sẵn ~31.600 khung `idle`, mục tiêu thu thập mới của AeroHand tập trung vào 6 lớp dương tính và 3.000 khung `idle` bổ sung (tổng **21.000 khung mới**):
 
-| Lớp cử chỉ (`PoseName`) | Tổng mục tiêu | Tay phải (`Right`) | Tay trái (`Left`) | Ghi chú |
+| Lớp cử chỉ (`PoseName`) | Tổng mục tiêu mới | Tay phải (`Right`) | Tay trái (`Left`) | Ghi chú |
 |---|---:|---:|---:|---|
-| `idle` | 8.000 | 5.000 | 3.000 | Bao gồm 8 nhóm âm tính khó (≥ 500 mẫu/nhóm) |
+| `idle` | 3.000 | 2.000 | 1.000 | Bổ sung vào ~31,6k khung 3D GestureCtl (cân bằng ≤ 15%/kịch bản) |
 | `thumb_index_pinch` | 3.000 | 2.000 | 1.000 | Giữ đọc giọng nói / Zoom 2 tay |
 | `thumb_middle_pinch` | 3.000 | 2.000 | 1.000 | Click trái / Double click |
 | `thumb_ring_pinch` | 3.000 | 2.000 | 1.000 | Chuột phải (giữ yên) / Cuộn 2D (di chuyển) |
 | `thumb_pinky_pinch` | 3.000 | 2.000 | 1.000 | Chia cửa sổ (`AXUIElement`) |
 | `thumb_pinky_base` | 3.000 | 2.000 | 1.000 | Chuyển Space / Mission Control |
 | `thumb_index_middle_pinch` | 3.000 | 2.000 | 1.000 | Kéo thả 3 ngón (Drag) |
-| **Tổng cộng** | **26.000** | **17.000** | **9.000** | Cắt tự động ±300 ms biên mỗi phân đoạn |
+| **Tổng cộng mới** | **21.000** | **14.000** | **7.000** | Cắt tự động ±300 ms biên mỗi phân đoạn |
+
+### Kỷ luật Held-Out đóng niêm phong & Đa người dùng (`V050-02`)
+- **Niêm phong tập held-out riêng của AeroHand** (`scripts/seal_heldout.py`):
+  ```bash
+  uv run python scripts/seal_heldout.py --src data/sessions/heldout_candidates --out-dir data/heldout_aerohand
+  uv run python scripts/replay_eval.py --heldout data/heldout_aerohand --backend onnx_tcn --model models/aerohand_tcn.onnx --normalizer models/aerohand_tcn_normalizer.json
+  ```
+  `sealed_manifest.json` lưu mã băm SHA-256 từng tệp, bộ đếm `touched` và `evaluated_model_hashes`. `replay_eval.py --heldout` xác minh toàn vẹn SHA-256 và **từ chối chạy lần thứ 2** cho cùng một `model_hash`.
+- **Đánh giá ngoài người dùng (`subject-held-out`)**: Khi quay thêm tình nguyện viên (chỉ lưu 21 khớp cục bộ, có thông báo quyền riêng tư trên ML Studio), truyền `--primary-subject <tên>` hoặc `--heldout-subjects <danh_sách>` khi chạy `scripts/train_tcn.py` để tách hoàn toàn người dùng phụ ra khỏi tập huấn luyện.
+- **Lấy mẫu cân bằng theo kịch bản (`--max-idle-scenario-share 0.15`)**: Tự động giới hạn mỗi kịch bản âm tính chiếm **≤ 15%** tổng số cửa sổ `idle` huấn luyện (giữ nguyên 100% cửa sổ dương tính).
 
 ### Phân bố điều kiện bắt buộc (`condition_id`)
 - **Góc cổ tay (`wrist_angle`)**: `{0, 30, 45, 60}` độ — **mỗi góc ≥ 15% tổng số mẫu**.

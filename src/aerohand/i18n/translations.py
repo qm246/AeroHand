@@ -189,7 +189,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "save_anyway": "⚠ Vẫn lưu (bỏ Strict)",
             "clean_summary": "Chế độ lọc sạch: giữ {kept}/{total} mẫu • cắt {dropped} khung xấu • {segs} phân đoạn",
             "draft_saved": "Đã tự động lưu bản nháp vào data/sessions/_drafts/",
-            "matrix_title": "Ma trận phủ điều kiện (26k mục tiêu • góc 0°/30°/45°/60° ≥ 15% mỗi góc)",
+            "matrix_title": "Ma trận phủ điều kiện (21k mục tiêu mới • góc 0°/30°/45°/60° ≥ 15% mỗi góc)",
+            "consent_notice": "🔒 Quyền riêng tư: Chỉ lưu tọa độ 21 khớp tay 2D/3D cục bộ trên máy này (không lưu ảnh/video). Nếu quay người dùng khác, hãy ghi rõ tên `Người quay` để tách riêng làm tập kiểm tra độc lập (subject-held-out).",
         },
     },
     "en": {
@@ -374,7 +375,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "save_anyway": "⚠ Save anyway (strict off)",
             "clean_summary": "Clean mode: keeping {kept}/{total} frames • dropped {dropped} bad • {segs} segment(s)",
             "draft_saved": "Autosaved draft to data/sessions/_drafts/",
-            "matrix_title": "Condition Coverage Matrix (26k target • 0°/30°/45°/60° ≥ 15% each)",
+            "matrix_title": "Condition Coverage Matrix (21k new target • 0°/30°/45°/60° ≥ 15% each)",
+            "consent_notice": "🔒 Local-only privacy notice: Only 21 2D/3D hand landmark coordinates are saved locally on this Mac (zero camera pixels/video). For additional volunteers, set a distinct Subject ID so their sessions remain strictly subject-held-out.",
         },
     },
 }

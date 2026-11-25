@@ -20,6 +20,8 @@ Exits non-zero if `total_ft_per_hour > --max-ft-per-hour` (default 2.0) or if
 from __future__ import annotations
 
 import argparse
+import hashlib
+import importlib.util
 import json
 import math
 import sys
@@ -512,6 +514,103 @@ def evaluate_recordings(
     }
 
 
+def _load_seal_heldout_module():
+    fp = Path(__file__).resolve().parent / "seal_heldout.py"
+    spec = importlib.util.spec_from_file_location("_aerohand_seal_heldout", fp)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Unable to load {fp}")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def compute_eval_model_hash(
+    backend_name: str,
+    cfg: Dict[str, Any],
+    *,
+    model_path: Optional[str | Path] = None,
+    normalizer_path: Optional[str | Path] = None,
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint identifying the evaluated model/config."""
+    h = hashlib.sha256()
+    h.update(str(backend_name).encode("utf-8"))
+    if backend_name == "onnx_tcn" and model_path and normalizer_path:
+        for p in (Path(model_path), Path(normalizer_path)):
+            h.update(p.read_bytes())
+    else:
+        cls_blob = json.dumps(cfg.get("classifier") or {}, sort_keys=True, ensure_ascii=False)
+        h.update(cls_blob.encode("utf-8"))
+    return h.hexdigest()[:24]
+
+
+def evaluate_sealed_heldout(
+    heldout_dir: str | Path,
+    *,
+    config: Optional[Dict[str, Any]] = None,
+    classifier: Optional[PinchClassifier] = None,
+    backend_name: str = "heuristic_3d",
+    model_path: Optional[str | Path] = None,
+    normalizer_path: Optional[str | Path] = None,
+    model_hash: Optional[str] = None,
+    force_idle: bool = False,
+    max_ft_per_hour: float = 2.0,
+    ci_level: float = 0.95,
+    min_exposure_hours_for_claim: float = 1.5,
+    baseline: Optional[Dict[str, Any]] = None,
+    max_f1_regression: float = 0.01,
+    ft_jsonl_path: Optional[str | Path] = None,
+) -> Dict[str, Any]:
+    """
+    Single-touch evaluation on AeroHand's own sealed `heldout_aerohand` directory (V050-02):
+      1. Verifies SHA-256 of every file listed in `sealed_manifest.json`.
+      2. Refuses a second evaluation for the same `model_hash`.
+      3. Runs `evaluate_recordings(..., allow_sealed_aerohand=True)`.
+      4. Increments `touched` and records `model_hash` in `sealed_manifest.json`.
+    """
+    seal_mod = _load_seal_heldout_module()
+    cfg = deepcopy(config) if config is not None else load_config()
+    eff_hash = model_hash or compute_eval_model_hash(
+        backend_name, cfg, model_path=model_path, normalizer_path=normalizer_path
+    )
+    manifest, verified_files = seal_mod.verify_sealed_heldout_manifest(heldout_dir)
+    seal_mod.check_model_not_evaluated(manifest, eff_hash)
+
+    report = evaluate_recordings(
+        session_paths=() if force_idle else verified_files,
+        negative_paths=verified_files if force_idle else (),
+        config=cfg,
+        classifier=classifier,
+        backend_name=backend_name,
+        max_ft_per_hour=max_ft_per_hour,
+        ci_level=ci_level,
+        min_exposure_hours_for_claim=min_exposure_hours_for_claim,
+        baseline=baseline,
+        max_f1_regression=max_f1_regression,
+        ft_jsonl_path=ft_jsonl_path,
+        allow_sealed_aerohand=True,
+    )
+
+    updated_manifest = seal_mod.record_heldout_touch(
+        heldout_dir,
+        eff_hash,
+        summary={
+            "backend": backend_name,
+            "total_ft": report["false_triggers"]["total"],
+            "hand_present_idle_hours": report["false_triggers"]["hand_present_idle_hours"],
+            "total_upper_bound_per_hour": report["false_triggers"]["total_upper_bound_per_hour"],
+            "macro_f1": report["classification"]["macro_f1"],
+            "passed": report["passed"],
+        },
+    )
+    report["heldout_audit"] = {
+        "heldout_dir": str(Path(heldout_dir)),
+        "model_hash": eff_hash,
+        "touched": updated_manifest["touched"],
+        "files_verified": len(verified_files),
+    }
+    return report
+
+
 def _build_cli_classifier(args: argparse.Namespace, cfg: Dict[str, Any]) -> PinchClassifier:
     if args.backend == "onnx_tcn":
         if not args.model or not args.normalizer:
@@ -527,10 +626,22 @@ def _build_cli_classifier(args: argparse.Namespace, cfg: Dict[str, Any]) -> Pinc
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="AeroHand deterministic offline replay & evaluation harness (V040-01)."
+        description="AeroHand deterministic offline replay & evaluation harness (V040-01 / V050-02)."
     )
     parser.add_argument("--sessions", nargs="*", default=[], help="Session JSON files or directories")
     parser.add_argument("--negatives", nargs="*", default=[], help="Hard-negative JSON files or directories (forced idle)")
+    parser.add_argument(
+        "--heldout",
+        type=str,
+        default=None,
+        help="Path to AeroHand sealed heldout_aerohand directory (verifies SHA-256 & single-touch manifest)",
+    )
+    parser.add_argument("--model-hash", type=str, default=None, help="Explicit model fingerprint for --heldout audit")
+    parser.add_argument(
+        "--heldout-force-idle",
+        action="store_true",
+        help="Treat all files in --heldout as ground-truth idle negatives",
+    )
     parser.add_argument("--backend", choices=["heuristic_3d", "onnx_tcn"], default="heuristic_3d")
     parser.add_argument("--model", type=str, default=None, help="Path to ONNX model (for onnx_tcn)")
     parser.add_argument("--normalizer", type=str, default=None, help="Path to normalizer JSON (for onnx_tcn)")
@@ -549,28 +660,48 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--out", type=str, default=None, help="Optional path to write JSON evaluation report")
     args = parser.parse_args(argv)
 
-    session_paths = _collect_json_paths(args.sessions)
-    negative_paths = _collect_json_paths(args.negatives)
-    if not session_paths and not negative_paths:
-        raise SystemExit("No JSON recordings found via --sessions or --negatives.")
-
     cfg = load_config(config_path=args.config) if args.config else load_config()
     baseline_data = json.loads(Path(args.baseline).read_text(encoding="utf-8")) if args.baseline else None
     clf = _build_cli_classifier(args, cfg)
 
-    report = evaluate_recordings(
-        session_paths=session_paths,
-        negative_paths=negative_paths,
-        config=cfg,
-        classifier=clf,
-        backend_name=args.backend,
-        max_ft_per_hour=args.max_ft_per_hour,
-        ci_level=args.ci_level,
-        min_exposure_hours_for_claim=args.min_exposure_hours_for_claim,
-        baseline=baseline_data,
-        max_f1_regression=args.max_f1_regression,
-        ft_jsonl_path=args.ft_jsonl,
-    )
+    if args.heldout:
+        if args.sessions or args.negatives:
+            raise SystemExit("--heldout cannot be combined with --sessions or --negatives.")
+        report = evaluate_sealed_heldout(
+            args.heldout,
+            config=cfg,
+            classifier=clf,
+            backend_name=args.backend,
+            model_path=args.model,
+            normalizer_path=args.normalizer,
+            model_hash=args.model_hash,
+            force_idle=args.heldout_force_idle,
+            max_ft_per_hour=args.max_ft_per_hour,
+            ci_level=args.ci_level,
+            min_exposure_hours_for_claim=args.min_exposure_hours_for_claim,
+            baseline=baseline_data,
+            max_f1_regression=args.max_f1_regression,
+            ft_jsonl_path=args.ft_jsonl,
+        )
+    else:
+        session_paths = _collect_json_paths(args.sessions)
+        negative_paths = _collect_json_paths(args.negatives)
+        if not session_paths and not negative_paths:
+            raise SystemExit("No JSON recordings found via --sessions, --negatives, or --heldout.")
+
+        report = evaluate_recordings(
+            session_paths=session_paths,
+            negative_paths=negative_paths,
+            config=cfg,
+            classifier=clf,
+            backend_name=args.backend,
+            max_ft_per_hour=args.max_ft_per_hour,
+            ci_level=args.ci_level,
+            min_exposure_hours_for_claim=args.min_exposure_hours_for_claim,
+            baseline=baseline_data,
+            max_f1_regression=args.max_f1_regression,
+            ft_jsonl_path=args.ft_jsonl,
+        )
     if not report["false_triggers"]["exposure_sufficient"]:
         print(f"[WARN] {report['false_triggers']['exposure_notice']}", file=sys.stderr)
 

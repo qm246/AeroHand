@@ -70,7 +70,7 @@ class ParsedSample:
 
 
 class SessionBundle:
-    __slots__ = ("name", "group_key", "windows", "labels")
+    __slots__ = ("name", "group_key", "windows", "labels", "scenario", "subject")
 
     def __init__(
         self,
@@ -78,11 +78,16 @@ class SessionBundle:
         group_key: str,
         windows: List[List[ParsedSample]],
         labels: np.ndarray,
+        *,
+        scenario: str = "",
+        subject: str = "anon",
     ) -> None:
         self.name = name
         self.group_key = group_key
         self.windows = windows
         self.labels = labels
+        self.scenario = scenario or name
+        self.subject = subject or "anon"
 
 
 def _to_landmarks(flat_or_list: object) -> List[Landmark]:
@@ -359,8 +364,159 @@ def load_session_bundle(
         skip_stats=skip_stats,
     )
     prefix = "neg:" if force_idle else ""
-    group_key = prefix + _session_group_key({"session_meta": rec_meta.get("session_meta") or {}}, session_path.name)
-    return SessionBundle(name=f"{prefix}{session_path.name}", group_key=group_key, windows=windows, labels=ys)
+    smeta = rec_meta.get("session_meta") or {}
+    group_key = prefix + _session_group_key({"session_meta": smeta}, session_path.name)
+    scenario = str(rec_meta.get("scenario") or session_path.stem)
+    subject = str(smeta.get("subject") or "anon").strip() or "anon"
+    return SessionBundle(
+        name=f"{prefix}{session_path.name}",
+        group_key=group_key,
+        windows=windows,
+        labels=ys,
+        scenario=scenario,
+        subject=subject,
+    )
+
+
+def split_subject_heldout(
+    bundles: Sequence[SessionBundle],
+    *,
+    primary_subject: str = "",
+    heldout_subjects: Sequence[str] = (),
+) -> Tuple[List[SessionBundle], List[SessionBundle]]:
+    """
+    Separate non-primary or explicitly held-out volunteer subjects out of dev training
+    so subject generalization is evaluated strictly out-of-subject (V050-02).
+    """
+    primary_norm = primary_subject.strip().lower()
+    ho_set = {s.strip().lower() for s in heldout_subjects if s and s.strip()}
+    if not primary_norm and not ho_set:
+        return list(bundles), []
+
+    dev_bundles: List[SessionBundle] = []
+    ho_bundles: List[SessionBundle] = []
+    for b in bundles:
+        subj = b.subject.strip().lower()
+        is_ho = (subj in ho_set) or (bool(primary_norm) and subj != primary_norm)
+        if is_ho:
+            ho_bundles.append(b)
+        else:
+            dev_bundles.append(b)
+    return dev_bundles, ho_bundles
+
+
+def balance_scenario_samples(
+    bundles: Sequence[SessionBundle],
+    *,
+    max_scenario_share: float = 0.15,
+    seed: int = 42,
+) -> Tuple[List[SessionBundle], Dict[str, Any]]:
+    """
+    Per-scenario balanced idle sampler (V050-02):
+    Caps every single scenario's share of `idle` (class 0) windows to `<= max_scenario_share`
+    using exact water-filling subsampling while preserving 100% of positive pinch windows.
+    """
+    share = max(0.01, min(1.0, float(max_scenario_share)))
+    # Collect idle window indices grouped by scenario
+    idle_by_sc: Dict[str, List[Tuple[int, int]]] = {}
+    for bi, b in enumerate(bundles):
+        for wi, lbl in enumerate(b.labels.tolist()):
+            if int(lbl) == 0:
+                idle_by_sc.setdefault(b.scenario, []).append((bi, wi))
+
+    total_idle_before = sum(len(v) for v in idle_by_sc.values())
+    if total_idle_before == 0 or len(idle_by_sc) <= 1 or share >= 1.0:
+        return list(bundles), {
+            "total_idle_before": total_idle_before,
+            "total_idle_after": total_idle_before,
+            "max_share_before": 1.0 if total_idle_before > 0 else 0.0,
+            "max_share_after": 1.0 if total_idle_before > 0 else 0.0,
+            "capped_scenarios": {},
+        }
+
+    counts = {sc: len(idxs) for sc, idxs in idle_by_sc.items()}
+    max_share_before = max(counts.values()) / float(total_idle_before)
+
+    # Exact closed-form water-filling cap:
+    # If `m` scenarios are capped at `L` and uncapped sum is `U`,
+    # `L / (U + m * L) <= share`  <=>  `L <= share * U / (1 - m * share)`.
+    n_sc = len(counts)
+    if n_sc * share < 1.0:
+        # Fewer than ceil(1 / share) scenarios: balance equally at min count
+        min_c = min(counts.values())
+        caps = {sc: min_c for sc in counts}
+    else:
+        capped: set[str] = set()
+        limit = total_idle_before
+        while True:
+            uncapped_sum = sum(c for sc, c in counts.items() if sc not in capped)
+            m = len(capped)
+            if m == 0:
+                cand_limit = int(math.floor(share * total_idle_before))
+            else:
+                denom = 1.0 - m * share
+                if denom <= 1e-9:
+                    cand_limit = min(counts.values())
+                else:
+                    cand_limit = int(math.floor((share * uncapped_sum) / denom))
+            cand_limit = max(1, cand_limit)
+            newly_capped = {sc for sc, c in counts.items() if sc not in capped and c > cand_limit}
+            if not newly_capped:
+                limit = cand_limit
+                break
+            capped.update(newly_capped)
+        caps = {sc: min(c, limit) for sc, c in counts.items()}
+
+    rng = np.random.default_rng(int(seed))
+    keep_idle_by_bundle: Dict[int, set[int]] = {}
+    capped_info: Dict[str, Dict[str, int]] = {}
+    for sc, pairs in sorted(idle_by_sc.items()):
+        cap_n = caps[sc]
+        if len(pairs) > cap_n:
+            chosen_idx = rng.choice(len(pairs), size=cap_n, replace=False)
+            chosen = [pairs[int(i)] for i in sorted(chosen_idx.tolist())]
+            capped_info[sc] = {"before": len(pairs), "after": cap_n}
+        else:
+            chosen = pairs
+        for bi, wi in chosen:
+            keep_idle_by_bundle.setdefault(bi, set()).add(wi)
+
+    out_bundles: List[SessionBundle] = []
+    total_idle_after = 0
+    kept_counts_by_sc: Dict[str, int] = {}
+    for bi, b in enumerate(bundles):
+        keep_idle = keep_idle_by_bundle.get(bi, set())
+        new_wins: List[List[ParsedSample]] = []
+        new_lbls: List[int] = []
+        for wi, (w, lbl) in enumerate(zip(b.windows, b.labels.tolist())):
+            if int(lbl) != 0 or wi in keep_idle:
+                new_wins.append(w)
+                new_lbls.append(int(lbl))
+                if int(lbl) == 0:
+                    total_idle_after += 1
+                    kept_counts_by_sc[b.scenario] = kept_counts_by_sc.get(b.scenario, 0) + 1
+        if new_wins:
+            out_bundles.append(
+                SessionBundle(
+                    name=b.name,
+                    group_key=b.group_key,
+                    windows=new_wins,
+                    labels=np.asarray(new_lbls, dtype=np.int64),
+                    scenario=b.scenario,
+                    subject=b.subject,
+                )
+            )
+
+    max_share_after = (
+        max(kept_counts_by_sc.values()) / float(total_idle_after) if total_idle_after > 0 else 0.0
+    )
+    return out_bundles, {
+        "total_idle_before": total_idle_before,
+        "total_idle_after": total_idle_after,
+        "max_share_before": round(max_share_before, 4),
+        "max_share_after": round(max_share_after, 4),
+        "capped_scenarios": capped_info,
+    }
 
 
 def augment_window(
@@ -789,13 +945,39 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     if not bundles:
         raise SystemExit("Loaded 0 valid sequences across all session files.")
 
-    train_bundles, val_bundles, missing_val = split_session_groups(bundles, val_ratio=args.val_ratio)
+    # Separate non-primary / volunteer subjects strictly out of dev training (V050-02)
+    ho_subjs = [s.strip() for s in str(getattr(args, "heldout_subjects", "") or "").split(",") if s.strip()]
+    dev_bundles, subject_ho_bundles = split_subject_heldout(
+        bundles,
+        primary_subject=str(getattr(args, "primary_subject", "") or ""),
+        heldout_subjects=ho_subjs,
+    )
+    if subject_ho_bundles:
+        ho_names = sorted({b.subject for b in subject_ho_bundles})
+        print(f"[DATA] Held out volunteer subjects for out-of-subject eval: {ho_names} ({len(subject_ho_bundles)} files)")
+    if not dev_bundles:
+        raise SystemExit("No development bundles remain after subject-held-out filtering.")
+
+    train_bundles, val_bundles, missing_val = split_session_groups(dev_bundles, val_ratio=args.val_ratio)
     if missing_val:
         print(f"[WARN] Validation split is missing classes: {missing_val}")
         if not args.allow_missing_val_classes:
             raise SystemExit(
                 f"Aborting: validation set missing canonical classes {missing_val}. "
                 "Record more sessions covering all 7 classes (or pass --allow-missing-val-classes for smoke runs)."
+            )
+
+    max_sc_share = float(getattr(args, "max_idle_scenario_share", 0.15))
+    balance_stats: Dict[str, Any] = {}
+    if 0.0 < max_sc_share < 1.0:
+        train_bundles, balance_stats = balance_scenario_samples(
+            train_bundles, max_scenario_share=max_sc_share, seed=args.seed
+        )
+        if balance_stats.get("capped_scenarios"):
+            print(
+                f"[DATA] Balanced idle scenarios (cap={max_sc_share:.2f}): "
+                f"idle {balance_stats['total_idle_before']} -> {balance_stats['total_idle_after']}, "
+                f"max_share {balance_stats['max_share_before']:.2f} -> {balance_stats['max_share_after']:.2f}"
             )
 
     train_windows = [w for b in train_bundles for w in b.windows]
@@ -941,6 +1123,21 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     ort_out = sess.run(None, {"input": sample_x})[0]
     max_diff = float(np.max(np.abs(pt_out - ort_out)))
 
+    subject_ho_metrics: Optional[Dict[str, Any]] = None
+    if subject_ho_bundles:
+        ho_windows = [w for b in subject_ho_bundles for w in b.windows]
+        X_ho, y_ho = _featurize_windows(
+            ho_windows, feature_set=args.feature_set, seq_len=args.seq_len, skip_stats=skip_stats
+        )
+        if len(X_ho) > 0:
+            X_ho_n = (X_ho - mean) / scale
+            with torch.no_grad():
+                ho_logits = model(torch.from_numpy(X_ho_n)).detach().numpy()
+                ho_preds = np.argmax(ho_logits, axis=1)
+            subject_ho_metrics = compute_classification_metrics(y_ho, ho_preds)
+            subject_ho_metrics["subjects"] = sorted({b.subject for b in subject_ho_bundles})
+            subject_ho_metrics["sequences"] = int(len(X_ho))
+
     metrics_payload = {
         "model_name": args.name,
         "feature_set": args.feature_set,
@@ -952,6 +1149,8 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
         "temperature": temperature,
         "train_sequences": int(len(X_train)),
         "val_sequences": int(len(X_val)),
+        "idle_scenario_balance": balance_stats,
+        "subject_heldout_metrics": subject_ho_metrics,
         "onnx_max_diff": round(max_diff, 8),
         "classes": [p.value for p in ALL_POSE_NAMES],
         **best_metrics,
@@ -1009,6 +1208,24 @@ def main() -> None:
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Enable landmark augmentation (default on)")
     p.add_argument("--augment-factor", type=int, default=2, help="Total training expansion factor when --augment is on")
     p.add_argument("--max-gap-ms", type=float, default=100.0, help="Break sequence windows on gaps > this threshold (ms)")
+    p.add_argument(
+        "--max-idle-scenario-share",
+        type=float,
+        default=0.15,
+        help="Cap any single scenario to <= this fraction of idle training windows (default 0.15)",
+    )
+    p.add_argument(
+        "--primary-subject",
+        type=str,
+        default="",
+        help="If set, keep all non-primary subjects strictly out of training for subject-held-out evaluation",
+    )
+    p.add_argument(
+        "--heldout-subjects",
+        type=str,
+        default="",
+        help="Comma-separated volunteer subject IDs held out strictly for subject-held-out evaluation",
+    )
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--allow-missing-val-classes", action="store_true", help="Allow smoke training even if val lacks some classes")
     p.add_argument("--seq-len", type=int, default=5)

@@ -39,7 +39,7 @@ from aerohand.core.engine import (
 from aerohand.core.kinematics import CursorLerpInterpolator
 from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
-from aerohand.ml.collector import PinchDataCollector
+from aerohand.ml.collector import FrameRingBuffer, PinchDataCollector
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
 from aerohand.platform.audio import AudioFeedback
@@ -230,6 +230,12 @@ class AeroHandRuntime:
         self.vitals_mon = SystemVitalsMonitor()
         col_cfg = config.get("collector") or {}
         self.collector_record_hand: str = str(col_cfg.get("record_hand", "primary")).lower()
+        neg_raw = str(col_cfg.get("negatives_dir", "data/negatives"))
+        self.negatives_dir: Path = Path(neg_raw) if Path(neg_raw).is_absolute() else (repo_root() / neg_raw)
+        self.negative_window_s: float = max(0.5, min(10.0, float(col_cfg.get("negative_window_s", 3.0))))
+        self.frame_ring: FrameRingBuffer = FrameRingBuffer(max_frames=100)
+        self._negatives_saved_count: int = 0
+        self._last_camera_ts_ms: int = 0
         self.collector: PinchDataCollector = PinchDataCollector(
             trim_edge_ms=float(col_cfg.get("trim_edge_ms", 300.0)),
             countdown_s=float(col_cfg.get("countdown_s", 3.0)),
@@ -540,6 +546,30 @@ class AeroHandRuntime:
         self._refresh_saved_sessions_cache()
         return self.collector_status()
 
+    def mark_last_trigger_not_intended(self, out_dir: Optional[str | Path] = None) -> Dict[str, Any]:
+        """Save +/- 1.5s of landmark ring buffer around the last false trigger as an `idle` hard-negative."""
+        if self.dictation.is_recording:
+            self.dictation.cancel(reason="not_intended")
+        target_dir = Path(out_dir) if out_dir is not None else self.negatives_dir
+        saved = self.frame_ring.save_negative_snapshot(
+            target_dir,
+            window_s=self.negative_window_s,
+            session_meta=self.collector.session_meta,
+        )
+        trig = self.frame_ring.last_trigger or {}
+        if saved is None:
+            self._last_action_text = "No recent hand frames for hard-negative"
+            return {"ok": False, "path": None, "negatives_saved": self._negatives_saved_count}
+        self._negatives_saved_count += 1
+        self._last_action_text = f"Saved hard-negative: {saved.name}"
+        logger.info(f"[COLLECT] Saved false-trigger hard-negative -> {saved}")
+        return {
+            "ok": True,
+            "path": str(saved),
+            "trigger_type": trig.get("trigger_type", "manual"),
+            "negatives_saved": self._negatives_saved_count,
+        }
+
     def collector_status(self) -> Dict[str, Any]:
         from aerohand.ml.collector import COLLECTOR_CLASS_TARGETS
 
@@ -571,6 +601,9 @@ class AeroHandRuntime:
             "quality": self.collector.evaluate_quality(),
             "record_hand": self.collector_record_hand,
             "sessions_dir": str(self.collect_dir),
+            "negatives_dir": str(self.negatives_dir),
+            "negatives_saved": self._negatives_saved_count,
+            "last_trigger": self.frame_ring.last_trigger,
             "saved_sessions": list(self._cached_saved_sessions or []),
         }
 
@@ -998,6 +1031,9 @@ class AeroHandRuntime:
                 clk_y = (self._screen_oy + float(cp.click_y)) if use_anchor else abs_y
                 self._last_action_text = "Double Click" if cnt == 2 else "Left Click"
                 self._practice["click"] = True
+                self.frame_ring.record_trigger(
+                    "click", click_ho.hand, self._last_camera_ts_ms or int(now_ms)
+                )
                 self._emit_click_pulse("double_click" if cnt == 2 else "left_click", clk_x, clk_y)
                 self.input_ctl.mouse_click(clk_x, clk_y, button="left", click_count=cnt)
                 if use_anchor and math.hypot(clk_x - abs_x, clk_y - abs_y) > 2.0:
@@ -1016,6 +1052,9 @@ class AeroHandRuntime:
                 rc_y = (self._screen_oy + float(cp.right_click_y)) if use_rc_anchor else abs_y
                 self._last_action_text = "Right Click"
                 self._practice["right_click"] = True
+                self.frame_ring.record_trigger(
+                    "right_click", click_ho.hand, self._last_camera_ts_ms or int(now_ms)
+                )
                 self._emit_click_pulse("right_click", rc_x, rc_y)
                 self.input_ctl.mouse_click(rc_x, rc_y, button="right", click_count=1)
                 if use_rc_anchor and math.hypot(rc_x - abs_x, rc_y - abs_y) > 2.0:
@@ -1039,6 +1078,9 @@ class AeroHandRuntime:
                 dg_y = (self._screen_oy + float(cp.drag_y)) if use_drag_anchor else abs_y
                 self._last_action_text = "Drag Start"
                 self._practice["drag"] = True
+                self.frame_ring.record_trigger(
+                    "drag_start", click_ho.hand, self._last_camera_ts_ms or int(now_ms)
+                )
                 self._emit_click_pulse("grab", dg_x, dg_y)
                 self.input_ctl.mouse_down(dg_x, dg_y, button="left")
                 if use_drag_anchor and math.hypot(dg_x - abs_x, dg_y - abs_y) > 2.0:
@@ -1061,6 +1103,12 @@ class AeroHandRuntime:
             self.audio.play_wheel_tick()
             self._practice["dictation"] = True
             pose_key = p.active_pose or p.pose
+            self.frame_ring.record_trigger(
+                "dictation_start",
+                primary.hand,
+                self._last_camera_ts_ms or int(now_ms),
+                meta={"pose": pose_key.value},
+            )
             self.dictation.start(
                 trigger_meta={
                     "source": "gesture",
@@ -1305,6 +1353,24 @@ class AeroHandRuntime:
                     frame_brightness=cf.brightness,
                     frame_aspect=cf.frame_aspect,
                 )
+                self._last_camera_ts_ms = int(cf.timestamp_ms)
+                out_by_hand = {o.hand: o for o in outputs}
+                for h_inp in hands:
+                    ho_match = out_by_hand.get(h_inp.handedness)
+                    probs_d = (
+                        {k.value: float(v) for k, v in ho_match.pose.pose_probabilities.items()}
+                        if ho_match is not None
+                        else None
+                    )
+                    self.frame_ring.push(
+                        h_inp.landmarks,
+                        h_inp.world_landmarks,
+                        h_inp.handedness,
+                        h_inp.confidence,
+                        int(cf.timestamp_ms),
+                        hand_id=h_inp.handedness,
+                        probabilities=probs_d,
+                    )
                 primary = self._select_primary_hand(outputs)
                 self._record_collector_frame(hands, primary, cf.timestamp_ms)
                 if self.calibration.state == "running":

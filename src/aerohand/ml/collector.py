@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 
@@ -382,6 +384,186 @@ class PinchDataCollector:
             "counts": self.counts(),
             "counts_by_hand": self.counts_by_hand(),
             "samples": self._samples,
+        }
+        out_fp.write_text(json.dumps(payload), encoding="utf-8")
+        return out_fp
+
+
+class FrameRingBuffer:
+    """
+    Bounded per-hand rolling landmark buffer (max 100 frames/hand) for V031-06 hard-negative mining.
+    Never stores camera pixels — only 2D/3D landmarks, handedness, confidence, timestamps, and pose probs.
+    """
+
+    def __init__(self, max_frames: int = 100) -> None:
+        self.max_frames: int = max(10, int(max_frames))
+        self._lock = threading.Lock()
+        self._buffers: Dict[str, Deque[Dict[str, Any]]] = {
+            "Right": deque(maxlen=self.max_frames),
+            "Left": deque(maxlen=self.max_frames),
+        }
+        self._last_trigger: Optional[Dict[str, Any]] = None
+
+    def push(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        confidence: float,
+        timestamp_ms: int,
+        *,
+        hand_id: Optional[str] = None,
+        probabilities: Optional[Dict[str, float]] = None,
+    ) -> None:
+        if len(landmarks_2d) < 21:
+            return
+        flat_2d = [c for lm in landmarks_2d[:21] for c in (lm.x, lm.y, lm.z)]
+        flat_3d = (
+            [c for lm in world_landmarks[:21] for c in (lm.x, lm.y, lm.z)]
+            if (world_landmarks is not None and len(world_landmarks) >= 21)
+            else []
+        )
+        item: Dict[str, Any] = {
+            "timestamp_ms": int(timestamp_ms),
+            "label": 0,
+            "label_name": PoseName.IDLE.value,
+            "handedness": handedness,
+            "hand_id": str(hand_id or handedness),
+            "confidence": round(float(confidence), 4),
+            "landmarks_2d": flat_2d,
+            "world_landmarks": flat_3d,
+            "hard_negative_group": "false_trigger",
+        }
+        if probabilities:
+            item["trigger_probs"] = {str(k): round(float(v), 4) for k, v in probabilities.items()}
+        key = "Left" if handedness == "Left" else "Right"
+        with self._lock:
+            self._buffers[key].append(item)
+
+    def record_trigger(
+        self,
+        trigger_type: str,
+        hand: str,
+        timestamp_ms: int,
+        *,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        key = "Left" if hand == "Left" else "Right"
+        with self._lock:
+            self._last_trigger = {
+                "trigger_type": str(trigger_type),
+                "hand": key,
+                "timestamp_ms": int(timestamp_ms),
+                "wall_ts": round(time.time(), 2),
+                "meta": dict(meta or {}),
+            }
+
+    @property
+    def last_trigger(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return dict(self._last_trigger) if self._last_trigger is not None else None
+
+    def len_for_hand(self, hand: str) -> int:
+        key = "Left" if hand == "Left" else "Right"
+        with self._lock:
+            return len(self._buffers[key])
+
+    def total_frames(self) -> int:
+        with self._lock:
+            return sum(len(b) for b in self._buffers.values())
+
+    def extract_window(
+        self,
+        *,
+        hand: Optional[str] = None,
+        center_ts_ms: Optional[int] = None,
+        window_s: float = 3.0,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """Extract chronological `idle`-labeled samples around the last trigger (or latest frames)."""
+        half_ms = max(250.0, float(window_s) * 500.0)
+        with self._lock:
+            trig = dict(self._last_trigger) if self._last_trigger is not None else None
+            target_hand = hand or (trig["hand"] if trig else None)
+            if target_hand is None:
+                target_hand = "Right" if len(self._buffers["Right"]) >= len(self._buffers["Left"]) else "Left"
+            key = "Left" if target_hand == "Left" else "Right"
+            buf = list(self._buffers[key])
+            if not buf:
+                other = "Left" if key == "Right" else "Right"
+                buf = list(self._buffers[other])
+                key = other
+
+        if not buf:
+            return [], {"hand": key, "trigger_type": (trig or {}).get("trigger_type", "manual"), "center_ts_ms": 0}
+
+        if center_ts_ms is None:
+            center = int(trig["timestamp_ms"]) if trig is not None else int(buf[-1]["timestamp_ms"])
+        else:
+            center = int(center_ts_ms)
+
+        lo = center - half_ms
+        hi = center + half_ms
+        selected = [dict(s) for s in buf if lo <= float(s["timestamp_ms"]) <= hi]
+        if not selected:
+            # Fallback to the most recent frames within window_s of buffer tail
+            tail_ts = float(buf[-1]["timestamp_ms"])
+            selected = [dict(s) for s in buf if (tail_ts - float(s["timestamp_ms"])) <= (2.0 * half_ms)]
+
+        selected.sort(key=lambda s: int(s["timestamp_ms"]))
+        for s in selected:
+            s["label"] = 0
+            s["label_name"] = PoseName.IDLE.value
+            s["hard_negative_group"] = "false_trigger"
+
+        info = {
+            "hand": key,
+            "trigger_type": (trig or {}).get("trigger_type", "manual"),
+            "center_ts_ms": center,
+        }
+        return selected, info
+
+    def save_negative_snapshot(
+        self,
+        out_dir: str | Path,
+        *,
+        window_s: float = 3.0,
+        session_meta: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Path]:
+        """Save the +/- window_s/2 landmark clip around the last false trigger as an `idle` v2 JSON."""
+        samples, info = self.extract_window(window_s=window_s)
+        if not samples:
+            return None
+        out_root = Path(out_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        trig_slug = _slugify(info["trigger_type"], "manual")
+        hand_slug = _slugify(info["hand"], "Right")
+        meta = dict(session_meta or {})
+        meta.setdefault("subject", "user")
+        meta["hand"] = info["hand"]
+        meta["source"] = "hard_negative_mine"
+        meta["trigger_type"] = info["trigger_type"]
+        meta.setdefault("condition_id", f"hardneg_{trig_slug}_{stamp}")
+
+        out_fp = out_root / f"aerohand_neg_{trig_slug}_{hand_slug}_{stamp}.json"
+        if out_fp.exists():
+            out_fp = out_root / f"aerohand_neg_{trig_slug}_{hand_slug}_{stamp}_{int(time.time() * 1000) % 1000}.json"
+
+        by_hand = {p.value: {"Right": 0, "Left": 0} for p in ALL_POSE_NAMES}
+        by_hand[PoseName.IDLE.value][info["hand"]] = len(samples)
+        counts = {p.value: (len(samples) if p == PoseName.IDLE else 0) for p in ALL_POSE_NAMES}
+
+        payload = {
+            "schema": "aerohand_pinch_v2",
+            "schema_version": 2,
+            "hard_negative": True,
+            "trigger_type": info["trigger_type"],
+            "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "session_meta": meta,
+            "total_samples": len(samples),
+            "counts": counts,
+            "counts_by_hand": by_hand,
+            "samples": samples,
         }
         out_fp.write_text(json.dumps(payload), encoding="utf-8")
         return out_fp

@@ -168,7 +168,7 @@ def detect_hotkey_conflicts(hk_cfg: Dict[str, Any]) -> List[str]:
     """Return list of action names that collide on the exact same normalized hotkey."""
     seen: Dict[Tuple[frozenset[str], str], str] = {}
     conflicts: List[str] = []
-    for action in ("toggle_pause", "recenter", "toggle_hud"):
+    for action in ("toggle_pause", "recenter", "toggle_hud", "mark_not_intended"):
         parsed = parse_hotkey_spec(str(hk_cfg.get(action, "")))
         if parsed is None:
             continue
@@ -548,6 +548,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 return True
             if self._event_matches_spec(event, str(hk_cfg.get("toggle_hud", "cmd+shift+h"))):
                 self.toggleCameraHud_(None)
+                return True
+            if self._event_matches_spec(event, str(hk_cfg.get("mark_not_intended", "cmd+shift+n"))):
+                self.markNotIntended_(None)
                 return True
         except Exception:
             pass
@@ -976,6 +979,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "collector_clear":
             if self.runtime is not None:
                 self.runtime.collector_clear()
+        elif act == "mark_not_intended":
+            self.markNotIntended_(None)
         elif act == "reset_practice":
             if self.runtime is not None:
                 self.runtime.reset_practice()
@@ -1226,6 +1231,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
     def toggleDictation_(self, _sender) -> None:
         if self.runtime is not None:
             self.runtime.toggle_dictation()
+
+    def markNotIntended_(self, _sender) -> None:
+        if self.runtime is not None:
+            self.runtime.mark_last_trigger_not_intended()
 
     def showControlCenter_(self, _sender) -> None:
         if self.window is not None:

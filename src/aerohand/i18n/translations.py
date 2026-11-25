@@ -166,6 +166,9 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "countdown": "Chuẩn bị giữ {pose} trong {sec}s...",
             "recording_step": "🔴 ĐANG GHI: {pose} ({sec}s) — tự cắt 0.3s đầu/cuối",
             "guided_done": "✓ Đã hoàn thành kịch bản hướng dẫn! Nhấn Lưu JSON.",
+            "not_intended_btn": "🚫 Không phải tôi muốn",
+            "not_intended_saved": "✓ Đã lưu mẫu âm tính khó (idle) để huấn luyện",
+            "not_intended_empty": "Chưa có khung hình tay gần đây để lưu mẫu âm tính",
         },
     },
     "en": {
@@ -327,6 +330,9 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "countdown": "Get ready for {pose} in {sec}s...",
             "recording_step": "🔴 RECORDING: {pose} ({sec}s left) — auto-trimming 0.3s edges",
             "guided_done": "✓ Guided script finished! Click Save JSON.",
+            "not_intended_btn": "🚫 Not intended",
+            "not_intended_saved": "✓ Saved hard-negative (idle) clip for TCN training",
+            "not_intended_empty": "No recent hand frames available to save",
         },
     },
 }

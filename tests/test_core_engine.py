@@ -2551,3 +2551,52 @@ def test_drag_lock_released_on_grab_start():
     o_drag = eng.process_frame([HandInput("Right", moved, moved)], 180.0, 1920.0, 1080.0)[0]
     assert o_drag.pose.is_grabbing is True
     assert o_drag.cursor.delta_x > 20.0
+
+
+def test_ring_buffer_capped():
+    from aerohand.ml.collector import FrameRingBuffer
+
+    ring = FrameRingBuffer(max_frames=100)
+    h = _make_open_hand()
+    for i in range(250):
+        ring.push(h, h, "Right", 0.95, i * 33)
+        ring.push(h, h, "Left", 0.92, i * 33)
+    assert ring.len_for_hand("Right") == 100
+    assert ring.len_for_hand("Left") == 100
+    assert ring.total_frames() == 200
+
+
+def test_negative_snapshot_roundtrips_to_trainer(tmp_path: Path):
+    import json
+
+    from aerohand.ml.collector import FrameRingBuffer
+
+    ring = FrameRingBuffer(max_frames=100)
+    h = _make_open_hand()
+    # Push 40 frames at 33ms intervals (~1.3s), mark false trigger at frame 20
+    for i in range(40):
+        ring.push(
+            h,
+            h,
+            "Right",
+            0.94,
+            1000 + i * 33,
+            probabilities={"idle": 0.2, "thumb_index_pinch": 0.8},
+        )
+    ring.record_trigger("dictation_start", "Right", 1000 + 20 * 33)
+
+    fp = ring.save_negative_snapshot(tmp_path, window_s=3.0)
+    assert fp is not None and fp.is_file()
+    raw = json.loads(fp.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == 2
+    assert raw["hard_negative"] is True
+    assert raw["trigger_type"] == "dictation_start"
+    assert len(raw["samples"]) == 40
+    assert all(s["label"] == 0 and s["label_name"] == "idle" for s in raw["samples"])
+
+    # Round-trip directly into train_tcn.py with force_idle=True (same path as --negatives-dir)
+    mod = _load_train_tcn_module("train_tcn_neg_rt")
+    xs, ys = mod.samples_to_sequences(raw["samples"], feature_set="invariant348", seq_len=5, force_idle=True)
+    assert xs.shape == (40 - 5 + 1, 5, FEATURE_DIM_3D)
+    assert np.all(ys == 0)
+    assert np.all(np.isfinite(xs))

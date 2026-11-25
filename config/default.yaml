@@ -130,6 +130,8 @@ collector:
   trim_edge_ms: 300                    # Trim first/last 300 ms of guided recording segments
   countdown_s: 3.0                     # Pre-step countdown for guided protocol
   step_duration_s: 5.0                 # Default capture duration per guided step
+  negatives_dir: "data/negatives"      # Hard-negative snapshots saved via "Not intended"
+  negative_window_s: 3.0               # Capture +/- 1.5s around the last false trigger
 
 pose_state_machine:
   pose_hold_threshold_ms: 180
@@ -332,6 +334,7 @@ hotkeys:
   toggle_pause: "cmd+shift+a"
   recenter: "cmd+shift+r"
   toggle_hud: "cmd+shift+h"
+  mark_not_intended: "cmd+shift+n"     # Save +/- 1.5s landmarks clip as hard-negative `idle`
 
 system:
   launch_at_login: false

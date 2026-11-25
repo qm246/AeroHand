@@ -310,9 +310,12 @@
 
         <div class="card">
           <div class="card-title"><span id="t-live-hand">TÍN HIỆU BÀN TAY & XÁC SUẤT CỬ CHỈ TRỰC TIẾP</span><span class="pill-tag" id="live-dirz">dirZ: --</span></div>
-          <div style="display:flex;justify-content:space-between;margin-bottom:8px;font-size:12px;color:var(--muted)">
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;font-size:12px;color:var(--muted)">
             <span id="live-hand-txt">Tay: Chưa thấy</span>
-            <span id="live-last-act">Hành động cuối: Ready</span>
+            <div style="display:flex;align-items:center;gap:8px">
+              <span id="live-last-act">Hành động cuối: Ready</span>
+              <button class="btn sm danger" id="btn-not-intended-dash" onclick="post('mark_not_intended')">🚫 Không phải tôi muốn</button>
+            </div>
           </div>
           <div id="prob-bars"></div>
         </div>
@@ -537,6 +540,9 @@
             <div class="row"><div class="row-label"><strong id="lbl-hk-hud">Bật/Tắt Camera HUD</strong></div>
               <input type="text" id="cfg-hk-hud" style="width:130px" onchange="setKey('hotkeys.toggle_hud', this.value.trim().toLowerCase())" />
             </div>
+            <div class="row"><div class="row-label"><strong id="lbl-hk-neg">Không phải tôi muốn</strong></div>
+              <input type="text" id="cfg-hk-neg" style="width:130px" onchange="setKey('hotkeys.mark_not_intended', this.value.trim().toLowerCase())" />
+            </div>
           </div>
           <div id="hk-conflict-msg" style="font-size:11.5px;color:var(--amber);margin-top:6px;display:none"></div>
         </div>
@@ -618,6 +624,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
             <button class="btn" id="btn-col-undo" onclick="post('collector_undo',{seconds:5})">↩ Hủy 5 giây vừa quay</button>
             <button class="btn" onclick="post('collector_save')" id="btn-col-save">💾 Lưu JSON</button>
+            <button class="btn" onclick="post('mark_not_intended')" id="btn-not-intended-ml">🚫 Không phải tôi muốn</button>
             <button class="btn danger" onclick="post('collector_clear')" id="btn-col-clear">🗑 Xóa tạm</button>
           </div>
           <div id="col-guided-banner" style="font-size:12px;color:var(--teal);margin-bottom:6px;display:none"></div>
@@ -1056,11 +1063,14 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     document.getElementById("cfg-hk-pause").value = getPath(c, "hotkeys.toggle_pause", "cmd+shift+a");
     document.getElementById("cfg-hk-recenter").value = getPath(c, "hotkeys.recenter", "cmd+shift+r");
     document.getElementById("cfg-hk-hud").value = getPath(c, "hotkeys.toggle_hud", "cmd+shift+h");
+    const hkNegEl = document.getElementById("cfg-hk-neg");
+    if (hkNegEl) hkNegEl.value = getPath(c, "hotkeys.mark_not_intended", "cmd+shift+n");
     setTxt("lbl-hk-en", "Phím tắt điều khiển", "Control Hotkeys");
     setTxt("sub-hk-en", "Tùy chỉnh tổ hợp phím (ví dụ: cmd+shift+a)", "Customize combos (e.g. cmd+shift+a)");
     setTxt("lbl-hk-pause", "Tạm dừng", "Toggle Pause");
     setTxt("lbl-hk-recenter", "Căn giữa", "Recenter");
     setTxt("lbl-hk-hud", "Camera HUD", "Camera HUD");
+    setTxt("lbl-hk-neg", "Không phải tôi muốn", "Not Intended");
     const hkPill = document.getElementById("hk-mode-pill");
     if (hkPill) {
       hkPill.textContent = STATE.hotkeys_local_only
@@ -1103,6 +1113,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     setTxt("lbl-col-active", "Nhãn đang ghi", "Active Label");
     setTxt("btn-col-undo", colI18n.undo_5s || "↩ Hủy 5 giây vừa quay", colI18n.undo_5s || "↩ Undo Last 5s");
     setTxt("btn-col-save", "💾 Lưu JSON", "💾 Save JSON");
+    setTxt("btn-not-intended-dash", colI18n.not_intended_btn || "🚫 Không phải tôi muốn", colI18n.not_intended_btn || "🚫 Not intended");
+    setTxt("btn-not-intended-ml", colI18n.not_intended_btn || "🚫 Không phải tôi muốn", colI18n.not_intended_btn || "🚫 Not intended");
     setTxt("btn-col-clear", "🗑 Xóa tạm", "🗑 Clear");
     setTxt("btn-copy-train", colI18n.copy_cmd || "📋 Sao chép lệnh train", colI18n.copy_cmd || "📋 Copy Train Command");
     setTxt("col-hold-hint", colI18n.hold_hint || "", colI18n.hold_hint || "");

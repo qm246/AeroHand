@@ -22,7 +22,8 @@ import logging
 import subprocess
 import threading
 import time
-from typing import Any, Callable, Dict, Optional, Set, Tuple
+from dataclasses import dataclass
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 try:
     import Quartz
@@ -68,6 +69,206 @@ DEFAULT_KEYBOARD_BLOCKS = frozenset({"pointer", "click", "drag", "scroll", "swip
 DEFAULT_MOUSE_BLOCKS = frozenset({"pointer", "click", "drag", "scroll"})
 
 
+@dataclass(frozen=True)
+class DisplayRect:
+    """Single display rectangle in Quartz global top-left Retina points."""
+
+    x: float
+    y: float
+    width: float
+    height: float
+    is_primary: bool = False
+    visible_x: Optional[float] = None
+    visible_y: Optional[float] = None
+    visible_width: Optional[float] = None
+    visible_height: Optional[float] = None
+    display_id: int = 0
+
+    def as_tuple(self) -> Tuple[float, float, float, float]:
+        return (self.x, self.y, self.width, self.height)
+
+    def visible_tuple(self) -> Tuple[float, float, float, float]:
+        if (
+            self.visible_x is not None
+            and self.visible_y is not None
+            and self.visible_width is not None
+            and self.visible_height is not None
+        ):
+            return (self.visible_x, self.visible_y, self.visible_width, self.visible_height)
+        top_inset = 28.0 if self.is_primary else 0.0
+        return (self.x, self.y + top_inset, self.width, max(200.0, self.height - top_inset))
+
+    def contains(self, px: float, py: float) -> bool:
+        return (self.x <= px < self.x + self.width) and (self.y <= py < self.y + self.height)
+
+    def center(self) -> Tuple[float, float]:
+        return (self.x + self.width * 0.5, self.y + self.height * 0.5)
+
+
+class ScreenGeometry:
+    """
+    Single coordinate-space authority for AeroHand (Quartz top-left points <-> Cocoa bottom-left points).
+    All coordinates are strictly in macOS points (never multiplied by backingScaleFactor).
+    """
+
+    def __init__(self, displays_provider: Optional[Callable[[], List[DisplayRect]]] = None) -> None:
+        self._displays_provider = displays_provider
+
+    def displays(self) -> List[DisplayRect]:
+        """Return active displays in Quartz global top-left coordinates."""
+        if self._displays_provider is not None:
+            res = list(self._displays_provider())
+            if res:
+                return res
+            return [DisplayRect(0.0, 0.0, 1920.0, 1080.0, is_primary=True)]
+
+        out: List[DisplayRect] = []
+        primary_h: float = 1080.0
+        if Quartz is not None:
+            try:
+                main_id = int(Quartz.CGMainDisplayID())
+                mr = Quartz.CGDisplayBounds(main_id)
+                primary_h = float(mr.size.height)
+                err, display_ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
+                if err == 0 and count:
+                    for did in display_ids[:count]:
+                        r = Quartz.CGDisplayBounds(did)
+                        did_int = int(did)
+                        out.append(
+                            DisplayRect(
+                                x=float(r.origin.x),
+                                y=float(r.origin.y),
+                                width=float(r.size.width),
+                                height=float(r.size.height),
+                                is_primary=(did_int == main_id),
+                                display_id=did_int,
+                            )
+                        )
+            except Exception:
+                out = []
+
+        if not out:
+            ox, oy, w, h = get_main_display_bounds()
+            return [DisplayRect(ox, oy, w, h, is_primary=True)]
+
+        # Enrich with AppKit visibleFrame (menu bar / Dock insets) using single primary_h Y-flip
+        try:
+            import AppKit
+
+            screens = list(AppKit.NSScreen.screens() or [])
+            if screens:
+                enriched: List[DisplayRect] = []
+                for d in out:
+                    matched_vis = None
+                    for sc in screens:
+                        f = sc.frame()
+                        qx = float(f.origin.x)
+                        qy = primary_h - float(f.origin.y + f.size.height)
+                        if (
+                            abs(qx - d.x) < 2.0
+                            and abs(qy - d.y) < 2.0
+                            and abs(float(f.size.width) - d.width) < 2.0
+                            and abs(float(f.size.height) - d.height) < 2.0
+                        ):
+                            vf = sc.visibleFrame()
+                            matched_vis = (
+                                float(vf.origin.x),
+                                primary_h - float(vf.origin.y + vf.size.height),
+                                float(vf.size.width),
+                                float(vf.size.height),
+                            )
+                            break
+                    if matched_vis is not None:
+                        enriched.append(
+                            DisplayRect(
+                                x=d.x,
+                                y=d.y,
+                                width=d.width,
+                                height=d.height,
+                                is_primary=d.is_primary,
+                                visible_x=matched_vis[0],
+                                visible_y=matched_vis[1],
+                                visible_width=matched_vis[2],
+                                visible_height=matched_vis[3],
+                                display_id=d.display_id,
+                            )
+                        )
+                    else:
+                        enriched.append(d)
+                return enriched
+        except Exception:
+            pass
+        return out
+
+    def primary_display(self) -> DisplayRect:
+        ds = self.displays()
+        for d in ds:
+            if d.is_primary:
+                return d
+        for d in ds:
+            if abs(d.x) < 1e-3 and abs(d.y) < 1e-3:
+                return d
+        return ds[0]
+
+    def _primary_height(self) -> float:
+        return self.primary_display().height
+
+    def to_quartz(self, cocoa_point: Tuple[float, float]) -> Tuple[float, float]:
+        """Convert Cocoa bottom-left point `(x, y)` to Quartz top-left point `(x, y)`."""
+        cx, cy = cocoa_point
+        return (float(cx), self._primary_height() - float(cy))
+
+    def to_cocoa(self, quartz_point: Tuple[float, float]) -> Tuple[float, float]:
+        """Convert Quartz top-left point `(x, y)` to Cocoa bottom-left point `(x, y)`."""
+        qx, qy = quartz_point
+        return (float(qx), self._primary_height() - float(qy))
+
+    def to_quartz_rect(self, cocoa_rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        """Convert Cocoa `(x, y, w, h)` to Quartz `(x, y, w, h)`."""
+        rx, ry, rw, rh = cocoa_rect
+        return (float(rx), self._primary_height() - float(ry + rh), float(rw), float(rh))
+
+    def to_cocoa_rect(self, quartz_rect: Tuple[float, float, float, float]) -> Tuple[float, float, float, float]:
+        """Convert Quartz `(x, y, w, h)` to Cocoa `(x, y, w, h)`."""
+        qx, qy, qw, qh = quartz_rect
+        return (float(qx), self._primary_height() - float(qy + qh), float(qw), float(qh))
+
+    def target_display_for(self, point: Tuple[float, float]) -> DisplayRect:
+        """Return the display containing Quartz `point`, falling back to nearest center."""
+        px, py = float(point[0]), float(point[1])
+        ds = self.displays()
+        for d in ds:
+            if d.contains(px, py):
+                return d
+        # Inclusive right/bottom edge tolerance
+        for d in ds:
+            if (d.x <= px <= d.x + d.width) and (d.y <= py <= d.y + d.height):
+                return d
+        return min(ds, key=lambda d: (d.center()[0] - px) ** 2 + (d.center()[1] - py) ** 2)
+
+    def union_bounds(self) -> Tuple[float, float, float, float]:
+        ds = self.displays()
+        min_x = min(d.x for d in ds)
+        min_y = min(d.y for d in ds)
+        max_x = max(d.x + d.width for d in ds)
+        max_y = max(d.y + d.height for d in ds)
+        return (min_x, min_y, max(1.0, max_x - min_x), max(1.0, max_y - min_y))
+
+    def resolve_control_surface(
+        self,
+        mode: str = "cursor",
+        cursor_pos: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[float, float, float, float]:
+        """Resolve `(ox, oy, w, h)` in Quartz points for mode `'cursor' | 'main' | 'all'`."""
+        m = str(mode or "cursor").strip().lower()
+        if m == "main":
+            return self.primary_display().as_tuple()
+        if m == "all":
+            return self.union_bounds()
+        pt = cursor_pos if cursor_pos is not None else get_current_cursor_position()
+        return self.target_display_for(pt).as_tuple()
+
+
 def get_main_display_bounds() -> Tuple[float, float, float, float]:
     """Return `(x, y, width, height)` of the main display in Retina points."""
     if Quartz is None:
@@ -81,27 +282,8 @@ def get_main_display_bounds() -> Tuple[float, float, float, float]:
 
 def get_virtual_display_bounds(multi_monitor: bool = True) -> Tuple[float, float, float, float]:
     """Return `(min_x, min_y, width, height)` across all active displays (or main only)."""
-    if not multi_monitor or Quartz is None:
-        return get_main_display_bounds()
-    try:
-        err, display_ids, count = Quartz.CGGetActiveDisplayList(16, None, None)
-        if err != 0 or not count:
-            return get_main_display_bounds()
-        min_x = 1e9
-        min_y = 1e9
-        max_x = -1e9
-        max_y = -1e9
-        for did in display_ids[:count]:
-            r = Quartz.CGDisplayBounds(did)
-            min_x = min(min_x, float(r.origin.x))
-            min_y = min(min_y, float(r.origin.y))
-            max_x = max(max_x, float(r.origin.x + r.size.width))
-            max_y = max(max_y, float(r.origin.y + r.size.height))
-        if max_x > min_x and max_y > min_y:
-            return min_x, min_y, max_x - min_x, max_y - min_y
-    except Exception:
-        pass
-    return get_main_display_bounds()
+    geom = ScreenGeometry()
+    return geom.union_bounds() if multi_monitor else geom.primary_display().as_tuple()
 
 
 def get_current_cursor_position() -> Tuple[float, float]:
@@ -134,33 +316,7 @@ def get_frontmost_app_bundle_id() -> Optional[str]:
 
 def _visible_frame_quartz_for_point(px: float, py: float) -> Tuple[float, float, float, float]:
     """Find the active screen visible frame in Quartz top-left coordinates for point `(px, py)`."""
-    _, _, main_w, main_h = get_main_display_bounds()
-    try:
-        import AppKit
-
-        screens = list(AppKit.NSScreen.screens() or [])
-        chosen = None
-        for sc in screens:
-            f = sc.frame()
-            q_x = float(f.origin.x)
-            q_y = main_h - float(f.origin.y + f.size.height)
-            q_w = float(f.size.width)
-            q_h = float(f.size.height)
-            if q_x <= px <= q_x + q_w and q_y <= py <= q_y + q_h:
-                chosen = sc
-                break
-        if chosen is None and screens:
-            chosen = AppKit.NSScreen.mainScreen() or screens[0]
-        if chosen is not None:
-            vf = chosen.visibleFrame()
-            vx = float(vf.origin.x)
-            vy = main_h - float(vf.origin.y + vf.size.height)
-            vw = float(vf.size.width)
-            vh = float(vf.size.height)
-            return vx, vy, vw, vh
-    except Exception:
-        pass
-    return 0.0, 28.0, main_w, max(200.0, main_h - 28.0)
+    return ScreenGeometry().target_display_for((px, py)).visible_tuple()
 
 
 def compute_tile_rect(

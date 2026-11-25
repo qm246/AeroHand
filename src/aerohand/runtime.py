@@ -20,7 +20,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -43,11 +43,10 @@ from aerohand.platform.control_api import LocalControlAPIServer
 from aerohand.platform.dictation import VoiceDictationController
 from aerohand.platform.input_macos import (
     MacOSInputController,
+    ScreenGeometry,
     compute_tile_rect,
     get_current_cursor_position,
     get_frontmost_app_bundle_id,
-    get_main_display_bounds,
-    get_virtual_display_bounds,
 )
 from aerohand.platform.permissions import check_all_permissions, verify_permissions
 from aerohand.platform.tracker import MediaPipeHandTracker
@@ -149,6 +148,8 @@ class AeroHandRuntime:
         on_toggle_camera_hud: Optional[Callable[[], None]] = None,
         on_config_updated: Optional[Callable[[Dict[str, Any]], None]] = None,
         clock_ms: Optional[Callable[[], float]] = None,
+        screen_geom: Optional[ScreenGeometry] = None,
+        cursor_pos_fn: Optional[Callable[[], Tuple[float, float]]] = None,
     ) -> None:
         self.base_config: Dict[str, Any] = deepcopy(config)
         self.config: Dict[str, Any] = deepcopy(config)
@@ -158,6 +159,8 @@ class AeroHandRuntime:
         self.collect_dir = Path(collect_dir) if collect_dir else (repo_root() / "data" / "sessions")
         self._cli_collect_mode = collect_dir is not None
         self._clock_ms: Callable[[], float] = clock_ms or (lambda: time.monotonic() * 1000.0)
+        self.screen_geom: ScreenGeometry = screen_geom or ScreenGeometry()
+        self._cursor_pos_fn: Callable[[], Tuple[float, float]] = cursor_pos_fn or get_current_cursor_position
 
         self._on_show_window = on_show_window
         self._on_toggle_camera_hud = on_toggle_camera_hud
@@ -271,8 +274,9 @@ class AeroHandRuntime:
         self._last_action_text = "Mode: Dry-Run" if self.dry_run else "Mode: Live Control"
 
     def trigger_recenter(self) -> None:
-        ox, oy, mw, mh = get_main_display_bounds()
-        cx, cy = ox + mw * 0.5, oy + mh * 0.5
+        self._refresh_display_bounds()
+        cx = self._screen_ox + self._screen_w * 0.5
+        cy = self._screen_oy + self._screen_h * 0.5
         self.engine.recenter(self._screen_w, self._screen_h)
         with self._lerp_lock:
             self._lerp.reset((cx, cy))
@@ -877,14 +881,21 @@ class AeroHandRuntime:
         )
 
     def _refresh_display_bounds(self) -> None:
+        cur_cfg = self.config.get("cursor") or {}
+        mode = str(cur_cfg.get("display", "cursor")).strip().lower()
         multi = bool((self.config.get("system") or {}).get("multi_monitor", True))
-        self._screen_ox, self._screen_oy, self._screen_w, self._screen_h = get_virtual_display_bounds(multi)
+        if not multi and mode == "all":
+            mode = "main"
+        cursor_pt = self._cursor_pos_fn()
+        self._screen_ox, self._screen_oy, self._screen_w, self._screen_h = (
+            self.screen_geom.resolve_control_surface(mode=mode, cursor_pos=cursor_pt)
+        )
 
     def _run_loop(self) -> None:
         perms = check_all_permissions()
         acc_ok = True if self.dry_run else perms.get("accessibility", False)
         self._refresh_display_bounds()
-        cur_x, cur_y = get_current_cursor_position()
+        cur_x, cur_y = self._cursor_pos_fn()
         self.engine.anchor_cursor("Right", cur_x - self._screen_ox, cur_y - self._screen_oy)
         self.engine.anchor_cursor("Left", cur_x - self._screen_ox, cur_y - self._screen_oy)
         with self._lerp_lock:
@@ -1072,13 +1083,15 @@ class AeroHandRuntime:
                             }
                         )
 
-                # Build Window Tile Ghost Preview payload
+                # Build Window Tile Ghost Preview payload (in Quartz global coordinates on active display)
                 wt_preview: Optional[Dict[str, Any]] = None
                 if primary is not None and primary.pose.window_tile_preview_direction:
-                    _, _, mw, mh = get_main_display_bounds()
+                    px_abs = self._screen_ox + primary.cursor.x
+                    py_abs = self._screen_oy + primary.cursor.y
+                    vis_rect = self.screen_geom.target_display_for((px_abs, py_abs)).visible_tuple()
                     rect = compute_tile_rect(
                         primary.pose.window_tile_preview_direction,
-                        (0.0, 28.0, mw, max(200.0, mh - 28.0)),
+                        vis_rect,
                     )
                     if rect is not None:
                         wt_preview = {

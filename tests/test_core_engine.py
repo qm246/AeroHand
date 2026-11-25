@@ -815,3 +815,62 @@ def test_trainer_reads_sdk_camelcase_session(tmp_path: Path):
     assert xs.shape == (8, 5, FEATURE_DIM_3D)
     assert np.all(ys == 3)  # thumb_ring_pinch index == 3
     assert skip_stats.get("unknown_label") == 1
+
+
+def test_to_quartz_to_cocoa_roundtrip():
+    from aerohand.platform.input_macos import DisplayRect, ScreenGeometry
+
+    displays = [
+        DisplayRect(x=0.0, y=0.0, width=1512.0, height=982.0, is_primary=True),
+        DisplayRect(x=-1920.0, y=-98.0, width=1920.0, height=1080.0, is_primary=False),
+    ]
+    geom = ScreenGeometry(displays_provider=lambda: displays)
+
+    for pt in [(0.0, 0.0), (756.0, 491.0), (-960.0, 442.0), (-1920.0, -98.0)]:
+        q = geom.to_quartz(pt)
+        c = geom.to_cocoa(q)
+        assert c == pytest.approx(pt)
+
+    # Rect roundtrip on negative-origin secondary monitor
+    cocoa_r = (-1920.0, 0.0, 1920.0, 1080.0)
+    quartz_r = geom.to_quartz_rect(cocoa_r)
+    assert quartz_r == pytest.approx((-1920.0, -98.0, 1920.0, 1080.0))
+    assert geom.to_cocoa_rect(quartz_r) == pytest.approx(cocoa_r)
+
+    # Target display selection across both monitors
+    assert geom.target_display_for((-500.0, 300.0)) == displays[1]
+    assert geom.target_display_for((500.0, 300.0)) == displays[0]
+
+
+def test_recenter_uses_active_display_rect():
+    from aerohand.platform.input_macos import DisplayRect, ScreenGeometry
+    from aerohand.runtime import AeroHandRuntime
+
+    displays = [
+        DisplayRect(x=0.0, y=0.0, width=1512.0, height=982.0, is_primary=True),
+        DisplayRect(x=-1920.0, y=0.0, width=1920.0, height=1080.0, is_primary=False),
+    ]
+    geom = ScreenGeometry(displays_provider=lambda: displays)
+    moved_to: List[tuple[float, float]] = []
+
+    class _RecInput(_FakeInputCtl):
+        def mouse_move(self, x: float, y: float, delta_x=None, delta_y=None) -> bool:
+            moved_to.append((x, y))
+            return True
+
+    cfg = load_config()
+    cfg["cursor"]["display"] = "cursor"
+    cfg["audio"]["enabled"] = False
+    # Cursor is currently on the left (negative-X) secondary monitor
+    rt = AeroHandRuntime(
+        cfg,
+        dry_run=False,
+        screen_geom=geom,
+        cursor_pos_fn=lambda: (-400.0, 200.0),
+    )
+    rt.input_ctl = _RecInput()  # type: ignore[assignment]
+    rt.trigger_recenter()
+
+    # Must center onto secondary display (-1920 + 960 = -960, 540), matching main loop bounds
+    assert (rt._screen_ox, rt._screen_oy, rt._screen_w, rt._screen_h) == (-1920.0, 0.0, 1920.0, 1080.0)
+    assert moved_to == [(-960.0, 540.0)]

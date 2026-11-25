@@ -38,6 +38,7 @@ from aerohand.platform.control_api import (
     is_launch_at_login_enabled,
     set_launch_at_login,
 )
+from aerohand.platform.input_macos import ScreenGeometry
 from aerohand.platform.permissions import is_accessibility_trusted
 from aerohand.runtime import AeroHandRuntime, RuntimeSnapshot
 
@@ -202,6 +203,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self.control_webview = None
         self.overlay_panel = None
         self.overlay_webview = None
+        self._overlay_entries: list[Dict[str, Any]] = []
+        self._screen_geom = ScreenGeometry()
         self.camera_panel = None
         self.camera_container = None
         self.camera_image_view = None
@@ -249,13 +252,19 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self._build_screen_overlay()
         self._build_floating_camera_panel()
         self._register_hotkeys()
+        Foundation.NSNotificationCenter.defaultCenter().addObserver_selector_name_object_(
+            self,
+            "onScreenParametersChanged:",
+            AppKit.NSApplicationDidChangeScreenParametersNotification,
+            None,
+        )
         self.runtime.start_background()
 
         hud_vis = bool(((self.config.get("ui") or {}).get("camera_hud") or {}).get("visible", True))
         if hud_vis and self.camera_panel is not None:
             self.camera_panel.orderFront_(None)
-        if self.overlay_panel is not None:
-            self.overlay_panel.orderFront_(None)
+        for entry in self._overlay_entries:
+            entry["panel"].orderFront_(None)
         if self.window is not None:
             self.window.makeKeyAndOrderFront_(None)
         AppKit.NSApp.activateIgnoringOtherApps_(True)
@@ -283,6 +292,10 @@ class AeroHandAppDelegate(AppKit.NSObject):
             )
 
     def applicationWillTerminate_(self, _notification) -> None:
+        try:
+            Foundation.NSNotificationCenter.defaultCenter().removeObserver_(self)
+        except Exception:
+            pass
         if self.ui_timer is not None:
             self.ui_timer.invalidate()
             self.ui_timer = None
@@ -430,46 +443,95 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self.control_webview = wv
 
     # ------------------------------------------------------------------
-    # Full-Screen Transparent Click-Through Screen Overlay (`NSPanel` + `WKWebView`)
+    # Full-Screen Transparent Click-Through Screen Overlays (1 NSPanel per Display)
     # ------------------------------------------------------------------
 
+    def _destroy_screen_overlays(self) -> None:
+        for entry in self._overlay_entries:
+            try:
+                entry["panel"].orderOut_(None)
+                entry["panel"].close()
+            except Exception:
+                pass
+        self._overlay_entries = []
+        self.overlay_panel = None
+        self.overlay_webview = None
+        self._overlay_ready = False
+
     def _build_screen_overlay(self) -> None:
-        screen = AppKit.NSScreen.mainScreen()
-        sf = screen.frame() if screen else Foundation.NSMakeRect(0, 0, 1440, 900)
-        style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
-        panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-            sf, style, AppKit.NSBackingStoreBuffered, False
-        )
-        panel.setLevel_(AppKit.NSScreenSaverWindowLevel)
-        panel.setOpaque_(False)
-        panel.setBackgroundColor_(AppKit.NSColor.clearColor())
-        panel.setHasShadow_(False)
-        panel.setIgnoresMouseEvents_(True)
-        panel.setCollectionBehavior_(
-            AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
-            | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
-            | AppKit.NSWindowCollectionBehaviorStationary
-        )
+        with objc.autorelease_pool():
+            self._destroy_screen_overlays()
+            screens = list(AppKit.NSScreen.screens() or [])
+            if not screens:
+                main_sc = AppKit.NSScreen.mainScreen()
+                if main_sc is not None:
+                    screens = [main_sc]
 
-        wk_cfg = WebKit.WKWebViewConfiguration.alloc().init()
-        wv = WebKit.WKWebView.alloc().initWithFrame_configuration_(
-            Foundation.NSMakeRect(0, 0, sf.size.width, sf.size.height), wk_cfg
-        )
-        wv.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
-        try:
-            wv.setValue_forKey_(Foundation.NSNumber.numberWithBool_(False), "drawsBackground")
-        except Exception:
-            pass
+            html_path = Path(__file__).resolve().parent / "web" / "overlay.html"
+            file_url = Foundation.NSURL.fileURLWithPath_(str(html_path))
+            dir_url = Foundation.NSURL.fileURLWithPath_(str(html_path.parent))
+            style = AppKit.NSWindowStyleMaskBorderless | AppKit.NSWindowStyleMaskNonactivatingPanel
 
-        html_path = Path(__file__).resolve().parent / "web" / "overlay.html"
-        file_url = Foundation.NSURL.fileURLWithPath_(str(html_path))
-        dir_url = Foundation.NSURL.fileURLWithPath_(str(html_path.parent))
-        wv.loadFileURL_allowingReadAccessToURL_(file_url, dir_url)
+            for idx, sc in enumerate(screens):
+                sf = sc.frame()
+                q_rect = self._screen_geom.to_quartz_rect(
+                    (float(sf.origin.x), float(sf.origin.y), float(sf.size.width), float(sf.size.height))
+                )
+                panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                    sf, style, AppKit.NSBackingStoreBuffered, False
+                )
+                panel.setLevel_(AppKit.NSScreenSaverWindowLevel)
+                panel.setOpaque_(False)
+                panel.setBackgroundColor_(AppKit.NSColor.clearColor())
+                panel.setHasShadow_(False)
+                panel.setIgnoresMouseEvents_(True)
+                panel.setCollectionBehavior_(
+                    AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                    | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
+                    | AppKit.NSWindowCollectionBehaviorStationary
+                )
 
-        panel.setContentView_(wv)
-        self.overlay_panel = panel
-        self.overlay_webview = wv
-        self._overlay_ready = True
+                wk_cfg = WebKit.WKWebViewConfiguration.alloc().init()
+                wv = WebKit.WKWebView.alloc().initWithFrame_configuration_(
+                    Foundation.NSMakeRect(0, 0, sf.size.width, sf.size.height), wk_cfg
+                )
+                wv.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+                try:
+                    wv.setValue_forKey_(Foundation.NSNumber.numberWithBool_(False), "drawsBackground")
+                except Exception:
+                    pass
+                wv.loadFileURL_allowingReadAccessToURL_(file_url, dir_url)
+                panel.setContentView_(wv)
+
+                is_primary = abs(q_rect[0]) < 2.0 and abs(q_rect[1]) < 2.0
+                self._overlay_entries.append(
+                    {
+                        "panel": panel,
+                        "webview": wv,
+                        "quartz_rect": q_rect,
+                        "is_primary": is_primary or idx == 0,
+                    }
+                )
+
+            if self._overlay_entries:
+                prim = next((e for e in self._overlay_entries if e["is_primary"]), self._overlay_entries[0])
+                self.overlay_panel = prim["panel"]
+                self.overlay_webview = prim["webview"]
+                self._overlay_ready = True
+
+    def onScreenParametersChanged_(self, _notification) -> None:
+        logger.info("[UI] Display configuration changed; rebuilding per-display click-through overlays.")
+        self._build_screen_overlay()
+        for entry in self._overlay_entries:
+            entry["panel"].orderFront_(None)
+        self._apply_camera_hud_layout()
+        if self.runtime is not None:
+            self.runtime._refresh_display_bounds()
+
+    @staticmethod
+    def _rect_contains(rect: tuple[float, float, float, float], x: float, y: float) -> bool:
+        rx, ry, rw, rh = rect
+        return (rx <= x <= rx + rw) and (ry <= y <= ry + rh)
 
     # ------------------------------------------------------------------
     # Hover-Aware Floating Camera HUD (4 Corners, 3 Sizes, Smooth Hover Opacity)
@@ -710,23 +772,63 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 if ns_img is not None:
                     self.camera_image_view.setImage_(ns_img)
 
-        # 3. Transparent Screen Overlay (20 Hz for silky Palm Wheel & Click Pulse)
-        if self._overlay_ready and self.overlay_webview is not None:
-            ov_payload = {
-                "snap": {
-                    "click_event_seq": snap.click_event_seq,
-                    "click_event": snap.click_event,
-                    "palm_wheels": snap.palm_wheels,
-                    "window_tile_preview": snap.window_tile_preview,
-                    "active_hint": snap.active_hint,
-                    "warning": snap.warning,
-                    "dictation": snap.dictation,
-                },
-                "ui": self.config.get("ui") or {},
-                "i18n": pack,
-            }
-            js_ov = f"window.updateOverlay && window.updateOverlay({json.dumps(ov_payload, ensure_ascii=False)});"
-            self.overlay_webview.evaluateJavaScript_completionHandler_(js_ov, None)
+        # 3. Transparent Screen Overlays (routed per display in panel-local coordinates)
+        if self._overlay_ready and self._overlay_entries:
+            active_idx = 0
+            for idx, entry in enumerate(self._overlay_entries):
+                if self._rect_contains(entry["quartz_rect"], snap.cursor_x, snap.cursor_y):
+                    active_idx = idx
+                    break
+            for idx, entry in enumerate(self._overlay_entries):
+                qx, qy, _qw, _qh = entry["quartz_rect"]
+                is_active_panel = idx == active_idx
+
+                local_click = None
+                if snap.click_event is not None and self._rect_contains(
+                    entry["quartz_rect"], float(snap.click_event["x"]), float(snap.click_event["y"])
+                ):
+                    local_click = dict(snap.click_event)
+                    local_click["x"] = round(float(snap.click_event["x"]) - qx, 1)
+                    local_click["y"] = round(float(snap.click_event["y"]) - qy, 1)
+
+                local_tile = None
+                if snap.window_tile_preview is not None:
+                    tcx = float(snap.window_tile_preview["x"]) + float(snap.window_tile_preview["w"]) * 0.5
+                    tcy = float(snap.window_tile_preview["y"]) + float(snap.window_tile_preview["h"]) * 0.5
+                    if self._rect_contains(entry["quartz_rect"], tcx, tcy):
+                        local_tile = dict(snap.window_tile_preview)
+                        local_tile["x"] = round(float(snap.window_tile_preview["x"]) - qx, 1)
+                        local_tile["y"] = round(float(snap.window_tile_preview["y"]) - qy, 1)
+
+                local_wheels = []
+                for pw in snap.palm_wheels:
+                    px_w = float(pw.get("cursor_x", snap.cursor_x))
+                    py_w = float(pw.get("cursor_y", snap.cursor_y))
+                    if self._rect_contains(entry["quartz_rect"], px_w, py_w) or (
+                        is_active_panel and not any(
+                            self._rect_contains(e2["quartz_rect"], px_w, py_w) for e2 in self._overlay_entries
+                        )
+                    ):
+                        pw_local = dict(pw)
+                        pw_local["cursor_x"] = round(px_w - qx, 1)
+                        pw_local["cursor_y"] = round(py_w - qy, 1)
+                        local_wheels.append(pw_local)
+
+                ov_payload = {
+                    "snap": {
+                        "click_event_seq": snap.click_event_seq if local_click is not None else 0,
+                        "click_event": local_click,
+                        "palm_wheels": local_wheels,
+                        "window_tile_preview": local_tile,
+                        "active_hint": snap.active_hint if is_active_panel else None,
+                        "warning": snap.warning if is_active_panel else None,
+                        "dictation": snap.dictation if is_active_panel else {},
+                    },
+                    "ui": self.config.get("ui") or {},
+                    "i18n": pack,
+                }
+                js_ov = f"window.updateOverlay && window.updateOverlay({json.dumps(ov_payload, ensure_ascii=False)});"
+                entry["webview"].evaluateJavaScript_completionHandler_(js_ov, None)
 
         # 4. Control Center telemetry (10 Hz, only when window visible)
         if (

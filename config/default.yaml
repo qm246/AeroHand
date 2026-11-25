@@ -73,6 +73,7 @@ smoothing:
   gap_reset_ms: 100.0                  # AM-7 filter reset on camera hiccup >= 100ms
 
 cursor:
+  display: "cursor"                    # "cursor" (active display) | "main" | "all"
   enable_filter: true
   filter_min_cutoff: 1.0               # Stage-2 OneEuro on cursor output
   filter_beta: 0.01

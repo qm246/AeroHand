@@ -730,3 +730,88 @@ def test_api_rejects_unknown_setting_key(tmp_path: Path):
         conn3.close()
     finally:
         srv.stop()
+
+
+def test_collector_roundtrip_to_trainer(tmp_path: Path):
+    import importlib.util
+    import json
+
+    from aerohand.ml.collector import PoseCollector
+
+    spec = importlib.util.spec_from_file_location(
+        "train_tcn_mod", Path(__file__).resolve().parent.parent / "scripts" / "train_tcn.py"
+    )
+    assert spec is not None and spec.loader is not None
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+
+    col = PoseCollector(session_meta={"subject": "minh", "lighting": "bright"})
+    col.toggle_recording()
+    h = _make_open_hand()
+    ts = 1000
+    col.set_pose(PoseName.IDLE)
+    for _ in range(20):
+        col.add_frame(h, h, "Right", 0.95, ts)
+        ts += 33
+    col.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+    for _ in range(20):
+        col.add_frame(h, h, "Right", 0.95, ts)
+        ts += 33
+
+    fp = col.save(tmp_path)
+    saved = json.loads(fp.read_text(encoding="utf-8"))
+    assert saved["schema_version"] == 2
+    assert saved["session_meta"]["subject"] == "minh"
+
+    xs, ys = train_mod.load_session_sequences(fp, feature_set="invariant348", seq_len=5)
+    assert xs.shape[0] == 36  # 40 - 5 + 1
+    assert xs.shape[1] == 5
+    assert xs.shape[2] == FEATURE_DIM_3D
+    assert int((ys == 0).sum()) > 0
+    assert int((ys == 2).sum()) > 0  # thumb_middle_pinch index == 2
+
+
+def test_trainer_reads_sdk_camelcase_session(tmp_path: Path):
+    import importlib.util
+    import json
+
+    spec = importlib.util.spec_from_file_location(
+        "train_tcn_mod2", Path(__file__).resolve().parent.parent / "scripts" / "train_tcn.py"
+    )
+    assert spec is not None and spec.loader is not None
+    train_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(train_mod)
+
+    h = _make_open_hand()
+    lms_dicts = [{"x": p.x, "y": p.y, "z": p.z} for p in h]
+    samples = []
+    for i in range(12):
+        samples.append(
+            {
+                "timestamp": 2000 + i * 33,
+                "labelName": "thumb_ring_pinch",
+                "handedness": "Right",
+                "landmarks": lms_dicts,
+                "worldLandmarks": lms_dicts,
+            }
+        )
+    # Include an unknown label sample that must be skipped and counted
+    samples.append(
+        {
+            "timestamp": 2500,
+            "labelName": "bogus_pose",
+            "handedness": "Right",
+            "landmarks": lms_dicts,
+            "worldLandmarks": lms_dicts,
+        }
+    )
+    fp = tmp_path / "sdk_v4_session.json"
+    fp.write_text(json.dumps({"version": "4.0", "samples": samples}), encoding="utf-8")
+
+    skip_stats = {}
+    xs, ys = train_mod.load_session_sequences(
+        fp, feature_set="invariant348", seq_len=5, skip_stats=skip_stats
+    )
+    assert xs.shape == (8, 5, FEATURE_DIM_3D)
+    assert np.all(ys == 3)  # thumb_ring_pinch index == 3
+    assert skip_stats.get("unknown_label") == 1

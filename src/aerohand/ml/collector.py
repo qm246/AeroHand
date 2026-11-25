@@ -19,11 +19,12 @@ POSE_TO_ID: Dict[PoseName, int] = {pose: i for i, pose in enumerate(ALL_POSE_NAM
 class PinchDataCollector:
     """Interactive labeled session recorder for training a personal ONNX TCN model."""
 
-    def __init__(self) -> None:
+    def __init__(self, session_meta: Optional[Dict[str, Any]] = None) -> None:
         self._samples: List[Dict[str, Any]] = []
         self._recording: bool = False
         self._current_pose: PoseName = PoseName.IDLE
         self._started_at_iso: str = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._session_meta: Dict[str, Any] = dict(session_meta or {})
 
     @property
     def is_recording(self) -> bool:
@@ -33,12 +34,23 @@ class PinchDataCollector:
     def current_pose(self) -> PoseName:
         return self._current_pose
 
+    @property
+    def session_meta(self) -> Dict[str, Any]:
+        return dict(self._session_meta)
+
+    def set_session_meta(self, meta: Dict[str, Any]) -> None:
+        self._session_meta.update(meta)
+
     def toggle_recording(self) -> bool:
         self._recording = not self._recording
         return self._recording
 
     def set_pose(self, pose: PoseName) -> None:
         self._current_pose = pose
+
+    def clear(self) -> None:
+        self._samples.clear()
+        self._started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
 
     def add_frame(
         self,
@@ -47,6 +59,8 @@ class PinchDataCollector:
         handedness: Handedness,
         confidence: float,
         timestamp_ms: int,
+        *,
+        hand_id: Optional[str] = None,
     ) -> None:
         if not self._recording or len(landmarks_2d) < 21:
             return
@@ -62,6 +76,7 @@ class PinchDataCollector:
                 "label": POSE_TO_ID[self._current_pose],
                 "label_name": self._current_pose.value,
                 "handedness": handedness,
+                "hand_id": str(hand_id or handedness),
                 "confidence": round(float(confidence), 4),
                 "landmarks_2d": flat_2d,
                 "world_landmarks": flat_3d,
@@ -82,11 +97,16 @@ class PinchDataCollector:
         stamp = time.strftime("%Y%m%d_%H%M%S")
         out_fp = out_root / f"aerohand_pinch_{stamp}.json"
         payload = {
-            "schema": "aerohand_pinch_v1",
+            "schema": "aerohand_pinch_v2",
+            "schema_version": 2,
             "collected_at": self._started_at_iso,
+            "session_meta": dict(self._session_meta),
             "total_samples": len(self._samples),
             "counts": self.counts(),
             "samples": self._samples,
         }
         out_fp.write_text(json.dumps(payload), encoding="utf-8")
         return out_fp
+
+
+PoseCollector = PinchDataCollector

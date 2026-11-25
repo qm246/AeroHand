@@ -22,7 +22,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -55,34 +55,73 @@ def _to_landmarks(flat_or_list: object) -> List[Landmark]:
     return []
 
 
-def load_session_sequences(
-    session_path: Path,
+def _resolve_sample_label(sample: Dict[str, Any]) -> Optional[str]:
+    raw = sample.get("label_name")
+    if raw is None:
+        raw = sample.get("labelName")
+    if raw is None:
+        return None
+    return str(raw).strip()
+
+
+def _resolve_sample_timestamp_ms(sample: Dict[str, Any]) -> Optional[float]:
+    raw = sample.get("timestamp_ms")
+    if raw is None:
+        raw = sample.get("timestamp")
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def samples_to_sequences(
+    samples: Sequence[Dict[str, Any]],
     *,
     feature_set: str = "invariant348",
     seq_len: int = 5,
     force_idle: bool = False,
+    skip_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Load one JSON session into sliding `(N, seq_len, F)` sequences and labels `(N,)`."""
-    data = json.loads(session_path.read_text(encoding="utf-8"))
-    samples = data.get("samples") or data.get("frames") or []
+    """Convert raw sample dicts (snake_case v1/v2 or SDK camelCase v4.0) into `(N, seq_len, F)` arrays."""
     feat_dim = FEATURE_DIM_3D if feature_set == "invariant348" else AIRMOUSE_885_DIM
+    stats = skip_stats if skip_stats is not None else {}
+
+    def _bump(reason: str) -> None:
+        stats[reason] = stats.get(reason, 0) + 1
 
     feats: List[np.ndarray] = []
     labels: List[int] = []
 
     for s in samples:
+        if not isinstance(s, dict):
+            _bump("non_dict")
+            continue
+
         if force_idle:
             label_idx = 0
         else:
-            lname = str(s.get("labelName") or PoseName.IDLE.value)
-            if lname not in POSE_TO_IDX:
+            lname = _resolve_sample_label(s)
+            if lname is None:
+                lname = PoseName.IDLE.value if s.get("label") == 0 else None
+            if lname is None or lname not in POSE_TO_IDX:
+                _bump("unknown_label")
                 continue
             label_idx = POSE_TO_IDX[lname]
 
-        lms2d = _to_landmarks(s.get("landmarks"))
+        raw_2d = s.get("landmarks_2d")
+        if raw_2d is None:
+            raw_2d = s.get("landmarks")
+        lms2d = _to_landmarks(raw_2d)
         if len(lms2d) < 21:
+            _bump("bad_landmarks")
             continue
-        lms3d = _to_landmarks(s.get("worldLandmarks")) or None
+
+        raw_3d = s.get("world_landmarks")
+        if raw_3d is None:
+            raw_3d = s.get("worldLandmarks")
+        lms3d = _to_landmarks(raw_3d) or None
         handed = "Left" if str(s.get("handedness", "Right")) == "Left" else "Right"
 
         if feature_set == "invariant348":
@@ -90,9 +129,11 @@ def load_session_sequences(
         else:
             vec = extract_airmouse_885_features(lms2d, lms3d, handedness=handed)
 
-        if vec.shape[0] == feat_dim and np.all(np.isfinite(vec)):
+        if vec is not None and vec.shape[0] == feat_dim and np.all(np.isfinite(vec)):
             feats.append(vec)
             labels.append(label_idx)
+        else:
+            _bump("non_finite_features")
 
     if len(feats) < seq_len:
         return np.zeros((0, seq_len, feat_dim), dtype=np.float32), np.zeros((0,), dtype=np.int64)
@@ -101,6 +142,26 @@ def load_session_sequences(
     seqs = np.stack([arr[i : i + seq_len] for i in range(len(arr) - seq_len + 1)], axis=0)
     ys = np.array(labels[seq_len - 1 :], dtype=np.int64)
     return seqs.astype(np.float32), ys
+
+
+def load_session_sequences(
+    session_path: Path,
+    *,
+    feature_set: str = "invariant348",
+    seq_len: int = 5,
+    force_idle: bool = False,
+    skip_stats: Optional[Dict[str, int]] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load one JSON session into sliding `(N, seq_len, F)` sequences and labels `(N,)`."""
+    data = json.loads(session_path.read_text(encoding="utf-8"))
+    samples = data.get("samples") or data.get("frames") or []
+    return samples_to_sequences(
+        samples,
+        feature_set=feature_set,
+        seq_len=seq_len,
+        force_idle=force_idle,
+        skip_stats=skip_stats,
+    )
 
 
 def train_and_export(args: argparse.Namespace) -> None:
@@ -158,20 +219,38 @@ def train_and_export(args: argparse.Namespace) -> None:
         )
 
     per_file: List[Tuple[str, np.ndarray, np.ndarray]] = []
+    skip_stats: Dict[str, int] = {}
     for fp in files:
-        xs, ys = load_session_sequences(fp, feature_set=args.feature_set, seq_len=args.seq_len)
+        xs, ys = load_session_sequences(
+            fp, feature_set=args.feature_set, seq_len=args.seq_len, skip_stats=skip_stats
+        )
         if xs.shape[0] > 0:
             per_file.append((fp.name, xs, ys))
 
     if args.negatives_dir:
         neg_dir = Path(args.negatives_dir)
         for fp in sorted(neg_dir.glob("*.json")):
-            xs, ys = load_session_sequences(fp, feature_set=args.feature_set, seq_len=args.seq_len, force_idle=True)
+            xs, ys = load_session_sequences(
+                fp,
+                feature_set=args.feature_set,
+                seq_len=args.seq_len,
+                force_idle=True,
+                skip_stats=skip_stats,
+            )
             if xs.shape[0] > 0:
                 per_file.append((f"neg:{fp.name}", xs, ys))
 
+    if skip_stats:
+        print(f"[DATA] Skipped samples by reason: {skip_stats}")
+
     if not per_file:
         raise SystemExit("Loaded 0 valid sequences across all session files.")
+
+    all_ys = np.concatenate([g[2] for g in per_file], axis=0)
+    total_counts = np.bincount(all_ys, minlength=len(ALL_POSE_NAMES))
+    print("[DATA] Sequence counts per class:")
+    for idx, pose in enumerate(ALL_POSE_NAMES):
+        print(f"  [{idx}] {pose.value:26s}: {int(total_counts[idx])}")
 
     # Session-grouped split (zero frame leakage!)
     if len(per_file) >= 2:

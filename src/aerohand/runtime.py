@@ -509,6 +509,38 @@ class AeroHandRuntime:
                 nx, ny, dx, dy = step
                 self.input_ctl.mouse_move(nx, ny, delta_x=dx, delta_y=dy)
 
+    def _record_collector_frame(
+        self,
+        hands: List[Any],
+        primary: Optional[HandOutput],
+        timestamp_ms: int,
+    ) -> None:
+        """Record landmarks for the active primary hand (never blindly `hands[0]`)."""
+        if not self.collector.is_recording or not hands:
+            return
+        target_hand: Optional[str] = primary.hand if primary is not None else None
+        chosen = None
+        if target_hand is not None:
+            for h_inp in hands:
+                if h_inp.handedness == target_hand:
+                    chosen = h_inp
+                    break
+        if chosen is None:
+            pref = str((self.config.get("hand") or {}).get("cursor_hand", "Right"))
+            for h_inp in hands:
+                if pref == "Both" or h_inp.handedness == pref:
+                    chosen = h_inp
+                    break
+        if chosen is not None:
+            self.collector.add_frame(
+                chosen.landmarks,
+                chosen.world_landmarks,
+                chosen.handedness,
+                chosen.confidence,
+                timestamp_ms,
+                hand_id=chosen.handedness,
+            )
+
     def _select_primary_hand(self, outputs: List[HandOutput]) -> Optional[HandOutput]:
         if not outputs:
             return None
@@ -969,12 +1001,6 @@ class AeroHandRuntime:
                         with self._lerp_lock:
                             self._lerp.reset((cx, cy))
                     self._hand_present_prev = True
-
-                    if self.collector.is_recording:
-                        h0 = hands[0]
-                        self.collector.add_frame(
-                            h0.landmarks, h0.world_landmarks, h0.handedness, h0.confidence, cf.timestamp_ms
-                        )
                 else:
                     if self._hand_present_prev:
                         self._hand_present_prev = False
@@ -989,6 +1015,7 @@ class AeroHandRuntime:
                     frame_brightness=cf.brightness,
                 )
                 primary = self._select_primary_hand(outputs)
+                self._record_collector_frame(hands, primary, cf.timestamp_ms)
                 active_hint = self._dispatch_actions(outputs, primary, frame_wall_ms)
                 self._enforce_input_safety(frame_wall_ms)
 

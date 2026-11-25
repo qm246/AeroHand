@@ -48,7 +48,7 @@ from aerohand.ml.collector import (
     compute_corpus_condition_matrix,
 )
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
-from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
+from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier, resolve_classifier_mode
 from aerohand.platform.audio import AudioFeedback
 from aerohand.platform.camera import ThreadedCamera, list_cameras
 from aerohand.platform.control_api import LocalControlAPIServer
@@ -127,12 +127,13 @@ def build_classifier(
     on_error: Optional[Callable[[], None]] = None,
 ) -> PinchClassifier:
     cls_cfg = config.get("classifier") or {}
-    backend = str(cls_cfg.get("backend", "heuristic_3d")).strip().lower()
-    shadow_mode = bool(cls_cfg.get("shadow_mode", False))
+    mode = resolve_classifier_mode(cls_cfg)
     max_p95_ms = float(cls_cfg.get("max_onnx_p95_ms", 8.0))
+    veto_min_prob = float(cls_cfg.get("veto_min_prob", 0.35))
+    veto_idle_prob = float(cls_cfg.get("veto_idle_prob", 0.60))
     heuristic = Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
 
-    if backend == "onnx_tcn" or shadow_mode:
+    if mode in ("shadow", "veto", "onnx"):
         mpath = cls_cfg.get("onnx_model_path")
         npath = cls_cfg.get("onnx_normalizer_path")
         if mpath and npath:
@@ -153,14 +154,18 @@ def build_classifier(
                     return GuardedClassifier(
                         onnx_clf,
                         heuristic,
-                        shadow_mode=(shadow_mode and backend != "onnx_tcn") or shadow_mode,
+                        mode=mode,
+                        veto_min_prob=veto_min_prob,
+                        veto_idle_prob=veto_idle_prob,
                         max_p95_ms=max_p95_ms,
                         on_error=on_error,
                     )
                 except Exception as exc:
                     logger.warning(f"[ML] Failed loading ONNX TCN ({exc}); falling back to heuristic_3d.")
             else:
-                logger.info("[ML] ONNX model not trained yet; using heuristic_3d until model is exported.")
+                logger.info(
+                    f"[ML] ONNX model not trained yet for mode={mode}; using heuristic_3d until model is exported."
+                )
     return heuristic
 
 
@@ -362,16 +367,24 @@ class AeroHandRuntime:
     def classifier_telemetry(self) -> Dict[str, Any]:
         if isinstance(self.classifier, GuardedClassifier):
             return self.classifier.telemetry()
+        cls_cfg = self.config.get("classifier") or {}
         return {
+            "mode": "heuristic",
             "active_backend": type(self.classifier).__name__,
             "shadow_mode": False,
             "shadow_frames": 0,
             "shadow_disagreements": 0,
             "shadow_disagreement_rate": 0.0,
+            "veto_count": 0,
+            "veto_retried_within_1s": 0,
+            "veto_min_prob": float(cls_cfg.get("veto_min_prob", 0.35)),
+            "veto_idle_prob": float(cls_cfg.get("veto_idle_prob", 0.60)),
             "onnx_p95_ms": 0.0,
             "onnx_errors": 0,
             "fell_back": False,
             "fallback_reason": None,
+            "guard_active": True,
+            "max_onnx_p95_ms": float(cls_cfg.get("max_onnx_p95_ms", 8.0)),
         }
 
     def _emit_click_pulse(self, kind: str, x: float, y: float) -> None:
@@ -472,9 +485,10 @@ class AeroHandRuntime:
 
         new_cls = effective.get("classifier") or {}
         if (
-            str(new_cls.get("backend", "heuristic_3d")) != str(old_cls.get("backend", "heuristic_3d"))
+            resolve_classifier_mode(new_cls) != resolve_classifier_mode(old_cls)
             or str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
-            or bool(new_cls.get("shadow_mode", False)) != bool(old_cls.get("shadow_mode", False))
+            or float(new_cls.get("veto_min_prob", 0.35)) != float(old_cls.get("veto_min_prob", 0.35))
+            or float(new_cls.get("veto_idle_prob", 0.60)) != float(old_cls.get("veto_idle_prob", 0.60))
             or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
             or (new_cls.get("heuristic_3d") or {}) != (old_cls.get("heuristic_3d") or {})
         ):

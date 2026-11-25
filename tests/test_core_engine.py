@@ -3674,3 +3674,184 @@ def test_validation_requires_all_classes():
     # All 7 canonical classes present -> passes cleanly with empty missing list
     complete = [_bundle_with_labels("complete", list(range(mod.NUM_CLASSES)))]
     assert mod.validate_validation_classes(complete, allow_missing=False) == []
+
+
+
+def test_veto_mode_never_creates_activation():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _StubClf:
+        def __init__(self, pose: PoseName, probs_override=None) -> None:
+            self.pose = pose
+            self.probs_override = probs_override
+
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            if self.probs_override is not None:
+                probs.update(self.probs_override)
+            elif self.pose != PoseName.IDLE:
+                probs[PoseName.IDLE] = 0.05
+                probs[self.pose] = 0.95
+            return PinchPrediction(self.pose, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    # Heuristic says IDLE while ONNX strongly predicts THUMB_MIDDLE_PINCH -> veto mode MUST stay IDLE!
+    heur_idle = _StubClf(PoseName.IDLE)
+    onnx_pinch = _StubClf(PoseName.THUMB_MIDDLE_PINCH)
+    guarded = GuardedClassifier(onnx_pinch, heur_idle, mode="veto", veto_min_prob=0.35, veto_idle_prob=0.60)
+    h = _make_open_hand()
+    for i in range(5):
+        pred = guarded.predict(h, h, "Right", i * 33.0)
+        assert pred.pose == PoseName.IDLE
+    tel = guarded.telemetry()
+    assert tel["mode"] == "veto"
+    assert tel["veto_count"] == 0
+
+
+def test_veto_blocks_low_probability_pose():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _DynamicClf:
+        def __init__(self) -> None:
+            self.pose = PoseName.IDLE
+            self.probs = idle_probabilities()
+
+        def set(self, pose: PoseName, p_pose: float, p_idle: float):
+            self.pose = pose
+            self.probs = idle_probabilities()
+            self.probs[PoseName.IDLE] = p_idle
+            if pose != PoseName.IDLE:
+                self.probs[pose] = p_pose
+
+        def predict(self, *args, **kwargs):
+            return PinchPrediction(self.pose, dict(self.probs), "high")
+
+        def reset(self, hand=None):
+            pass
+
+    heur = _DynamicClf()
+    onnx = _DynamicClf()
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_min_prob=0.35, veto_idle_prob=0.60)
+    h = _make_open_hand()
+
+    # 1. Heuristic proposes THUMB_INDEX_PINCH, ONNX gives prob=0.20 (<0.35) -> VETOED to IDLE!
+    heur.set(PoseName.THUMB_INDEX_PINCH, 0.90, 0.10)
+    onnx.set(PoseName.IDLE, 0.0, 0.80)
+    onnx.probs[PoseName.THUMB_INDEX_PINCH] = 0.20
+    pred_vetoed = guarded.predict(h, h, "Right", 100.0)
+    assert pred_vetoed.pose == PoseName.IDLE
+    assert guarded.telemetry()["veto_count"] == 1
+
+    # 2. User releases to IDLE then retries the exact same pose within 1s -> increments veto_retried_within_1s!
+    heur.set(PoseName.IDLE, 0.0, 1.0)
+    guarded.predict(h, h, "Right", 250.0)
+    heur.set(PoseName.THUMB_INDEX_PINCH, 0.92, 0.08)
+    onnx.set(PoseName.THUMB_INDEX_PINCH, 0.82, 0.18)
+    pred_ok = guarded.predict(h, h, "Right", 400.0)
+    assert pred_ok.pose == PoseName.THUMB_INDEX_PINCH
+    tel = guarded.telemetry()
+    assert tel["veto_count"] == 1
+    assert tel["veto_retried_within_1s"] == 1
+
+
+def test_mode_switch_clears_buffers():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _BufferedClf:
+        def __init__(self) -> None:
+            self.reset_calls: List[object] = []
+            self.buf: List[float] = []
+
+        def predict(self, _l2, _l3, hand, ts):
+            self.buf.append(ts)
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
+
+        def reset(self, hand=None):
+            self.reset_calls.append(hand)
+            self.buf.clear()
+
+    onnx = _BufferedClf()
+    heur = _BufferedClf()
+    guarded = GuardedClassifier(onnx, heur, mode="shadow")
+    h = _make_open_hand()
+    guarded.predict(h, h, "Right", 0.0)
+    guarded.predict(h, h, "Right", 33.0)
+    assert len(onnx.buf) == 2 and len(heur.buf) == 2
+
+    # Switching shadow -> veto MUST clear both classifiers' buffers!
+    guarded.set_mode("veto")
+    assert guarded.mode == "veto"
+    assert onnx.buf == [] and heur.buf == []
+    assert onnx.reset_calls == [None] and heur.reset_calls == [None]
+
+    # Switching veto -> onnx clears buffers again
+    guarded.predict(h, h, "Right", 66.0)
+    assert len(onnx.buf) == 1
+    guarded.set_mode("onnx")
+    assert onnx.buf == [] and len(onnx.reset_calls) == 2
+
+
+def test_promotion_check_script_rejects_insufficient_exposure():
+    from aerohand.core.types import ALL_POSE_NAMES
+
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_test")
+    all_high_per_class = {
+        p.value: {"precision": 0.99, "recall": 0.985, "f1": 0.987, "support": 500}
+        for p in ALL_POSE_NAMES
+    }
+    good_metrics = {"subject_heldout_metrics": {"per_class": all_high_per_class}}
+    cfg = load_config()
+
+    # Case 1: Insufficient sealed exposure (0.41h < 1.5h) -> MUST fail!
+    short_sealed = {
+        "heldout_audit": {"touched": 1, "model_hash": "abc"},
+        "false_triggers": {
+            "hand_present_idle_hours": 0.41,
+            "total_upper_bound_per_hour": 7.31,
+        },
+    }
+    res_fail = promo_mod.check_onnx_promotion(
+        metrics_report=good_metrics,
+        sealed_eval_report=short_sealed,
+        latency_p95_ms=1.4,
+        config=cfg,
+    )
+    assert res_fail["passed"] is False
+    assert res_fail["criteria"]["sealed_negatives_ft_ucb"]["passed"] is False
+    assert res_fail["criteria"]["subject_heldout_recall"]["passed"] is True
+    assert res_fail["criteria"]["cpu_latency_p95_ms"]["passed"] is True
+    assert res_fail["criteria"]["runtime_guard_active"]["passed"] is True
+
+    # Case 2: All 4 criteria satisfied -> MUST pass!
+    good_sealed = {
+        "heldout_audit": {"touched": 1, "model_hash": "abc"},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.60,
+            "total_upper_bound_per_hour": 1.87,
+        },
+    }
+    res_ok = promo_mod.check_onnx_promotion(
+        metrics_report=good_metrics,
+        sealed_eval_report=good_sealed,
+        latency_p95_ms=1.4,
+        config=cfg,
+    )
+    assert res_ok["passed"] is True
+    assert all(c["passed"] for c in res_ok["criteria"].values())
+
+    # Case 3: One class recall < 0.97 -> MUST fail!
+    weak_cls = dict(all_high_per_class)
+    weak_cls["thumb_pinky_base"] = {"precision": 0.96, "recall": 0.94, "f1": 0.95, "support": 200}
+    res_weak = promo_mod.check_onnx_promotion(
+        metrics_report={"subject_heldout_metrics": {"per_class": weak_cls}},
+        sealed_eval_report=good_sealed,
+        latency_p95_ms=1.4,
+        config=cfg,
+    )
+    assert res_weak["passed"] is False
+    assert res_weak["criteria"]["subject_heldout_recall"]["passed"] is False

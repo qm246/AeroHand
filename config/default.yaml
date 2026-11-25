@@ -109,12 +109,15 @@ cursor:
   virtual_canvas_height: 1080
 
 classifier:
-  backend: "heuristic_3d"              # "heuristic_3d" (zero-setup) | "onnx_tcn" (self-trained)
+  mode: "heuristic"                    # "heuristic" | "shadow" | "veto" | "onnx"
+  backend: "heuristic_3d"              # Legacy alias: "heuristic_3d" | "onnx_tcn"
   onnx_model_path: "models/aerohand_tcn.onnx"
   onnx_normalizer_path: "models/aerohand_tcn_normalizer.json"
   sequence_length: 5
   feature_set: "invariant348"          # "invariant348" | "airmouse885"
-  shadow_mode: false                   # Run ONNX alongside heuristic & log disagreement without acting
+  shadow_mode: false                   # Legacy alias for mode="shadow"
+  veto_min_prob: 0.35                  # In veto mode: veto if ONNX prob(proposed_pose) < 0.35
+  veto_idle_prob: 0.60                 # In veto mode: veto if ONNX prob(idle) > 0.60
   max_onnx_p95_ms: 8.0                 # Auto-fallback to heuristic if ONNX p95 latency > 8ms
   heuristic_3d:
     pinch_on_dist: 0.34

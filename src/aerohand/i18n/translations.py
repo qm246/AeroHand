@@ -192,6 +192,15 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "matrix_title": "Ma trận phủ điều kiện (21k mục tiêu mới • góc 0°/30°/45°/60° ≥ 15% mỗi góc)",
             "consent_notice": "🔒 Quyền riêng tư: Chỉ lưu tọa độ 21 khớp tay 2D/3D cục bộ trên máy này (không lưu ảnh/video). Nếu quay người dùng khác, hãy ghi rõ tên `Người quay` để tách riêng làm tập kiểm tra độc lập (subject-held-out).",
         },
+        "classifier": {
+            "mode_label": "Chế độ bộ phân loại Pinch",
+            "mode_desc": "Lộ trình triển khai an toàn: Heuristic 3D → Shadow → Veto-Only → ONNX toàn phần",
+            "mode_heuristic": "Heuristic 3D (Mặc định — 4 cổng ý định)",
+            "mode_shadow": "Shadow Mode (Chạy song song ONNX, chưa tác động)",
+            "mode_veto": "Veto-Only (ONNX chỉ được chặn kích hoạt nhầm)",
+            "mode_onnx": "ONNX 1D-TCN (Toàn phần — có auto-fallback)",
+            "veto_status": "Veto Mode: đã chặn {vetos} lần • thử lại ≤1s: {retries} • ONNX p95={p95} ms",
+        },
     },
     "en": {
         "app_tagline": "Touchless macOS Control • Airpoint Ergonomics × GestureCtl Safety",
@@ -377,6 +386,15 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "draft_saved": "Autosaved draft to data/sessions/_drafts/",
             "matrix_title": "Condition Coverage Matrix (21k new target • 0°/30°/45°/60° ≥ 15% each)",
             "consent_notice": "🔒 Local-only privacy notice: Only 21 2D/3D hand landmark coordinates are saved locally on this Mac (zero camera pixels/video). For additional volunteers, set a distinct Subject ID so their sessions remain strictly subject-held-out.",
+        },
+        "classifier": {
+            "mode_label": "Pinch Classifier Mode",
+            "mode_desc": "Safe rollout path: Heuristic 3D → Shadow → Veto-Only → Full ONNX",
+            "mode_heuristic": "Heuristic 3D (Default — 4 Intent Gates)",
+            "mode_shadow": "Shadow Mode (Log ONNX disagreements without acting)",
+            "mode_veto": "Veto-Only (ONNX may only veto false activations)",
+            "mode_onnx": "ONNX 1D-TCN (Full control + auto-fallback)",
+            "veto_status": "Veto Mode: {vetos} vetoed • retried ≤1s: {retries} • ONNX p95={p95} ms",
         },
     },
 }

@@ -121,11 +121,26 @@ Tiêu chí đạt chuẩn CI/phát hành:
 
 ---
 
-## 5. Quy trình Đưa mô hình ONNX vào Sử dụng An toàn (Shadow Rollout)
+## 5. Quy trình Đưa mô hình ONNX vào Sử dụng An toàn (4 Giai đoạn — `V050-04`)
 
-1. Bật `classifier.shadow_mode: true` trong tab **Dữ liệu ML** (hoặc `aerohand settings set classifier.shadow_mode true`). Lúc này hệ thống vẫn điều khiển chuột bằng `Heuristic3DPinchClassifier`, đồng thời chạy song song ONNX và ghi nhận tỷ lệ bất đồng (`shadow_disagreement_rate`) + độ trễ `onnx_p95_ms` qua `aerohand vitals --json`.
-2. Theo dõi phiên thực tế ≥ 15 phút: kiểm tra `onnx_p95_ms < 8.0 ms` và `onnx_errors == 0`.
-3. Chuyển `classifier.backend: "onnx_tcn"` (`shadow_mode: false`). Lớp bảo vệ `GuardedClassifier` vẫn giám sát liên tục và tự động hạ về `Heuristic3DPinchClassifier` kèm `release_all()` nếu độ trễ `p95 > 8 ms` hoặc có ≥ 3 lỗi trong 10 giây.
+Cấu hình `classifier.mode` hỗ trợ 4 mức an toàn (`heuristic` → `shadow` → `veto` → `onnx`); mọi chuyển chế độ đều xóa sạch bộ đệm 5 khung hình của từng tay:
+
+1. **`heuristic`** (mặc định): dùng `Heuristic3DPinchClassifier` kèm 4 cổng ý định (`V050-01`).
+2. **`shadow`**: chạy song song ONNX để đo tỷ lệ bất đồng (`shadow_disagreement_rate`) và độ trễ `onnx_p95_ms` qua `aerohand vitals --json` mà chưa tác động chuột.
+3. **`veto` (Veto-Only)**: `Heuristic3DPinchClassifier` đề xuất cử chỉ; ONNX **chỉ được phép phủ quyết (trả về `idle`)** nếu `P_onnx(pose) < veto_min_prob` (`0.35`) hoặc `P_onnx(idle) > veto_idle_prob` (`0.60`). ONNX **không bao giờ tự tạo kích hoạt mới** khi Heuristic dự đoán `idle`. Bộ đếm `veto_count` và chỉ số bỏ lỡ gần đúng `veto_retried_within_1s` được theo dõi trực tiếp qua `aerohand vitals --json` và tab **Dữ liệu ML**.
+4. **`onnx` (Toàn phần — chỉ bật sau khi vượt qua `scripts/check_onnx_promotion.py`)**:
+   ```bash
+   uv run python scripts/check_onnx_promotion.py \
+     --metrics models/metrics.json \
+     --sealed-eval runs/sealed_heldout_eval.json \
+     --model models/aerohand_tcn.onnx \
+     --normalizer models/aerohand_tcn_normalizer.json
+   ```
+   Bắt buộc đạt đồng thời **4 tiêu chí**:
+   - Recall ngoài người dùng (`subject_heldout_metrics`) ≥ `0.97` trên **tất cả 7 lớp chuẩn**.
+   - Cận trên 95% Poisson trên tập âm tính held-out đóng niêm phong ≤ `2.0 FT/giờ` trên phơi nhiễm `hand_present_idle_hours` ≥ `1.5 giờ`.
+   - Độ trễ p95 CPU M1 `< 3.0 ms`.
+   - Cổng tự động hạ về `Heuristic3DPinchClassifier` (`max_onnx_p95_ms <= 8.0` và lỗi ≥ 3 lần / 10 giây) đang kích hoạt kèm `release_all()`.
 
 ---
 

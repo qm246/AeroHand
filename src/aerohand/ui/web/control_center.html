@@ -567,15 +567,13 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         <div class="card">
           <div class="card-title"><span>BỘ PHÂN LOẠI CỬ CHỈ & TRACKER DELEGATE</span></div>
           <div class="row">
-            <div class="row-label"><strong>Bộ phân loại Pinch</strong><span id="ml-model-status">Heuristic 3D (Sẵn sàng không cần dữ liệu)</span></div>
-            <select id="cfg-cls-backend" onchange="setKey('classifier.backend', this.value)">
-              <option value="heuristic_3d">Heuristic 3D (Mặc định)</option>
-              <option value="onnx_tcn">ONNX 1D-TCN (Model tự huấn luyện)</option>
+            <div class="row-label"><strong id="lbl-cls-mode">Chế độ bộ phân loại Pinch</strong><span id="ml-model-status">Heuristic 3D (Mặc định — 4 cổng ý định)</span></div>
+            <select id="cfg-cls-mode" onchange="setClassifierMode(this.value)">
+              <option value="heuristic">Heuristic 3D (Mặc định — 4 cổng ý định)</option>
+              <option value="shadow">Shadow Mode (Chạy song song ONNX, chưa tác động)</option>
+              <option value="veto">Veto-Only (ONNX chỉ được chặn kích hoạt nhầm)</option>
+              <option value="onnx">ONNX 1D-TCN (Toàn phần — có auto-fallback)</option>
             </select>
-          </div>
-          <div class="row">
-            <div class="row-label"><strong id="lbl-shadow-mode">Chế độ Shadow Mode (A/B an toàn)</strong><span id="sub-shadow-mode">Chạy song song ONNX để đo độ lệch mà chưa tác động chuột</span></div>
-            <label class="switch"><input type="checkbox" id="cfg-shadow-mode" onchange="setKey('classifier.shadow_mode', this.checked)"><span class="track"></span></label>
           </div>
           <div id="ml-guard-status" style="font-size:11.5px;color:var(--teal);margin-top:6px"></div>
           <div class="row">
@@ -699,6 +697,17 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
   function setCamRes(val) {
     const [w, h] = val.split("x").map(Number);
     post("set_keys", { updates: { "camera.width": w, "camera.height": h } });
+  }
+
+  function setClassifierMode(mode) {
+    const m = String(mode || "heuristic").toLowerCase();
+    post("set_keys", {
+      updates: {
+        "classifier.mode": m,
+        "classifier.backend": m === "onnx" ? "onnx_tcn" : "heuristic_3d",
+        "classifier.shadow_mode": m === "shadow",
+      },
+    });
   }
 
   let LAST_GUIDED_ACTIVE = false;
@@ -1099,11 +1108,24 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     }
 
     // ML Studio
-    document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");
-    const shCb = document.getElementById("cfg-shadow-mode");
-    if (shCb) shCb.checked = !!getPath(c, "classifier.shadow_mode", false);
-    setTxt("lbl-shadow-mode", "Chế độ Shadow Mode (A/B an toàn)", "Shadow Mode (Safe Side-by-Side Eval)");
-    setTxt("sub-shadow-mode", "Chạy song song ONNX để đo độ lệch mà chưa tác động chuột", "Run ONNX alongside Heuristic 3D and log disagreement rate without acting");
+    const clsI18n = i18n.classifier || {};
+    setTxt("lbl-cls-mode", clsI18n.mode_label || "Chế độ bộ phân loại Pinch", clsI18n.mode_label || "Pinch Classifier Mode");
+    setTxt("ml-model-status", clsI18n.mode_desc || "Lộ trình triển khai an toàn", clsI18n.mode_desc || "Safe rollout path");
+    const modeSel = document.getElementById("cfg-cls-mode");
+    if (modeSel) {
+      modeSel.innerHTML = [
+        ["heuristic", clsI18n.mode_heuristic || "Heuristic 3D"],
+        ["shadow", clsI18n.mode_shadow || "Shadow Mode"],
+        ["veto", clsI18n.mode_veto || "Veto-Only"],
+        ["onnx", clsI18n.mode_onnx || "ONNX 1D-TCN"],
+      ].map(([v, lbl]) => `<option value="${v}">${lbl}</option>`).join("");
+      let effMode = String(getPath(c, "classifier.mode", "heuristic") || "heuristic").toLowerCase();
+      if (effMode === "heuristic") {
+        if (getPath(c, "classifier.shadow_mode", false)) effMode = "shadow";
+        else if (getPath(c, "classifier.backend", "heuristic_3d") === "onnx_tcn") effMode = "onnx";
+      }
+      modeSel.value = effMode;
+    }
     const delSel = document.getElementById("cfg-trk-del");
     if (delSel) delSel.value = getPath(c, "tracker.delegate", "CPU");
     const recHandSel = document.getElementById("col-rec-hand");
@@ -1271,10 +1293,18 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       const ct = snap.classifier_telemetry || {};
       const guardEl = document.getElementById("ml-guard-status");
       if (guardEl) {
+        const clsI18n = i18n.classifier || {};
         if (ct.fell_back && ct.fallback_reason) {
           guardEl.style.color = "var(--amber)";
           guardEl.textContent = "⚠ " + ((i18n.warnings && i18n.warnings[ct.fallback_reason]) || ct.fallback_reason);
-        } else if (ct.shadow_mode) {
+        } else if (ct.mode === "veto") {
+          guardEl.style.color = "var(--teal)";
+          const tmpl = clsI18n.veto_status || "Veto Mode: {vetos} vetoed • retried ≤1s: {retries} • ONNX p95={p95} ms";
+          guardEl.textContent = tmpl
+            .replace("{vetos}", String(ct.veto_count || 0))
+            .replace("{retries}", String(ct.veto_retried_within_1s || 0))
+            .replace("{p95}", String(ct.onnx_p95_ms || 0));
+        } else if (ct.shadow_mode || ct.mode === "shadow") {
           const pct = ((ct.shadow_disagreement_rate || 0) * 100).toFixed(1);
           guardEl.style.color = "var(--teal)";
           guardEl.textContent = isVi

@@ -186,7 +186,10 @@ class AeroHandRuntime:
         cur_cfg = config.get("cursor") or {}
         self.enable_lerp_60hz: bool = bool(cur_cfg.get("enable_lerp_60hz", True))
         self.lerp_rate_hz: float = float(cur_cfg.get("lerp_rate_hz", 60.0))
-        self._lerp = CursorLerpInterpolator(lerp_speed=float(cur_cfg.get("lerp_speed", 55.0)))
+        self._lerp = CursorLerpInterpolator(
+            lerp_speed=float(cur_cfg.get("lerp_speed", 55.0)),
+            adaptive=bool(cur_cfg.get("adaptive_lerp", True)),
+        )
         self._lerp_lock = threading.Lock()
         self._lerp_active: bool = False
 
@@ -345,6 +348,7 @@ class AeroHandRuntime:
         cur = effective.get("cursor") or {}
         self.enable_lerp_60hz = bool(cur.get("enable_lerp_60hz", True))
         self._lerp.lerp_speed = float(cur.get("lerp_speed", 55.0))
+        self._lerp.adaptive = bool(cur.get("adaptive_lerp", True))
 
         rt_cfg = effective.get("runtime") or {}
         self.idle_throttle_enabled = bool(rt_cfg.get("idle_throttle_enabled", True))
@@ -791,7 +795,7 @@ class AeroHandRuntime:
                 self._practice["move"] = True
             if self.enable_lerp_60hz:
                 with self._lerp_lock:
-                    self._lerp.set_target(abs_x, abs_y)
+                    self._lerp.set_target(abs_x, abs_y, speed_px_s=c.speed)
                     self._lerp_active = True
             else:
                 self.input_ctl.mouse_move(abs_x, abs_y, delta_x=c.delta_x, delta_y=c.delta_y)
@@ -806,10 +810,13 @@ class AeroHandRuntime:
             if cp.is_clicking:
                 self.audio.play_click_up()
                 cnt = max(1, cp.click_count)
+                use_anchor = (click_ho is primary) and (cp.click_x is not None) and (cp.click_y is not None)
+                clk_x = (self._screen_ox + float(cp.click_x)) if use_anchor else abs_x
+                clk_y = (self._screen_oy + float(cp.click_y)) if use_anchor else abs_y
                 self._last_action_text = "Double Click" if cnt == 2 else "Left Click"
                 self._practice["click"] = True
-                self._emit_click_pulse("double_click" if cnt == 2 else "left_click", abs_x, abs_y)
-                self.input_ctl.mouse_click(abs_x, abs_y, button="left", click_count=cnt)
+                self._emit_click_pulse("double_click" if cnt == 2 else "left_click", clk_x, clk_y)
+                self.input_ctl.mouse_click(clk_x, clk_y, button="left", click_count=cnt)
                 active_hint = "click"
 
             if cp.is_right_clicking:

@@ -166,6 +166,8 @@ class PoseOutput:
     is_pinching: bool = False
     is_clicking: bool = False
     click_count: int = 0
+    click_x: Optional[float] = None
+    click_y: Optional[float] = None
     is_right_clicking: bool = False
     is_grabbing: bool = False
     grab_just_started: bool = False

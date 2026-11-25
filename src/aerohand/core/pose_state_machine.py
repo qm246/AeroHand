@@ -150,7 +150,13 @@ class PoseStateMachine:
                 best_pose = pose
         return best_pose
 
-    def process(self, probs: PoseProbabilities, timestamp_ms: float) -> List[PoseEvent]:
+    def process(
+        self,
+        probs: PoseProbabilities,
+        timestamp_ms: float,
+        *,
+        cursor_speed_px_s: float = 0.0,
+    ) -> List[PoseEvent]:
         events: List[PoseEvent] = []
 
         # --- CASE 1: No active pose, looking for entry ---
@@ -210,7 +216,11 @@ class PoseStateMachine:
             self._hold_active = True
             events.append(PoseEvent(type="hold_start", pose=active))
 
-        if self._exit_count >= th.exit_frames:
+        effective_exit_frames = th.exit_frames
+        if active == PoseName.THUMB_INDEX_MIDDLE_PINCH and cursor_speed_px_s > 300.0:
+            effective_exit_frames = max(th.exit_frames, 6)
+
+        if self._exit_count >= effective_exit_frames:
             was_holding = self._hold_active
             captured_motion = self._motion_distance
             self._active_pose = None

@@ -12,11 +12,30 @@ Combines:
 from __future__ import annotations
 
 import math
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Deque, Dict, Optional, Sequence, Tuple
 
 from aerohand.core.filters import OneEuroFilter1D
 from aerohand.core.types import Landmark
+
+
+def adaptive_lerp_speed(
+    speed_px_s: float,
+    *,
+    min_speed: float = 40.0,
+    max_speed: float = 70.0,
+    low_vel: float = 150.0,
+    high_vel: float = 1200.0,
+) -> float:
+    """Monotonically scale lerp stiffness from `min_speed` (precise) to `max_speed` (fast flick)."""
+    v = max(0.0, float(speed_px_s))
+    if v <= low_vel or high_vel <= low_vel:
+        return float(min_speed)
+    if v >= high_vel:
+        return float(max_speed)
+    t = (v - low_vel) / (high_vel - low_vel)
+    return float(min_speed + t * (max_speed - min_speed))
 
 
 def isotropic_distance_2d(
@@ -75,6 +94,7 @@ class CursorKinematics:
         self._skip_remaining: int = 0
         self._display_speed: float = 0.0
         self._display_finger_speed: float = 0.0
+        self._history: Deque[Tuple[float, float, float]] = deque(maxlen=64)  # (ts_ms, x, y) over ~0.5s
 
     def reset(self) -> None:
         self.filter_x.reset()
@@ -85,6 +105,21 @@ class CursorKinematics:
         self._skip_remaining = self.reacquire_skip_frames
         self._display_speed = 0.0
         self._display_finger_speed = 0.0
+        self._history.clear()
+
+    def record_history(self, timestamp_ms: float, x: float, y: float, window_ms: float = 500.0) -> None:
+        self._history.append((float(timestamp_ms), float(x), float(y)))
+        cutoff = float(timestamp_ms) - float(window_ms)
+        while len(self._history) > 1 and self._history[0][0] < cutoff:
+            self._history.popleft()
+
+    def lookup_position(self, target_timestamp_ms: float) -> Optional[Tuple[float, float]]:
+        """Return the buffered cursor position closest to `target_timestamp_ms` (pre-pinch anchor)."""
+        if not self._history:
+            return self._last_pointer_pos
+        target = float(target_timestamp_ms)
+        best = min(self._history, key=lambda item: abs(item[0] - target))
+        return (best[1], best[2])
 
     def set_cursor_position(self, x: float, y: float) -> None:
         """Anchor pointer position (e.g. from real OS cursor or recenter) without jumping."""
@@ -174,6 +209,7 @@ class CursorKinematics:
                 step_dx, step_dy = 0.0, 0.0
 
             self._last_pointer_pos = (final_x, final_y)
+            self.record_history(timestamp_ms, final_x, final_y)
             cursor_speed = math.hypot(step_dx, step_dy) / dt_s
 
             alpha = 0.15
@@ -202,23 +238,40 @@ class CursorKinematics:
 class CursorLerpInterpolator:
     """
     Smoothly interpolates ~30 Hz camera cursor updates to 60 Hz OS cursor motion
-    using Airpoint's frame-rate-independent exponential lerp (`1 - exp(-lerp_speed * dt)`).
+    using Airpoint's frame-rate-independent exponential lerp (`1 - exp(-lerp_speed * dt)`),
+    with optional velocity-adaptive stiffness (40 when precise -> 70 when flicking).
     """
 
-    def __init__(self, lerp_speed: float = 55.0, snap_threshold_px: float = 0.25) -> None:
+    def __init__(
+        self,
+        lerp_speed: float = 55.0,
+        snap_threshold_px: float = 0.25,
+        adaptive: bool = True,
+    ) -> None:
         self.lerp_speed = float(lerp_speed)
         self.snap_threshold_px = float(snap_threshold_px)
+        self.adaptive = bool(adaptive)
         self._current: Optional[Tuple[float, float]] = None
         self._target: Optional[Tuple[float, float]] = None
+        self._speed_px_s: float = 0.0
 
     def reset(self, pos: Optional[Tuple[float, float]] = None) -> None:
         self._current = pos
         self._target = pos
+        self._speed_px_s = 0.0
 
-    def set_target(self, x: float, y: float) -> None:
+    def set_target(self, x: float, y: float, *, speed_px_s: Optional[float] = None) -> None:
         self._target = (float(x), float(y))
+        if speed_px_s is not None:
+            self._speed_px_s = max(0.0, float(speed_px_s))
         if self._current is None:
             self._current = (float(x), float(y))
+
+    def effective_speed(self) -> float:
+        if not self.adaptive or self.lerp_speed <= 0.0:
+            return self.lerp_speed
+        base_scale = self.lerp_speed / 55.0
+        return adaptive_lerp_speed(self._speed_px_s) * base_scale
 
     def step(self, dt_s: float) -> Optional[Tuple[float, float, float, float]]:
         """
@@ -234,10 +287,11 @@ class CursorLerpInterpolator:
         err = math.hypot(err_x, err_y)
         if err < 1e-4:
             return None
-        if err <= self.snap_threshold_px or self.lerp_speed <= 0.0:
+        eff_speed = self.effective_speed()
+        if err <= self.snap_threshold_px or eff_speed <= 0.0:
             nx, ny = tx, ty
         else:
-            factor = 1.0 - math.exp(-self.lerp_speed * max(0.001, dt_s))
+            factor = 1.0 - math.exp(-eff_speed * max(0.001, dt_s))
             nx = cx + err_x * factor
             ny = cy + err_y * factor
         self._current = (nx, ny)

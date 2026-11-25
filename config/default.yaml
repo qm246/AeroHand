@@ -85,8 +85,11 @@ cursor:
   reference_palm_size: 0.10            # Normalized wrist->middle_mcp reference
   max_jump_ratio: 0.15                 # Reject single-frame jump > 15% screen width
   enable_lerp_60hz: true               # Interpolate 30Hz webcam to smooth 60Hz cursor
+  adaptive_lerp: true                  # Ramp lerp_speed smoothly from 40 (slow) to 70 (fast)
   lerp_speed: 55.0
   lerp_rate_hz: 60.0
+  click_lookback_ms: 90.0              # Anchor click to pre-pinch fingertip position (90 ms earlier)
+  click_dwell_lock_ms: 120.0           # Freeze pointer up to 120 ms while click probability rises > 0.4
   deadzone_px: 0.35                    # Micro-jitter floor
   reacquire_skip_frames: 2             # Ignore first 2 frames after hand reappears
   enable_pointing_gate: true

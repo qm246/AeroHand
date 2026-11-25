@@ -1175,3 +1175,90 @@ def test_distance_isotropy_16x9():
     d_h = isotropic_distance_2d(c, horiz, frame_aspect=ar)
     d_v = isotropic_distance_2d(c, vert, frame_aspect=ar)
     assert d_h == pytest.approx(d_v, rel=1e-6)
+
+
+def test_click_lookback_returns_pre_pinch_position():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["click_lookback_ms"] = 90.0
+    cfg["cursor"]["click_dwell_lock_ms"] = 0.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _SeqClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(
+                PoseName.THUMB_MIDDLE_PINCH if self.p >= 0.5 else PoseName.IDLE,
+                probs,
+                "high",
+            )
+
+        def reset(self):
+            pass
+
+    clf = _SeqClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 500.0, 500.0)
+    eng._hands["Right"].kinematics._skip_remaining = 0
+
+    # Steady aim at t=0..90ms, then fingertip shifts during pinch at t=120..180ms
+    base = _make_open_hand(forward_z=-0.25)
+    eng.process_frame([HandInput("Right", base, base)], 0.0, 1920.0, 1080.0)
+    out_30 = eng.process_frame([HandInput("Right", base, base)], 30.0, 1920.0, 1080.0)[0]
+    pre_x, pre_y = out_30.cursor.x, out_30.cursor.y
+    eng.process_frame([HandInput("Right", base, base)], 60.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Right", base, base)], 90.0, 1920.0, 1080.0)
+
+    # Shift index tip during pinch closure (simulates accidental click drift)
+    shifted = [Landmark(p.x + 0.015, p.y + 0.015, p.z) for p in base]
+    clf.p = 0.92
+    eng.process_frame([HandInput("Right", shifted, shifted)], 120.0, 1920.0, 1080.0)
+    out_enter = eng.process_frame([HandInput("Right", shifted, shifted)], 150.0, 1920.0, 1080.0)[0]
+    assert out_enter.cursor.x > pre_x + 20.0  # cursor visibly drifted on closure
+
+    # Release -> tap click MUST anchor to ~90ms pre-pinch position (~t=60ms), NOT drifted cursor!
+    clf.p = 0.05
+    eng.process_frame([HandInput("Right", shifted, shifted)], 180.0, 1920.0, 1080.0)
+    out_tap = eng.process_frame([HandInput("Right", shifted, shifted)], 210.0, 1920.0, 1080.0)[0]
+    assert out_tap.pose.is_clicking is True
+    assert out_tap.pose.click_x == pytest.approx(pre_x, abs=2.0)
+    assert out_tap.pose.click_y == pytest.approx(pre_y, abs=2.0)
+
+
+def test_adaptive_lerp_speed_monotonic():
+    from aerohand.core.kinematics import adaptive_lerp_speed
+
+    speeds = [0.0, 50.0, 150.0, 300.0, 600.0, 900.0, 1200.0, 2000.0]
+    vals = [adaptive_lerp_speed(s) for s in speeds]
+    assert vals[0] == 40.0
+    assert vals[2] == 40.0
+    assert vals[-2] == 70.0
+    assert vals[-1] == 70.0
+    for a, b in zip(vals, vals[1:]):
+        assert b >= a
+
+    # Also verify fast drag increases exit_frames from 4 to 6 in PoseStateMachine
+    psm = PoseStateMachine(load_config()["pose_state_machine"])
+    hi = idle_probabilities()
+    hi[PoseName.IDLE] = 0.05
+    hi[PoseName.THUMB_INDEX_MIDDLE_PINCH] = 0.95
+    lo = idle_probabilities()
+    psm.process(hi, 0.0)
+    psm.process(hi, 33.0)
+    psm.process(hi, 250.0)  # hold_start
+    # 5 low-prob frames at high cursor speed (> 300 px/s) must NOT drop drag yet
+    for k in range(5):
+        evs = psm.process(lo, 283.0 + k * 33.0, cursor_speed_px_s=500.0)
+        assert evs == []
+    # 6th frame drops drag cleanly
+    evs6 = psm.process(lo, 450.0, cursor_speed_px_s=500.0)
+    assert [e.type for e in evs6] == ["hold_end"]

@@ -69,6 +69,10 @@ class _PerHandState:
     palm_wheel_offset: Tuple[float, float] = (0.0, 0.0)
     cursor_delta: Tuple[float, float] = (0.0, 0.0)
     last_seen_ms: float = -1e9
+    click_anchor_pos: Optional[Tuple[float, float]] = None
+    prev_click_prob: float = 0.0
+    dwell_lock_until_ms: float = 0.0
+    dwell_lock_pos: Optional[Tuple[float, float]] = None
 
     def reset(self) -> None:
         self.kinematics.reset()
@@ -83,6 +87,10 @@ class _PerHandState:
         self.palm_wheel_was_active = False
         self.palm_wheel_offset = (0.0, 0.0)
         self.cursor_delta = (0.0, 0.0)
+        self.click_anchor_pos = None
+        self.prev_click_prob = 0.0
+        self.dwell_lock_until_ms = 0.0
+        self.dwell_lock_pos = None
 
 
 class HandCursorEngine:
@@ -155,6 +163,8 @@ class HandCursorEngine:
         self.enable_pointing_gate: bool = bool(cur_cfg.get("enable_pointing_gate", True))
         self.pointing_forward_z_threshold: float = float(cur_cfg.get("pointing_forward_z_threshold", -0.15))
         self.pointing_gate_hysteresis: float = float(cur_cfg.get("pointing_gate_hysteresis", 0.04))
+        self.click_lookback_ms: float = max(0.0, float(cur_cfg.get("click_lookback_ms", 90.0)))
+        self.click_dwell_lock_ms: float = max(0.0, float(cur_cfg.get("click_dwell_lock_ms", 120.0)))
 
         psm_cfg = config.get("pose_state_machine") or {}
         self.enable_click_debounce: bool = bool(psm_cfg.get("enable_click_debounce", True))
@@ -427,16 +437,50 @@ class HandCursorEngine:
                 PoseName.THUMB_INDEX_MIDDLE_PINCH,
             )
 
-            # 6. Pose State Machine
+            # 6. Pre-click dwell lock & Pose State Machine
             tg1 = time.perf_counter()
+            click_poses = [
+                pose_k
+                for pose_k, act in hs.pose_sm.tap_actions.items()
+                if act == "left_click"
+            ]
+            click_prob = max((float(pose_probs.get(pk, 0.0)) for pk in click_poses), default=0.0)
+            if (
+                self.click_dwell_lock_ms > 0.0
+                and self._is_click_allowed_for_hand(hand)
+                and not hs.is_grabbing
+                and not pw_active
+            ):
+                if (
+                    click_prob > 0.40
+                    and click_prob > hs.prev_click_prob
+                    and timestamp_ms >= hs.dwell_lock_until_ms
+                ):
+                    hs.dwell_lock_until_ms = timestamp_ms + self.click_dwell_lock_ms
+                    hs.dwell_lock_pos = (cursor_out.x, cursor_out.y)
+                elif click_prob < 0.20 and hs.pose_sm.active_pose is None:
+                    hs.dwell_lock_until_ms = 0.0
+                    hs.dwell_lock_pos = None
+
+                if timestamp_ms < hs.dwell_lock_until_ms and hs.dwell_lock_pos is not None:
+                    cursor_out.x, cursor_out.y = hs.dwell_lock_pos
+                    cursor_out.delta_x = 0.0
+                    cursor_out.delta_y = 0.0
+                    hs.cursor_delta = (0.0, 0.0)
+            hs.prev_click_prob = click_prob
+
             if hs.pose_sm.active_pose is not None:
                 hs.pose_sm.add_motion(math.hypot(hs.cursor_delta[0], hs.cursor_delta[1]))
 
-            events = hs.pose_sm.process(pose_probs, timestamp_ms)
+            events = hs.pose_sm.process(
+                pose_probs, timestamp_ms, cursor_speed_px_s=cursor_out.speed
+            )
 
             is_pinching = False
             is_clicking = False
             click_count = 0
+            click_x: Optional[float] = None
+            click_y: Optional[float] = None
             is_right_clicking = False
             grab_started = False
             grab_ended = False
@@ -447,6 +491,12 @@ class HandCursorEngine:
                 if ev.type == "pose_enter":
                     if hs.pose_sm.get_tap_action(ev.pose) == "left_click" and self._is_click_allowed_for_hand(hand):
                         is_pinching = True
+                        if self.click_lookback_ms > 0.0:
+                            hs.click_anchor_pos = hs.kinematics.lookup_position(
+                                timestamp_ms - self.click_lookback_ms
+                            )
+                        else:
+                            hs.click_anchor_pos = (cursor_out.x, cursor_out.y)
                 elif ev.type == "tap":
                     tap_act = hs.pose_sm.get_tap_action(ev.pose)
                     if tap_act == "left_click" and self._is_click_allowed_for_hand(hand):
@@ -462,8 +512,15 @@ class HandCursorEngine:
                             else:
                                 click_count = 1
                             is_clicking = True
+                            if hs.click_anchor_pos is not None:
+                                click_x, click_y = hs.click_anchor_pos
+                            else:
+                                click_x, click_y = cursor_out.x, cursor_out.y
                             hs.last_click_ms = timestamp_ms
                             hs.last_click_count = click_count
+                        hs.click_anchor_pos = None
+                        hs.dwell_lock_until_ms = 0.0
+                        hs.dwell_lock_pos = None
                     elif tap_act == "right_click" and self.enable_right_click and self._is_hand_allowed_for_click_actions(hand):
                         is_right_clicking = True
                 elif ev.type == "hold_start":
@@ -526,6 +583,8 @@ class HandCursorEngine:
                 is_pinching=is_pinching,
                 is_clicking=is_clicking,
                 click_count=click_count,
+                click_x=click_x,
+                click_y=click_y,
                 is_right_clicking=is_right_clicking,
                 is_grabbing=hs.is_grabbing,
                 grab_just_started=grab_started,

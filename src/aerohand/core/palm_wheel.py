@@ -251,6 +251,22 @@ class PalmWheelOutput:
     )
 
 
+_REPEATABLE_ACTIONS = frozenset({
+    "volume_up",
+    "volume_down",
+    "volume_mute",
+    "media_next",
+    "media_prev",
+    "media_play_pause",
+    "edit_copy",
+    "edit_paste",
+    "edit_cut",
+    "edit_undo",
+    "edit_redo",
+    "recenter",
+})
+
+
 class PalmWheelDetector:
     """Open-palm 5-finger radial quick-menu detector with multi-level Submenus."""
 
@@ -260,7 +276,9 @@ class PalmWheelDetector:
         self._activation_start_ms: Optional[float] = None
         self._activation_anchor: Optional[Tuple[float, float]] = None
         self._confirm_start_ms: Optional[float] = None
+        self._confirm_stay_open: bool = True
         self._last_action_ms: float = -1e9
+        self._cooldown_override_ms: float = 0.0
         self._last_open_palm_ms: Optional[float] = None
         self._open_palm_stable: bool = False
         self._selected_finger: Optional[FingerName] = None
@@ -345,8 +363,10 @@ class PalmWheelDetector:
             self.reset()
             return PalmWheelOutput()
 
-        if self._state == "inactive" and (timestamp_ms - self._last_action_ms) < self.cooldown_ms:
+        active_cooldown = max(self.cooldown_ms, self._cooldown_override_ms)
+        if self._state == "inactive" and (timestamp_ms - self._last_action_ms) < active_cooldown:
             return PalmWheelOutput(state="inactive")
+        self._cooldown_override_ms = 0.0
 
         cyl = calculate_radial_cylinder(landmarks, radius_multiplier=self.cylinder_radius_multiplier)
         if cyl is None:
@@ -460,6 +480,7 @@ class PalmWheelDetector:
                         self._menu_stack.append((label, dict(items)))
                         self._state = "confirmed"
                         self._confirm_start_ms = timestamp_ms
+                        self._confirm_stay_open = True
                         out.state = "confirmed"
                         out.selected_finger = fname
                         out.menu_path = self._current_menu_path()
@@ -473,6 +494,7 @@ class PalmWheelDetector:
                             self._menu_stack.pop()
                         self._state = "confirmed"
                         self._confirm_start_ms = timestamp_ms
+                        self._confirm_stay_open = True
                         out.state = "confirmed"
                         out.selected_finger = fname
                         out.menu_path = self._current_menu_path()
@@ -483,6 +505,9 @@ class PalmWheelDetector:
                     self._state = "confirmed"
                     self._confirm_start_ms = timestamp_ms
                     self._last_action_ms = timestamp_ms
+                    self._confirm_stay_open = action in _REPEATABLE_ACTIONS
+                    if not self._confirm_stay_open:
+                        self._cooldown_override_ms = 750.0
                     out.state = "confirmed"
                     out.selected_finger = fname
                     out.triggered_action = action
@@ -495,14 +520,14 @@ class PalmWheelDetector:
             c_start = self._confirm_start_ms if self._confirm_start_ms is not None else timestamp_ms
             elapsed = timestamp_ms - c_start
             if elapsed >= self.confirmation_hold_ms:
-                # Airpoint stay-open behavior: keep menu open if user still holds palm open!
-                if open_now:
+                # Stay open for submenus & repeatable actions; auto-close for toggle/modal actions
+                if self._confirm_stay_open and open_now:
                     self._state = "active"
                     self._selected_finger = None
                     self._finger_pressed = {f: False for f, _, _, _ in _FINGER_TIP_MAP}
                     out.state = "active"
                     out.selected_finger = None
-                else:
+                elif self._confirm_stay_open:
                     within_grace = (
                         self.confirmation_grace_ms > 0.0
                         and self._last_open_palm_ms is not None
@@ -513,5 +538,10 @@ class PalmWheelDetector:
                         out.state = "inactive"
                         out.progress = 0.0
                         out.selected_finger = None
+                else:
+                    self.reset()
+                    out.state = "inactive"
+                    out.progress = 0.0
+                    out.selected_finger = None
 
         return out

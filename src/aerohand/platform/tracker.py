@@ -47,7 +47,7 @@ class MediaPipeHandTracker:
         min_hand_detection_confidence: float = 0.55,
         min_hand_presence_confidence: float = 0.55,
         min_tracking_confidence: float = 0.55,
-        delegate: str = "GPU",
+        delegate: str = "CPU",
         mirror_handedness: bool = True,
     ) -> None:
         self.model_path = str(resolve_model_path(model_path))
@@ -100,10 +100,10 @@ class MediaPipeHandTracker:
         self._last_ts_ms = timestamp_ms
 
         if self._delegate_used == "GPU":
-            frame_rgba = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA)
+            frame_rgba = np.ascontiguousarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGBA))
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGBA, data=frame_rgba)
         else:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+            frame_rgb = np.ascontiguousarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
             mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
 
         res = self._landmarker.detect_for_video(mp_img, timestamp_ms)

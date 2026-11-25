@@ -527,12 +527,19 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       <!-- 7. ML STUDIO & PROFILER -->
       <div id="tab-ml" class="tab-pane">
         <div class="card">
-          <div class="card-title"><span>BỘ PHÂN LOẠI CỬ CHỈ (HEURISTIC 3D vs. ONNX TCN)</span></div>
+          <div class="card-title"><span>BỘ PHÂN LOẠI CỬ CHỈ & TRACKER DELEGATE</span></div>
           <div class="row">
-            <div class="row-label"><strong>Backend đang chạy</strong><span id="ml-model-status">Heuristic 3D (Sẵn sàng không cần dữ liệu)</span></div>
+            <div class="row-label"><strong>Bộ phân loại Pinch</strong><span id="ml-model-status">Heuristic 3D (Sẵn sàng không cần dữ liệu)</span></div>
             <select id="cfg-cls-backend" onchange="setKey('classifier.backend', this.value)">
               <option value="heuristic_3d">Heuristic 3D (Mặc định)</option>
               <option value="onnx_tcn">ONNX 1D-TCN (Model tự huấn luyện)</option>
+            </select>
+          </div>
+          <div class="row">
+            <div class="row-label"><strong>MediaPipe Delegate</strong><span>CPU XNNPACK (0 rò rỉ RAM, ổn định 24/7 trên macOS)</span></div>
+            <select id="cfg-trk-del" onchange="setKey('tracker.delegate', this.value)">
+              <option value="CPU">CPU XNNPACK (Khuyên dùng — Ổn định)</option>
+              <option value="GPU">GPU Metal (Thử nghiệm — có thể rò RAM MediaPipe)</option>
             </select>
           </div>
         </div>
@@ -807,6 +814,8 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
 
     // ML Studio
     document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");
+    const delSel = document.getElementById("cfg-trk-del");
+    if (delSel) delSel.value = getPath(c, "tracker.delegate", "CPU");
     document.getElementById("col-pose-sel").innerHTML = POSE_KEYS
       .map((p, idx) => `<option value="${p}">[${idx}] ${poses[p] || p}</option>`).join("");
 
@@ -867,7 +876,8 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
 
     // Stats
     document.getElementById("st-fps").textContent = (snap.fps || 0).toFixed(1) + " FPS";
-    document.getElementById("st-del").textContent = (snap.delegate || "CPU") + " Metal • " + (snap.hands_count || 0) + (isVi ? " tay" : " hand(s)");
+    const delLbl = (snap.delegate === "GPU") ? "GPU Metal" : "CPU XNNPACK";
+    document.getElementById("st-del").textContent = delLbl + " • " + (snap.hands_count || 0) + (isVi ? " tay" : " hand(s)");
     const t = snap.timing || {};
     document.getElementById("st-lat").textContent = (t.total_ms || 0).toFixed(1) + " ms";
     document.getElementById("st-cls").textContent = snap.classifier_name || "Heuristic 3D";

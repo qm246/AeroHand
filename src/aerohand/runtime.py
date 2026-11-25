@@ -329,7 +329,7 @@ class AeroHandRuntime:
         new_trk = effective.get("tracker") or {}
         if (
             int(new_trk.get("num_hands", 2)) != int(old_trk.get("num_hands", 2))
-            or str(new_trk.get("delegate", "GPU")) != str(old_trk.get("delegate", "GPU"))
+            or str(new_trk.get("delegate", "CPU")) != str(old_trk.get("delegate", "CPU"))
         ):
             self._restart_tracker_event.set()
 
@@ -728,7 +728,7 @@ class AeroHandRuntime:
             min_hand_detection_confidence=float(trk_cfg.get("min_hand_detection_confidence", 0.55)),
             min_hand_presence_confidence=float(trk_cfg.get("min_hand_presence_confidence", 0.55)),
             min_tracking_confidence=float(trk_cfg.get("min_tracking_confidence", 0.55)),
-            delegate=str(trk_cfg.get("delegate", "GPU")),
+            delegate=str(trk_cfg.get("delegate", "CPU")),
             mirror_handedness=self.mirror,
         )
 
@@ -773,7 +773,26 @@ class AeroHandRuntime:
                 f"delegate={tracker.delegate_used} | display={int(self._screen_w)}x{int(self._screen_h)})"
             )
 
-            camera.start()
+            # Wait gracefully while user grants macOS Camera permission on first launch
+            cam_started = False
+            while not self._stop_event.is_set() and not cam_started:
+                try:
+                    camera.start()
+                    cam_started = True
+                except RuntimeError as cam_exc:
+                    logger.warning(f"[CAMERA] Waiting for camera access ({cam_exc}); retrying in 1.5s...")
+                    with self._snapshot_lock:
+                        self._snapshot = RuntimeSnapshot(
+                            running=False,
+                            dry_run=self.dry_run,
+                            delegate=tracker.delegate_used,
+                            permissions=check_all_permissions(),
+                            last_action="Waiting for Camera permission...",
+                            error=str(cam_exc),
+                        )
+                    self._stop_event.wait(timeout=1.5)
+            if not cam_started:
+                return
             last_hand_wall = time.monotonic()
             fps_ema = 30.0
             prev_wall = time.monotonic()

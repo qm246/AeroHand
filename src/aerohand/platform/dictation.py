@@ -226,7 +226,13 @@ class VoiceDictationController:
         if not chunks:
             return
         audio = np.concatenate(chunks, axis=0)
-        if audio.size < int(SAMPLE_RATE * 0.20):
+        # Skip ultra-short or silent accidental pinches (< 0.35s or below speech noise floor)
+        if audio.size < int(SAMPLE_RATE * 0.35):
+            return
+        peak = float(np.max(np.abs(audio)))
+        rms = float(np.sqrt(np.mean(audio * audio)))
+        if peak < 0.015 or rms < 0.003:
+            logger.debug(f"[DICTATION] Skipped silent clip (peak={peak:.4f}, rms={rms:.4f})")
             return
 
         threading.Thread(target=self._run_transcription, args=(audio,), daemon=True).start()

@@ -702,12 +702,13 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self._menu_items["open_acc"].setTitle_(mtxt.get("open_acc", "Accessibility"))
         self._menu_items["quit"].setTitle_(mtxt.get("quit", "Quit"))
 
-        # 2. Floating Camera HUD image (20 Hz)
+        # 2. Floating Camera HUD image (20 Hz) — explicit autorelease pool avoids ObjC bitmap buildup
         if hud_vis and snap.frame_bgr is not None and self.camera_image_view is not None:
             pw, ph = self._hud_size_px
-            ns_img = _bgr_to_nsimage(snap.frame_bgr, pw, ph)
-            if ns_img is not None:
-                self.camera_image_view.setImage_(ns_img)
+            with objc.autorelease_pool():
+                ns_img = _bgr_to_nsimage(snap.frame_bgr, pw, ph)
+                if ns_img is not None:
+                    self.camera_image_view.setImage_(ns_img)
 
         # 3. Transparent Screen Overlay (20 Hz for silky Palm Wheel & Click Pulse)
         if self._overlay_ready and self.overlay_webview is not None:

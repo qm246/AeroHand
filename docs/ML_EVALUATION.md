@@ -56,22 +56,32 @@ AeroHand **không bao giờ lưu điểm ảnh camera** — chỉ lưu tọa đ�
 
 ## 3. So sánh A/B: `invariant348` vs `airmouse885`
 
-### Lệnh chạy so sánh đa hạt giống (3 seed: `42, 1337, 2026`)
+### Lệnh chạy so sánh đa hạt giống trên kho hợp nhất (3 seed: `42, 1337, 2026` — `V050-03`)
 ```bash
 cd /Users/macos/Documents/AeroHand
 uv sync --extra train
+
+# 1. Kiểm tra lệch miền (KS-test) giữa kho GestureCtl đã quy đổi và phiên AeroHand mới
+uv run python scripts/domain_check.py \
+  --a data/converted/negatives \
+  --b data/sessions
+
+# 2. Huấn luyện & so sánh A/B trên kho hợp nhất (cân bằng kịch bản <= 15%, tách subject-held-out)
 uv run python scripts/train_tcn.py \
   --ab-compare \
   --ab-seeds 42,1337,2026 \
-  --sessions data/sessions \
-  --negatives-dir data/negatives \
+  --sessions data/sessions data/converted/positives \
+  --negatives-dir data/negatives data/converted/negatives \
+  --ab-eval-negatives data/converted/negatives/gctl_d_dev_*.json \
+  --max-idle-scenario-share 0.15 \
+  --primary-subject minh \
   --out-dir models \
   --loss focal \
   --augment
 ```
 
 Kết quả được xuất ra `models/ab_report.json` chứa:
-- Trung bình và độ lệch chuẩn (`mean` / `std`) của `macro_f1`, `val_accuracy`, `idle_fp_rate` cho cả `invariant348` và `airmouse885`.
+- Trung bình và độ lệch chuẩn (`mean` / `std`) của `macro_f1`, `val_accuracy`, `idle_fp_rate`, `selection_score` (`macro_f1 - 0.5 * idle_fp_rate`), `ft_per_hour` và `ft_upper_bound_per_hour` (95% Poisson UCB) cho cả `invariant348` và `airmouse885`.
 - Phân tích lỗi từng cặp dễ nhầm lẫn:
   - `thumb_middle_pinch <-> thumb_index_middle_pinch`
   - `thumb_ring_pinch <-> thumb_pinky_pinch`
@@ -79,12 +89,13 @@ Kết quả được xuất ra `models/ab_report.json` chứa:
   - `thumb_index_pinch <-> idle`
 - Trường `decision` ghi rõ tập đặc trưng được chọn.
 
-### Quy tắc ra quyết định (Decision Rule)
+### Quy tắc ra quyết định (`V050-03` Decision Rule)
+- **Bắt buộc đủ cả 7 lớp chuẩn** trong tập validation (nếu thiếu lớp, `validate_validation_classes` từ chối huấn luyện trừ khi chỉ định `--allow-missing-val-classes` cho smoke test).
 - **Mặc định giữ `invariant348`** (bất biến xoay/tịnh tiến/tỷ lệ trong hệ tọa độ lòng bàn tay 3D, kích thước gọn và suy luận nhanh).
 - **Chỉ chuyển sang `airmouse885`** nếu đồng thời thỏa mãn:
   1. `macro_f1_mean(airmouse885) - macro_f1_mean(invariant348) > +0.02` (vượt trội trên 2 điểm phần trăm).
   2. `idle_fp_rate_mean(airmouse885) <= idle_fp_rate_mean(invariant348)` (không làm tăng báo động giả ở trạng thái nghỉ).
-  3. Không làm tăng tổng số kích hoạt nhầm trên giờ (`total_ft_per_hour`) trên bộ kiểm thử hồi quy ngoại tuyến.
+  3. Không làm tăng `total_ft_per_hour` **và** không làm tăng cận trên 95% Poisson `ft_upper_bound_per_hour` trên bộ kiểm thử hồi quy ngoại tuyến.
 
 ---
 

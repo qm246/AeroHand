@@ -3601,3 +3601,76 @@ def test_balanced_sampler_caps_scenario_share():
     dev_b, ho_b = mod.split_subject_heldout(bundles + [b_vol], primary_subject="minh")
     assert len(ho_b) == 1 and ho_b[0].subject == "volunteer_a"
     assert all(b.subject == "minh" for b in dev_b)
+
+
+
+def test_ab_selection_rule_respects_ft_and_f1():
+    mod = _load_train_tcn_module("train_tcn_ab_v050")
+
+    # 1. airmouse885 wins macro-F1 by +0.03 and keeps idle_fp & ft_per_hour flat,
+    #    BUT increases 95% Poisson UCB (`ft_upper_bound_per_hour`) -> MUST retain invariant348!
+    d_ucb_reg = mod.evaluate_ab_decision(
+        {
+            "macro_f1_mean": 0.90,
+            "idle_fp_rate_mean": 0.01,
+            "ft_per_hour_mean": 1.0,
+            "ft_upper_bound_per_hour_mean": 1.8,
+        },
+        {
+            "macro_f1_mean": 0.935,
+            "idle_fp_rate_mean": 0.01,
+            "ft_per_hour_mean": 1.0,
+            "ft_upper_bound_per_hour_mean": 2.4,
+        },
+    )
+    assert d_ucb_reg["winner"] == "invariant348"
+    assert "ft_upper_bound_per_hour" in d_ucb_reg["reason"]
+
+    # 2. airmouse885 wins macro-F1 by +0.03 and does NOT increase idle_fp, ft/h, or 95% UCB -> airmouse885 wins!
+    d_win = mod.evaluate_ab_decision(
+        {
+            "macro_f1_mean": 0.90,
+            "idle_fp_rate_mean": 0.012,
+            "ft_per_hour_mean": 1.2,
+            "ft_upper_bound_per_hour_mean": 1.9,
+        },
+        {
+            "macro_f1_mean": 0.935,
+            "idle_fp_rate_mean": 0.010,
+            "ft_per_hour_mean": 0.9,
+            "ft_upper_bound_per_hour_mean": 1.7,
+        },
+    )
+    assert d_win["winner"] == "airmouse885"
+    assert d_win["selection_score_delta"] > 0.02
+
+    # 3. aggregate_seed_metrics carries ft_upper_bound_per_hour_mean cleanly
+    agg = mod.aggregate_seed_metrics(
+        [
+            {"macro_f1": 0.91, "val_accuracy": 0.92, "idle_fp_rate": 0.01, "ft_per_hour": 1.0, "ft_upper_bound_per_hour": 1.9},
+            {"macro_f1": 0.93, "val_accuracy": 0.94, "idle_fp_rate": 0.01, "ft_per_hour": 0.8, "ft_upper_bound_per_hour": 1.7},
+        ]
+    )
+    assert agg["ft_upper_bound_per_hour_mean"] == pytest.approx(1.8, abs=1e-3)
+
+
+def test_validation_requires_all_classes():
+    mod = _load_train_tcn_module("train_tcn_val_cls")
+    h = _make_open_hand()
+
+    def _bundle_with_labels(name: str, lbls: List[int]):
+        wins = [[mod.ParsedSample(l_i, h, h, "Right", "Right", 0.0)] * 5 for l_i in lbls]
+        return mod.SessionBundle(name, name, wins, np.asarray(lbls, dtype=np.int64))
+
+    # Missing classes 5 & 6 -> MUST raise ValueError by default
+    partial = [_bundle_with_labels("partial", [0, 1, 2, 3, 4])]
+    with pytest.raises(ValueError, match="missing canonical classes"):
+        mod.validate_validation_classes(partial, allow_missing=False)
+
+    # allow_missing=True returns the missing class names without raising
+    missing = mod.validate_validation_classes(partial, allow_missing=True)
+    assert len(missing) == 2
+
+    # All 7 canonical classes present -> passes cleanly with empty missing list
+    complete = [_bundle_with_labels("complete", list(range(mod.NUM_CLASSES)))]
+    assert mod.validate_validation_classes(complete, allow_missing=False) == []

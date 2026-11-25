@@ -651,6 +651,28 @@ def split_session_groups(
     return train_bundles, val_bundles, missing
 
 
+def validate_validation_classes(
+    val_bundles: Sequence[SessionBundle],
+    *,
+    allow_missing: bool = False,
+    num_classes: int = NUM_CLASSES,
+) -> List[str]:
+    """
+    Verify that all `num_classes` canonical pose classes are present in validation bundles (V050-03).
+    Returns missing class names; raises `ValueError` if any class is missing and `allow_missing=False`.
+    """
+    present: set[int] = set()
+    for b in val_bundles:
+        present.update(int(x) for x in b.labels.tolist())
+    missing = [ALL_POSE_NAMES[i].value for i in range(num_classes) if i not in present]
+    if missing and not allow_missing:
+        raise ValueError(
+            f"Validation split is missing canonical classes: {missing}. "
+            "Record sessions covering all 7 classes (or pass --allow-missing-val-classes for smoke runs)."
+        )
+    return missing
+
+
 def compute_classification_metrics(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -744,7 +766,9 @@ def aggregate_seed_metrics(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "val_accuracy_mean": 0.0,
             "idle_fp_rate_mean": 0.0,
             "idle_fp_rate_std": 0.0,
+            "selection_score_mean": 0.0,
             "ft_per_hour_mean": None,
+            "ft_upper_bound_per_hour_mean": None,
             "confusable_pairs_mean": {},
             "runs": [],
         }
@@ -752,7 +776,16 @@ def aggregate_seed_metrics(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     f1s = [float(r.get("macro_f1", 0.0)) for r in runs]
     accs = [float(r.get("val_accuracy", 0.0)) for r in runs]
     ifps = [float(r.get("idle_fp_rate", 0.0)) for r in runs]
+    sel_scores = [
+        float(r.get("selection_score", float(r.get("macro_f1", 0.0)) - 0.5 * float(r.get("idle_fp_rate", 0.0))))
+        for r in runs
+    ]
     fts = [float(r["ft_per_hour"]) for r in runs if r.get("ft_per_hour") is not None]
+    ft_ucbs = [
+        float(r["ft_upper_bound_per_hour"])
+        for r in runs
+        if r.get("ft_upper_bound_per_hour") is not None
+    ]
 
     pair_totals: Dict[str, List[float]] = {}
     for r in runs:
@@ -769,7 +802,9 @@ def aggregate_seed_metrics(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "val_accuracy_mean": round(float(np.mean(accs)), 4),
         "idle_fp_rate_mean": round(float(np.mean(ifps)), 4),
         "idle_fp_rate_std": round(float(np.std(ifps)), 4),
+        "selection_score_mean": round(float(np.mean(sel_scores)), 4),
         "ft_per_hour_mean": round(float(np.mean(fts)), 3) if fts else None,
+        "ft_upper_bound_per_hour_mean": round(float(np.mean(ft_ucbs)), 3) if ft_ucbs else None,
         "confusable_pairs_mean": {
             k: round(float(np.mean(vs)), 2) for k, vs in pair_totals.items()
         },
@@ -784,35 +819,47 @@ def evaluate_ab_decision(
     min_f1_gain: float = 0.02,
 ) -> Dict[str, Any]:
     """
-    Documented V040-03 feature-set selection rule:
+    Documented V040-03 / V050-03 feature-set selection rule:
       - Default to `invariant348` (3D rotation/scale invariant, compact).
       - Switch to `airmouse885` ONLY if it improves `macro_f1_mean` by strictly more than
-        `min_f1_gain` (+0.02) AND does not increase `idle_fp_rate_mean` or `ft_per_hour_mean`.
+        `min_f1_gain` (+0.02) AND does not increase `idle_fp_rate_mean`, `ft_per_hour_mean`,
+        or `ft_upper_bound_per_hour_mean` (95% Poisson UCB).
     """
     f1_348 = float(summary_348.get("macro_f1_mean", 0.0))
     f1_885 = float(summary_885.get("macro_f1_mean", 0.0))
     fp_348 = float(summary_348.get("idle_fp_rate_mean", 0.0))
     fp_885 = float(summary_885.get("idle_fp_rate_mean", 0.0))
+    sel_348 = float(summary_348.get("selection_score_mean", f1_348 - 0.5 * fp_348))
+    sel_885 = float(summary_885.get("selection_score_mean", f1_885 - 0.5 * fp_885))
     ft_348 = summary_348.get("ft_per_hour_mean")
     ft_885 = summary_885.get("ft_per_hour_mean")
+    ucb_348 = summary_348.get("ft_upper_bound_per_hour_mean")
+    ucb_885 = summary_885.get("ft_upper_bound_per_hour_mean")
 
     f1_delta = round(f1_885 - f1_348, 4)
     fp_delta = round(fp_885 - fp_348, 4)
+    sel_delta = round(sel_885 - sel_348, 4)
     ft_delta = (
         round(float(ft_885) - float(ft_348), 3)
         if (ft_348 is not None and ft_885 is not None)
+        else None
+    )
+    ucb_delta = (
+        round(float(ucb_885) - float(ucb_348), 3)
+        if (ucb_348 is not None and ucb_885 is not None)
         else None
     )
 
     f1_beats = f1_delta > float(min_f1_gain)
     fp_ok = fp_885 <= fp_348 + 1e-9
     ft_ok = True if (ft_delta is None) else (ft_delta <= 1e-9)
+    ucb_ok = True if (ucb_delta is None) else (ucb_delta <= 1e-9)
 
-    if f1_beats and fp_ok and ft_ok:
+    if f1_beats and fp_ok and ft_ok and ucb_ok:
         winner = "airmouse885"
         reason = (
             f"airmouse885 beat invariant348 by +{f1_delta:.4f} macro-F1 (> {min_f1_gain:.2f}) "
-            "without raising idle FP rate or FT/hour."
+            "without raising idle FP rate, FT/hour, or FT 95% UCB."
         )
     else:
         winner = "invariant348"
@@ -823,6 +870,8 @@ def evaluate_ab_decision(
             reasons.append(f"idle_fp_rate increased by {fp_delta:+.4f}")
         if not ft_ok and ft_delta is not None:
             reasons.append(f"ft_per_hour increased by {ft_delta:+.3f}")
+        if not ucb_ok and ucb_delta is not None:
+            reasons.append(f"ft_upper_bound_per_hour increased by {ucb_delta:+.3f}")
         reason = "Retained default invariant348 (" + "; ".join(reasons) + ")."
 
     return {
@@ -830,7 +879,9 @@ def evaluate_ab_decision(
         "min_f1_gain_required": float(min_f1_gain),
         "macro_f1_delta": f1_delta,
         "idle_fp_delta": fp_delta,
+        "selection_score_delta": sel_delta,
         "ft_per_hour_delta": ft_delta,
+        "ft_upper_bound_delta": ucb_delta,
         "reason": reason,
     }
 
@@ -914,12 +965,14 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             pt = torch.exp(-F.cross_entropy(logits, target, reduction="none"))
             return (((1.0 - pt) ** self.gamma) * ce).mean()
 
-    sessions_dir = Path(args.sessions)
-    assert_not_heldout(sessions_dir)
-    files = collect_json_paths([sessions_dir]) if sessions_dir.exists() else []
+    raw_sessions = args.sessions if isinstance(args.sessions, (list, tuple)) else [args.sessions]
+    session_inputs = [Path(s) for s in raw_sessions if s]
+    for sp in session_inputs:
+        assert_not_heldout(sp)
+    files = collect_json_paths([sp for sp in session_inputs if sp.exists()])
     if not files:
         raise SystemExit(
-            f"No session JSON files found in {sessions_dir}.\n"
+            f"No session JSON files found in {[str(p) for p in session_inputs]}.\n"
             "Record labeled data first inside AeroHand.app -> 'Dữ liệu ML' tab (or `aerohand run --collect-dir data/sessions`)."
         )
 
@@ -931,9 +984,15 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             bundles.append(b)
 
     if args.negatives_dir:
-        neg_dir = Path(args.negatives_dir)
-        assert_not_heldout(neg_dir)
-        for fp in collect_json_paths([neg_dir]):
+        raw_negs = (
+            args.negatives_dir
+            if isinstance(args.negatives_dir, (list, tuple))
+            else [args.negatives_dir]
+        )
+        neg_inputs = [Path(n) for n in raw_negs if n]
+        for np_dir in neg_inputs:
+            assert_not_heldout(np_dir)
+        for fp in collect_json_paths([p for p in neg_inputs if p.exists()]):
             b = load_session_bundle(
                 fp, seq_len=args.seq_len, force_idle=True, max_gap_ms=args.max_gap_ms, skip_stats=skip_stats
             )
@@ -958,14 +1017,15 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     if not dev_bundles:
         raise SystemExit("No development bundles remain after subject-held-out filtering.")
 
-    train_bundles, val_bundles, missing_val = split_session_groups(dev_bundles, val_ratio=args.val_ratio)
+    train_bundles, val_bundles, _ = split_session_groups(dev_bundles, val_ratio=args.val_ratio)
+    try:
+        missing_val = validate_validation_classes(
+            val_bundles, allow_missing=bool(args.allow_missing_val_classes)
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Aborting: {exc}") from None
     if missing_val:
         print(f"[WARN] Validation split is missing classes: {missing_val}")
-        if not args.allow_missing_val_classes:
-            raise SystemExit(
-                f"Aborting: validation set missing canonical classes {missing_val}. "
-                "Record more sessions covering all 7 classes (or pass --allow-missing-val-classes for smoke runs)."
-            )
 
     max_sc_share = float(getattr(args, "max_idle_scenario_share", 0.15))
     balance_stats: Dict[str, Any] = {}
@@ -1170,10 +1230,26 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
 
 def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
     """Train & compare `invariant348` vs `airmouse885` across multiple seeds and write `ab_report.json`."""
+    import importlib.util
+
     seeds = [int(s.strip()) for s in str(args.ab_seeds).split(",") if s.strip()]
     if not seeds:
         seeds = list(AB_DEFAULT_SEEDS)
 
+    eval_neg_paths = (
+        collect_json_paths(args.ab_eval_negatives)
+        if getattr(args, "ab_eval_negatives", None)
+        else []
+    )
+    replay_mod = None
+    if eval_neg_paths:
+        rfp = Path(__file__).resolve().parent / "replay_eval.py"
+        spec = importlib.util.spec_from_file_location("_aerohand_replay_eval_ab", rfp)
+        if spec is not None and spec.loader is not None:
+            replay_mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(replay_mod)
+
+    out_dir = Path(args.out_dir)
     runs_by_fs: Dict[str, List[Dict[str, Any]]] = {"invariant348": [], "airmouse885": []}
     for fs in ("invariant348", "airmouse885"):
         for sd in seeds:
@@ -1183,10 +1259,27 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
             run_args.name = f"{args.name}_{fs}_s{sd}"
             m = train_and_export(run_args)
             m["seed"] = sd
+            if replay_mod is not None and eval_neg_paths:
+                from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+
+                clf = ONNXPinchClassifier(
+                    model_path=out_dir / f"{run_args.name}.onnx",
+                    normalizer_path=out_dir / f"{run_args.name}_normalizer.json",
+                    sequence_length=args.seq_len,
+                    feature_set=fs,
+                )
+                rep = replay_mod.evaluate_recordings(
+                    negative_paths=eval_neg_paths,
+                    classifier=clf,
+                    backend_name="onnx_tcn",
+                    min_exposure_hours_for_claim=0.0,
+                    max_ft_per_hour=1e9,
+                )
+                m["ft_per_hour"] = rep["false_triggers"]["total_ft_per_hour"]
+                m["ft_upper_bound_per_hour"] = rep["false_triggers"]["total_upper_bound_per_hour"]
             runs_by_fs[fs].append(m)
 
     report = build_ab_report(runs_by_fs["invariant348"], runs_by_fs["airmouse885"], seeds=seeds)
-    out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ab_fp = out_dir / "ab_report.json"
     ab_fp.write_text(json.dumps(report, indent=2), encoding="utf-8")
@@ -1197,13 +1290,29 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
 
 def main() -> None:
     p = argparse.ArgumentParser(description="Train AeroHand Causal 1D-TCN and export ONNX + metrics.")
-    p.add_argument("--sessions", type=str, default="data/sessions", help="Directory containing collected JSON sessions")
-    p.add_argument("--negatives-dir", type=str, default=None, help="Optional directory of hard-negative JSON recordings")
+    p.add_argument(
+        "--sessions",
+        nargs="+",
+        default=["data/sessions"],
+        help="One or more directories/files containing collected JSON sessions",
+    )
+    p.add_argument(
+        "--negatives-dir",
+        nargs="*",
+        default=None,
+        help="Optional directories/files of hard-negative JSON recordings",
+    )
     p.add_argument("--out-dir", type=str, default="models", help="Output directory for .onnx, normalizer, and metrics.json")
     p.add_argument("--name", type=str, default="aerohand_tcn", help="Base filename for exported artifacts")
     p.add_argument("--feature-set", choices=["invariant348", "airmouse885"], default="invariant348")
     p.add_argument("--ab-compare", action="store_true", help="Run multi-seed A/B evaluation comparing invariant348 vs airmouse885")
     p.add_argument("--ab-seeds", type=str, default="42,1337,2026", help="Comma-separated seeds for --ab-compare")
+    p.add_argument(
+        "--ab-eval-negatives",
+        nargs="*",
+        default=None,
+        help="Optional offline negative recordings used to compute FT/hour & 95% UCB per A/B seed",
+    )
     p.add_argument("--loss", choices=["ce", "focal", "ls"], default="focal")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Enable landmark augmentation (default on)")
     p.add_argument("--augment-factor", type=int, default=2, help="Total training expansion factor when --augment is on")

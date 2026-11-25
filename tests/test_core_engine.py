@@ -433,3 +433,153 @@ def test_ax_tile_rects_i18n_audio_and_local_control_api(tmp_path: Path):
         assert state["tracking"] is False
     finally:
         srv.stop()
+
+
+class _FakeInputCtl:
+    def __init__(self) -> None:
+        self.events: List[str] = []
+        self.dry_run = False
+        self._pressed_mouse_buttons: set[str] = set()
+        self._pressed_keys: set[int] = set()
+        self.last_guard_reason = ""
+
+    def mouse_move(self, x: float, y: float, delta_x=None, delta_y=None) -> bool:
+        self.events.append("mouse_move")
+        return True
+
+    def mouse_click(self, x: float, y: float, button: str = "left", click_count: int = 1) -> bool:
+        self.events.append(f"mouse_click:{button}:{click_count}")
+        return True
+
+    def mouse_down(self, x: float, y: float, button: str = "left") -> bool:
+        self._pressed_mouse_buttons.add(button)
+        self.events.append(f"mouse_down:{button}")
+        return True
+
+    def mouse_up(self, x: float, y: float, button: str = "left") -> bool:
+        self._pressed_mouse_buttons.discard(button)
+        self.events.append(f"mouse_up:{button}")
+        return True
+
+    def end_scroll_phase(self) -> None:
+        self.events.append("end_scroll_phase")
+
+    def release_all(self) -> None:
+        self._pressed_mouse_buttons.clear()
+        self._pressed_keys.clear()
+        self.events.append("release_all")
+
+
+def _make_hand_output(hand: str, *, grab_started: bool = False, is_grabbing: bool = False):
+    from aerohand.core.types import CursorOutput, HandOutput, PoseOutput
+
+    return HandOutput(
+        hand=hand,  # type: ignore[arg-type]
+        cursor=CursorOutput(hand=hand, x=500.0, y=500.0, is_pointing=True, is_valid=True),  # type: ignore[arg-type]
+        pose=PoseOutput(
+            hand=hand,  # type: ignore[arg-type]
+            pose=PoseName.THUMB_INDEX_MIDDLE_PINCH if is_grabbing else PoseName.IDLE,
+            active_pose=PoseName.THUMB_INDEX_MIDDLE_PINCH if is_grabbing else None,
+            grab_just_started=grab_started,
+            is_grabbing=is_grabbing,
+        ),
+    )
+
+
+def test_drag_released_when_only_secondary_hand_visible():
+    from aerohand.runtime import AeroHandRuntime
+
+    now = [1000.0]
+    cfg = load_config()
+    cfg["hand"]["cursor_hand"] = "Right"
+    cfg["runtime"]["hand_lost_release_ms"] = 350
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=False, clock_ms=lambda: now[0])
+    fake = _FakeInputCtl()
+    rt.input_ctl = fake  # type: ignore[assignment]
+
+    # Right hand starts drag at t=1000ms
+    right_drag = _make_hand_output("Right", grab_started=True, is_grabbing=True)
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([right_drag], right_drag, now[0])
+    assert fake.events.count("mouse_down:left") == 1
+    assert fake.events.count("release_all") == 0
+
+    # Only Left (secondary) hand remains visible; Right vanished -> primary is None
+    left_only = _make_hand_output("Left", grab_started=False, is_grabbing=False)
+    now[0] = 1200.0
+    rt._last_frame_ms = now[0]
+    primary = rt._select_primary_hand([left_only])
+    assert primary is None
+    rt._dispatch_actions([left_only], primary, now[0])
+    assert fake.events.count("release_all") == 0
+
+    # At t=1400ms (400ms without primary >= 350ms) -> release_all called exactly once
+    now[0] = 1400.0
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([left_only], None, now[0])
+    assert fake.events.count("release_all") == 1
+
+    # Subsequent ticks must NOT spam release_all
+    now[0] = 2000.0
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([left_only], None, now[0])
+    rt._enforce_input_safety(now[0])
+    assert fake.events.count("release_all") == 1
+
+
+def test_drag_released_on_camera_stall():
+    from aerohand.runtime import AeroHandRuntime
+
+    now = [5000.0]
+    cfg = load_config()
+    cfg["runtime"]["hand_lost_release_ms"] = 1000
+    cfg["runtime"]["camera_stall_release_ms"] = 500
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=False, clock_ms=lambda: now[0])
+    fake = _FakeInputCtl()
+    rt.input_ctl = fake  # type: ignore[assignment]
+
+    right_drag = _make_hand_output("Right", grab_started=True, is_grabbing=True)
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([right_drag], right_drag, now[0])
+    assert fake.events.count("mouse_down:left") == 1
+
+    # Camera stops yielding frames (cf.success == False -> _last_frame_ms does not advance)
+    now[0] = 5400.0
+    assert rt._enforce_input_safety(now[0]) is False
+    assert fake.events.count("release_all") == 0
+
+    now[0] = 5550.0
+    assert rt._enforce_input_safety(now[0]) is True
+    assert fake.events.count("release_all") == 1
+    # Calling again while nothing is held does nothing
+    now[0] = 6000.0
+    assert rt._enforce_input_safety(now[0]) is False
+    assert fake.events.count("release_all") == 1
+
+
+def test_max_drag_watchdog_runs_without_primary():
+    from aerohand.runtime import AeroHandRuntime
+
+    now = [1000.0]
+    cfg = load_config()
+    cfg["runtime"]["max_drag_duration_ms"] = 20000
+    cfg["runtime"]["hand_lost_release_ms"] = 999999
+    cfg["runtime"]["camera_stall_release_ms"] = 999999
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=False, clock_ms=lambda: now[0])
+    fake = _FakeInputCtl()
+    rt.input_ctl = fake  # type: ignore[assignment]
+
+    right_drag = _make_hand_output("Right", grab_started=True, is_grabbing=True)
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([right_drag], right_drag, now[0])
+    assert fake.events.count("mouse_down:left") == 1
+
+    # Exceed max_drag_duration_ms with primary=None -> watchdog still fires before early return!
+    now[0] = 22000.0
+    rt._last_frame_ms = now[0]
+    rt._dispatch_actions([], None, now[0])
+    assert fake.events.count("release_all") == 1
+    assert rt._drag_started_ms is None

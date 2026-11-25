@@ -304,6 +304,7 @@ runtime:
   idle_fps: 8.0
   max_drag_duration_ms: 20000
   hand_lost_release_ms: 350
+  camera_stall_release_ms: 500
 
 typing_guard:
   enabled: true

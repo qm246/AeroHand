@@ -148,6 +148,7 @@ class AeroHandRuntime:
         on_show_window: Optional[Callable[[], None]] = None,
         on_toggle_camera_hud: Optional[Callable[[], None]] = None,
         on_config_updated: Optional[Callable[[Dict[str, Any]], None]] = None,
+        clock_ms: Optional[Callable[[], float]] = None,
     ) -> None:
         self.base_config: Dict[str, Any] = deepcopy(config)
         self.config: Dict[str, Any] = deepcopy(config)
@@ -156,6 +157,7 @@ class AeroHandRuntime:
         self.render_hud_frames = bool(render_hud_frames or self.preview)
         self.collect_dir = Path(collect_dir) if collect_dir else (repo_root() / "data" / "sessions")
         self._cli_collect_mode = collect_dir is not None
+        self._clock_ms: Callable[[], float] = clock_ms or (lambda: time.monotonic() * 1000.0)
 
         self._on_show_window = on_show_window
         self._on_toggle_camera_hud = on_toggle_camera_hud
@@ -176,6 +178,7 @@ class AeroHandRuntime:
         self.idle_fps: float = float(rt_cfg.get("idle_fps", 8.0))
         self.max_drag_duration_ms: float = float(rt_cfg.get("max_drag_duration_ms", 20000.0))
         self.hand_lost_release_ms: float = float(rt_cfg.get("hand_lost_release_ms", 350.0))
+        self.camera_stall_release_ms: float = float(rt_cfg.get("camera_stall_release_ms", 500.0))
 
         cur_cfg = config.get("cursor") or {}
         self.enable_lerp_60hz: bool = bool(cur_cfg.get("enable_lerp_60hz", True))
@@ -205,6 +208,10 @@ class AeroHandRuntime:
 
         self._paused: bool = False
         self._drag_started_ms: Optional[float] = None
+        self._mouse_button_held: bool = False
+        self._is_scroll_held: bool = False
+        self._last_primary_ms: float = 0.0
+        self._last_frame_ms: float = 0.0
         self._last_hand_ms: float = 0.0
         self._hand_present_prev: bool = False
         self._screen_ox: float = 0.0
@@ -245,6 +252,8 @@ class AeroHandRuntime:
             with self._lerp_lock:
                 self._lerp_active = False
             self._drag_started_ms = None
+            self._mouse_button_held = False
+            self._is_scroll_held = False
             self.dictation.stop_and_transcribe()
             self.input_ctl.release_all()
             self._last_action_text = "Paused"
@@ -255,6 +264,9 @@ class AeroHandRuntime:
         self.dry_run = bool(dry_run)
         self.input_ctl.dry_run = self.dry_run
         if self.dry_run:
+            self._drag_started_ms = None
+            self._mouse_button_held = False
+            self._is_scroll_held = False
             self.input_ctl.release_all()
         self._last_action_text = "Mode: Dry-Run" if self.dry_run else "Mode: Live Control"
 
@@ -299,6 +311,14 @@ class AeroHandRuntime:
         cur = effective.get("cursor") or {}
         self.enable_lerp_60hz = bool(cur.get("enable_lerp_60hz", True))
         self._lerp.lerp_speed = float(cur.get("lerp_speed", 55.0))
+
+        rt_cfg = effective.get("runtime") or {}
+        self.idle_throttle_enabled = bool(rt_cfg.get("idle_throttle_enabled", True))
+        self.idle_timeout_s = float(rt_cfg.get("idle_timeout_s", 3.0))
+        self.idle_fps = float(rt_cfg.get("idle_fps", 8.0))
+        self.max_drag_duration_ms = float(rt_cfg.get("max_drag_duration_ms", 20000.0))
+        self.hand_lost_release_ms = float(rt_cfg.get("hand_lost_release_ms", 350.0))
+        self.camera_stall_release_ms = float(rt_cfg.get("camera_stall_release_ms", 500.0))
 
         self.engine.update_config(effective)
 
@@ -566,9 +586,72 @@ class AeroHandRuntime:
         elif action.startswith("open_app:"):
             self.input_ctl.open_app(action.split(":", 1)[1].strip())
 
+    def _now_ms(self) -> float:
+        return float(self._clock_ms())
+
+    def _has_held_input(self) -> bool:
+        pressed_btns = getattr(self.input_ctl, "_pressed_mouse_buttons", None)
+        pressed_keys = getattr(self.input_ctl, "_pressed_keys", None)
+        return (
+            self._drag_started_ms is not None
+            or self._mouse_button_held
+            or self._is_scroll_held
+            or bool(pressed_btns)
+            or bool(pressed_keys)
+        )
+
+    def _force_release_held_inputs(self, reason: str) -> None:
+        logger.warning(f"[SAFETY] {reason}; releasing all held inputs.")
+        self._drag_started_ms = None
+        self._mouse_button_held = False
+        if self._is_scroll_held:
+            self._is_scroll_held = False
+            self._scroll_acc_x = 0.0
+            self._scroll_acc_y = 0.0
+            self.input_ctl.end_scroll_phase()
+        self.input_ctl.release_all()
+        for hs in self.engine._hands.values():
+            hs.is_grabbing = False
+
+    def _enforce_input_safety(self, now_ms: Optional[float] = None) -> bool:
+        """
+        Level-triggered watchdog guaranteeing zero stuck mouse buttons or scroll phases
+        across primary-hand loss, secondary-hand-only views, max drag timeout, or camera stalls.
+        """
+        if not self._has_held_input():
+            return False
+        now = self._now_ms() if now_ms is None else float(now_ms)
+
+        if self._drag_started_ms is not None and (now - self._drag_started_ms) > self.max_drag_duration_ms:
+            self._force_release_held_inputs("Max drag duration exceeded")
+            return True
+
+        if (
+            (self._drag_started_ms is not None or self._mouse_button_held or self._is_scroll_held)
+            and self._last_primary_ms > 0.0
+            and (now - self._last_primary_ms) >= self.hand_lost_release_ms
+        ):
+            self._force_release_held_inputs(
+                f"Primary hand/pose absent for {now - self._last_primary_ms:.0f}ms"
+            )
+            return True
+
+        if self._last_frame_ms > 0.0 and (now - self._last_frame_ms) >= self.camera_stall_release_ms:
+            self._force_release_held_inputs(
+                f"Camera stalled for {now - self._last_frame_ms:.0f}ms while input held"
+            )
+            return True
+
+        return False
+
     def _dispatch_actions(self, outputs: List[HandOutput], primary: Optional[HandOutput], ts_ms: float) -> Optional[str]:
         """Dispatch OS events for Palm Wheels (both hands), Zoom, and primary cursor/gestures."""
         active_hint: Optional[str] = None
+        now_ms = float(ts_ms)
+
+        # Level-triggered max-drag check runs BEFORE any early return (even when primary is None)
+        if self._drag_started_ms is not None and (now_ms - self._drag_started_ms) > self.max_drag_duration_ms:
+            self._force_release_held_inputs("Max drag duration exceeded")
 
         # 1. Process Palm Wheel audio & actions across BOTH hands (even when paused, so user can unpause!)
         any_pw_active = False
@@ -600,12 +683,22 @@ class AeroHandRuntime:
             return "zoom"
 
         if primary is None:
+            self._enforce_input_safety(now_ms)
             return None
 
         p = primary.pose
         c = primary.cursor
         abs_x = self._screen_ox + c.x
         abs_y = self._screen_oy + c.y
+
+        if (
+            p.is_grabbing
+            or p.grab_just_started
+            or p.is_scrolling
+            or p.is_dictating
+            or p.active_pose is not None
+        ):
+            self._last_primary_ms = now_ms
 
         suppress_cursor = p.is_scrolling or p.is_spaces_nav or p.is_window_tiling or any_pw_active
         if c.is_pointing and c.is_valid and not suppress_cursor:
@@ -644,7 +737,11 @@ class AeroHandRuntime:
 
         if p.grab_just_started:
             self.audio.play_click_down()
-            self._drag_started_ms = ts_ms
+            self._drag_started_ms = now_ms
+            self._last_primary_ms = now_ms
+            if self._last_frame_ms <= 0.0:
+                self._last_frame_ms = now_ms
+            self._mouse_button_held = True
             self._last_action_text = "Drag Start"
             self._practice["drag"] = True
             self._emit_click_pulse("grab", abs_x, abs_y)
@@ -652,11 +749,8 @@ class AeroHandRuntime:
         elif p.grab_just_ended:
             self.audio.play_click_up()
             self._drag_started_ms = None
+            self._mouse_button_held = False
             self._last_action_text = "Drag Release"
-            self.input_ctl.mouse_up(abs_x, abs_y, button="left")
-        elif self._drag_started_ms is not None and (ts_ms - self._drag_started_ms) > self.max_drag_duration_ms:
-            logger.warning("[SAFETY] Max drag duration exceeded; auto-releasing mouse button.")
-            self._drag_started_ms = None
             self.input_ctl.mouse_up(abs_x, abs_y, button="left")
         if p.is_grabbing:
             active_hint = "grab"
@@ -686,6 +780,7 @@ class AeroHandRuntime:
             if sx != 0 or sy != 0:
                 self._scroll_acc_x -= sx
                 self._scroll_acc_y -= sy
+                self._is_scroll_held = True
                 self._last_action_text = f"Scroll ({sx:+d}, {sy:+d})"
                 self.input_ctl.scroll_pixels(
                     sy, sx, use_phases=scroll_use_phases, is_inertia=p.is_scroll_inertia
@@ -693,6 +788,8 @@ class AeroHandRuntime:
         else:
             self._scroll_acc_x = 0.0
             self._scroll_acc_y = 0.0
+            if self._is_scroll_held:
+                self._is_scroll_held = False
             self.input_ctl.end_scroll_phase()
 
         if p.is_spaces_nav:
@@ -798,11 +895,15 @@ class AeroHandRuntime:
             if not cam_started:
                 return
             last_hand_wall = time.monotonic()
+            self._last_frame_ms = self._now_ms()
             fps_ema = 30.0
             prev_wall = time.monotonic()
             last_slow_poll = time.monotonic()
 
             while not self._stop_event.is_set():
+                # Level-triggered stuck-input watchdog runs every iteration regardless of camera/hand state
+                self._enforce_input_safety(self._now_ms())
+
                 # Handle hot camera / tracker switches cleanly
                 if self._restart_camera_event.is_set():
                     self._restart_camera_event.clear()
@@ -843,8 +944,11 @@ class AeroHandRuntime:
 
                 cf = camera.read(timeout_s=0.04)
                 if not cf.success or cf.frame is None:
+                    self._enforce_input_safety(self._now_ms())
                     continue
 
+                frame_wall_ms = self._now_ms()
+                self._last_frame_ms = frame_wall_ms
                 dt_wall = max(1e-4, time.monotonic() - prev_wall)
                 prev_wall = time.monotonic()
                 fps_ema = 0.85 * fps_ema + 0.15 * (1.0 / dt_wall)
@@ -855,7 +959,7 @@ class AeroHandRuntime:
 
                 if hands:
                     last_hand_wall = time.monotonic()
-                    self._last_hand_ms = float(cf.timestamp_ms)
+                    self._last_hand_ms = frame_wall_ms
                     if not self._hand_present_prev:
                         cx, cy = get_current_cursor_position()
                         for h_inp in hands:
@@ -876,12 +980,6 @@ class AeroHandRuntime:
                         self._hand_present_prev = False
                         with self._lerp_lock:
                             self._lerp_active = False
-                    if (
-                        self._drag_started_ms is not None
-                        and (float(cf.timestamp_ms) - self._last_hand_ms) >= self.hand_lost_release_ms
-                    ):
-                        self._drag_started_ms = None
-                        self.input_ctl.release_all()
 
                 outputs = self.engine.process_frame(
                     hands,
@@ -891,7 +989,8 @@ class AeroHandRuntime:
                     frame_brightness=cf.brightness,
                 )
                 primary = self._select_primary_hand(outputs)
-                active_hint = self._dispatch_actions(outputs, primary, float(cf.timestamp_ms))
+                active_hint = self._dispatch_actions(outputs, primary, frame_wall_ms)
+                self._enforce_input_safety(frame_wall_ms)
 
                 t_ren0 = time.perf_counter()
                 vis_frame: Optional[np.ndarray] = None

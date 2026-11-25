@@ -124,12 +124,16 @@ class HandCursorEngine:
 
         sm_cfg = config.get("smoothing") or {}
         self.enable_landmark_smoothing: bool = bool(sm_cfg.get("enable_landmark_smoothing", True))
-        self.landmark_exclude_joints: List[int] = list(sm_cfg.get("landmark_exclude_joints") or [])
+        prev_excl = getattr(self, "landmark_exclude_joints", None)
+        new_excl = list(sm_cfg.get("landmark_exclude_joints") or [])
+        self.landmark_exclude_joints: List[int] = new_excl
         self.smoother.update_config(
             min_cutoff=float(sm_cfg.get("landmark_min_cutoff", 2.0)),
             beta=float(sm_cfg.get("landmark_beta", 45.0)),
             d_cutoff=float(sm_cfg.get("landmark_d_cutoff", 1.0)),
         )
+        if prev_excl is not None and prev_excl != new_excl:
+            self.smoother.reset()
 
         hand_cfg = config.get("hand") or {}
         self.cursor_hand: str = str(hand_cfg.get("cursor_hand", "Right"))

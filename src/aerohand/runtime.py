@@ -206,6 +206,9 @@ class AeroHandRuntime:
         self._restart_camera_event = threading.Event()
         self._restart_tracker_event = threading.Event()
         self._bg_thread: Optional[threading.Thread] = None
+        self._processing_thread_id: Optional[int] = None
+        self._config_lock = threading.Lock()
+        self._pending_cfg: Optional[Tuple[Dict[str, Any], bool]] = None
         self._snapshot_lock = threading.Lock()
         self._snapshot = RuntimeSnapshot(dry_run=self.dry_run)
 
@@ -299,9 +302,36 @@ class AeroHandRuntime:
         self._last_click_event = {"seq": self._click_seq, "kind": kind, "x": round(x, 1), "y": round(y, 1)}
 
     def apply_live_settings(self, config: Dict[str, Any], *, from_profile: bool = False) -> None:
+        """
+        Queue config updates from UI/HTTP threads to apply cleanly on the processing thread
+        at the start of the next frame (prevents cross-thread filter/engine races).
+        """
+        cfg_copy = deepcopy(config)
+        with self._config_lock:
+            if not from_profile:
+                self.base_config = deepcopy(cfg_copy)
+            proc_tid = self._processing_thread_id
+            if proc_tid is not None and threading.get_ident() != proc_tid:
+                self._pending_cfg = (cfg_copy, bool(from_profile))
+                return
+        self._apply_live_settings_now(cfg_copy, from_profile=from_profile)
+
+    def _flush_pending_config(self) -> bool:
+        """Swap and apply any queued configuration update on the processing thread."""
+        with self._config_lock:
+            pending = self._pending_cfg
+            self._pending_cfg = None
+        if pending is None:
+            return False
+        cfg, from_profile = pending
+        self._apply_live_settings_now(cfg, from_profile=from_profile)
+        return True
+
+    def _apply_live_settings_now(self, config: Dict[str, Any], *, from_profile: bool = False) -> None:
         """Apply any config update in realtime; restarts camera/tracker only when hardware params change."""
         if not from_profile:
-            self.base_config = deepcopy(config)
+            with self._config_lock:
+                self.base_config = deepcopy(config)
         effective = (
             config
             if from_profile
@@ -892,6 +922,8 @@ class AeroHandRuntime:
         )
 
     def _run_loop(self) -> None:
+        self._processing_thread_id = threading.get_ident()
+        self._flush_pending_config()
         perms = check_all_permissions()
         acc_ok = True if self.dry_run else perms.get("accessibility", False)
         self._refresh_display_bounds()
@@ -944,6 +976,8 @@ class AeroHandRuntime:
             last_slow_poll = time.monotonic()
 
             while not self._stop_event.is_set():
+                # Apply any queued UI/API live settings safely on the processing thread
+                self._flush_pending_config()
                 # Level-triggered stuck-input watchdog runs every iteration regardless of camera/hand state
                 self._enforce_input_safety(self._now_ms())
 
@@ -1198,6 +1232,7 @@ class AeroHandRuntime:
             with self._snapshot_lock:
                 self._snapshot = RuntimeSnapshot(running=False, error=str(exc), last_action=f"Error: {exc}")
         finally:
+            self._processing_thread_id = None
             self._stop_event.set()
             if lerp_thread is not None and lerp_thread.is_alive():
                 lerp_thread.join(timeout=0.5)

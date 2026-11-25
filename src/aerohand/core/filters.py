@@ -112,12 +112,25 @@ class LandmarkSmoother:
         ]
 
     def update_config(self, min_cutoff: float, beta: float, d_cutoff: Optional[float] = None) -> None:
+        new_mc = float(min_cutoff)
+        new_beta = float(beta)
         new_dc = self.d_cutoff if d_cutoff is None else float(d_cutoff)
-        if self.min_cutoff != float(min_cutoff) or self.beta != float(beta) or self.d_cutoff != new_dc:
-            self.min_cutoff = float(min_cutoff)
-            self.beta = float(beta)
-            self.d_cutoff = new_dc
+        dc_changed = new_dc != self.d_cutoff
+        self.min_cutoff = new_mc
+        self.beta = new_beta
+        self.d_cutoff = new_dc
+        if dc_changed:
             self.reset()
+            return
+        # Update coefficients in place so slider drags never reset filter history or jump the cursor
+        for hand_filters in self._filters.values():
+            for fx, fy, fz in hand_filters:
+                fx.min_cutoff = new_mc
+                fx.beta = new_beta
+                fy.min_cutoff = new_mc
+                fy.beta = new_beta
+                fz.min_cutoff = new_mc
+                fz.beta = new_beta
 
     def reset(self, label: Optional[str] = None) -> None:
         if label is None:

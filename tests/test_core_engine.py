@@ -874,3 +874,70 @@ def test_recenter_uses_active_display_rect():
     # Must center onto secondary display (-1920 + 960 = -960, 540), matching main loop bounds
     assert (rt._screen_ox, rt._screen_oy, rt._screen_w, rt._screen_h) == (-1920.0, 0.0, 1920.0, 1080.0)
     assert moved_to == [(-960.0, 540.0)]
+
+
+def test_update_config_does_not_reset_filter_state():
+    sm = LandmarkSmoother(min_cutoff=2.0, beta=45.0, d_cutoff=1.0)
+    h0 = _make_open_hand()
+    h1 = [Landmark(p.x + 0.01, p.y + 0.01, p.z) for p in h0]
+    sm.smooth(h0, "Right", 0.0)
+    sm.smooth(h1, "Right", 33.0)
+    prev_x_before = sm._filters["Right"][8][0]._x_prev
+    prev_t_before = sm._filters["Right"][8][0]._t_prev_ms
+    assert prev_x_before is not None and prev_t_before == 33.0
+
+    # Changing min_cutoff / beta updates coefficients in place without clearing filter history
+    sm.update_config(min_cutoff=1.5, beta=30.0)
+    assert "Right" in sm._filters
+    assert sm._filters["Right"][8][0]._x_prev == prev_x_before
+    assert sm._filters["Right"][8][0]._t_prev_ms == 33.0
+    assert sm._filters["Right"][8][0].min_cutoff == 1.5
+    assert sm._filters["Right"][8][0].beta == 30.0
+
+    # Changing d_cutoff structure resets filters as specified
+    sm.update_config(min_cutoff=1.5, beta=30.0, d_cutoff=2.0)
+    assert sm._filters == {}
+
+
+def test_pending_config_applied_on_processing_thread():
+    import threading
+
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=True)
+
+    # Simulate an active processing thread owning the engine
+    rt._processing_thread_id = threading.get_ident()
+    applied_threads: List[int] = []
+    orig_apply = rt._apply_live_settings_now
+
+    def _spy(c, *, from_profile=False):
+        applied_threads.append(threading.get_ident())
+        orig_apply(c, from_profile=from_profile)
+
+    rt._apply_live_settings_now = _spy  # type: ignore[method-assign]
+
+    # Call apply_live_settings from a DIFFERENT (UI/HTTP) thread -> must queue, NOT apply immediately
+    ui_cfg = deep_merge(cfg, {"cursor": {"pointer_sensitivity": 3.4}})
+    worker_tid: List[int] = []
+
+    def _ui_thread():
+        worker_tid.append(threading.get_ident())
+        rt.apply_live_settings(ui_cfg)
+
+    t = threading.Thread(target=_ui_thread)
+    t.start()
+    t.join(timeout=2.0)
+
+    assert len(applied_threads) == 0
+    assert rt._pending_cfg is not None
+    assert rt.engine.config["cursor"]["pointer_sensitivity"] != 3.4
+
+    # Processing thread flushes pending config at start of frame
+    assert rt._flush_pending_config() is True
+    assert applied_threads == [threading.get_ident()]
+    assert applied_threads[0] != worker_tid[0]
+    assert rt.engine.config["cursor"]["pointer_sensitivity"] == 3.4
+    assert rt._flush_pending_config() is False

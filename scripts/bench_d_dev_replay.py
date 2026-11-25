@@ -166,11 +166,18 @@ def benchmark_dir(dev_dir: Path) -> Dict[str, Any]:
 
 
 def main() -> None:
+    default_dev_dir = (
+        Path(__file__).resolve().parents[1]
+        / "data"
+        / "gesturectl_recordings"
+        / "m01_v2"
+        / "s2b_dev_d_set"
+    )
     parser = argparse.ArgumentParser(description="AeroHand read-only dev replay benchmark")
     parser.add_argument(
         "dev_dir",
         nargs="?",
-        default="/Users/macos/Documents/GestureCtl/recordings/m01_v2/s2b_dev_d_set",
+        default=str(default_dev_dir),
         help="Path to dev recordings directory (never heldout)",
     )
     args = parser.parse_args()

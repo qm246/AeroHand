@@ -20,6 +20,7 @@ class ZoomController:
     def __init__(self, cfg: Optional[Dict[str, Any]] = None) -> None:
         self.update_config(cfg)
         self._active: bool = False
+        self._hold_start_ms: Optional[float] = None
         self._anchor_dist: Optional[float] = None
         self._ema_dist: Optional[float] = None
         self._accum: float = 0.0
@@ -29,12 +30,14 @@ class ZoomController:
         c = cfg or {}
         self.enabled: bool = bool(c.get("enable_zoom", True))
         self.zoom_speed: float = max(0.2, float(c.get("zoom_speed", 1.0)))
+        self.hold_ms: float = max(0.0, float(c.get("zoom_hold_ms", 0.0)))
         self.step_threshold: float = 0.045 / self.zoom_speed
         self.deadzone: float = 0.004
         self.cooldown_ms: float = 95.0
 
     def reset(self) -> None:
         self._active = False
+        self._hold_start_ms = None
         self._anchor_dist = None
         self._ema_dist = None
         self._accum = 0.0
@@ -49,6 +52,12 @@ class ZoomController:
         if not self.enabled or not both_pinching or left_pt is None or right_pt is None:
             self.reset()
             return ZoomOutput()
+
+        if self.hold_ms > 0.0 and not self._active:
+            if self._hold_start_ms is None:
+                self._hold_start_ms = timestamp_ms
+            if (timestamp_ms - self._hold_start_ms) < self.hold_ms:
+                return ZoomOutput(is_zooming=False, delta=0.0, step=0, distance=0.0)
 
         raw_dist = math.hypot(right_pt[0] - left_pt[0], right_pt[1] - left_pt[1])
         if not self._active or self._ema_dist is None or self._anchor_dist is None:

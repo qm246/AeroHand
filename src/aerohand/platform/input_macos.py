@@ -323,22 +323,28 @@ def compute_tile_rect(
     direction: str,
     visible_rect: Tuple[float, float, float, float],
 ) -> Optional[Tuple[float, float, float, float]]:
-    """Compute target `(x, y, w, h)` in Quartz points for a given tile direction."""
+    """
+    Compute target `(x, y, w, h)` in Quartz points for explicit tile zones:
+      - `left` / `right`: exact vertical halves
+      - `top` / `bottom`: exact horizontal halves
+      - `fill`: full visible display rect
+      - `center`: centered 72% x 78% rect
+    """
     vx, vy, vw, vh = visible_rect
     pad = 4.0
     if direction == "left":
         return (vx + pad, vy + pad, vw * 0.5 - pad * 1.5, vh - pad * 2.0)
     if direction == "right":
         return (vx + vw * 0.5 + pad * 0.5, vy + pad, vw * 0.5 - pad * 1.5, vh - pad * 2.0)
-    if direction in ("top", "fill"):
-        return (vx + pad, vy + pad, vw - pad * 2.0, vh - pad * 2.0)
+    if direction == "top":
+        return (vx + pad, vy + pad, vw - pad * 2.0, vh * 0.5 - pad * 1.5)
     if direction == "bottom":
+        return (vx + pad, vy + vh * 0.5 + pad * 0.5, vw - pad * 2.0, vh * 0.5 - pad * 1.5)
+    if direction == "fill":
+        return (vx + pad, vy + pad, vw - pad * 2.0, vh - pad * 2.0)
+    if direction == "center":
         cw = vw * 0.72
         ch = vh * 0.78
-        return (vx + (vw - cw) * 0.5, vy + (vh - ch) * 0.5, cw, ch)
-    if direction == "center":
-        cw = vw * 0.70
-        ch = vh * 0.76
         return (vx + (vw - cw) * 0.5, vy + (vh - ch) * 0.5, cw, ch)
     return None
 

@@ -31,7 +31,7 @@ ALL_POSE_NAMES: Tuple[PoseName, ...] = (
 
 PoseProbabilities = Dict[PoseName, float]
 Handedness = Literal["Left", "Right"]
-SlideDirection = Optional[Literal["left", "right", "top", "bottom", "fill"]]
+SlideDirection = Optional[Literal["left", "right", "top", "bottom", "fill", "center"]]
 
 
 def idle_probabilities() -> PoseProbabilities:

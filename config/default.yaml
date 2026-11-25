@@ -63,6 +63,8 @@ gestures:
   enable_dictation: true
   enable_zoom: true
   zoom_speed: 1.0
+  zoom_pose: "thumb_index_pinch"       # Dedicated 2-hand zoom pose (never collides with drag/click)
+  zoom_hold_ms: 120                    # Both hands must hold zoom pose >= 120 ms before zooming
   latch_gate_while_pose_active: true   # Keep classifying active pose even if hand tilts past dirZ gate
 
 smoothing:

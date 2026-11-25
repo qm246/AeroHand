@@ -156,6 +156,10 @@ class HandCursorEngine:
         self.enable_spaces_nav: bool = bool(gest_cfg.get("enable_spaces_nav", True))
         self.enable_dictation: bool = bool(gest_cfg.get("enable_dictation", True))
         self.enable_zoom: bool = bool(gest_cfg.get("enable_zoom", True))
+        try:
+            self.zoom_pose: PoseName = PoseName(str(gest_cfg.get("zoom_pose", "thumb_index_pinch")))
+        except ValueError:
+            self.zoom_pose = PoseName.THUMB_INDEX_PINCH
         self.latch_gate_while_pose_active: bool = bool(gest_cfg.get("latch_gate_while_pose_active", True))
         self.zoom.update_config(gest_cfg)
 
@@ -429,13 +433,9 @@ class HandCursorEngine:
                     pred_pose = PoseName.IDLE
             ml_ms += (time.perf_counter() - tm0) * 1000.0
 
-            # Record pinch coordinates for two-hand zoom check
+            # Record dedicated zoom pose eligibility (never mixes click/drag/scroll/palm-wheel)
             hand_pinch_pts[hand] = (lms[4].x, lms[4].y)
-            hand_pinching[hand] = pred_pose in (
-                PoseName.THUMB_INDEX_PINCH,
-                PoseName.THUMB_MIDDLE_PINCH,
-                PoseName.THUMB_INDEX_MIDDLE_PINCH,
-            )
+            hand_pinching[hand] = (pred_pose == self.zoom_pose) and (not pw_active)
 
             # 6. Pre-click dwell lock & Pose State Machine
             tg1 = time.perf_counter()
@@ -616,9 +616,16 @@ class HandCursorEngine:
 
             outputs.append(HandOutput(hand=hand, cursor=cursor_out, pose=pose_out))
 
-        # 8. Two-Hand Pinch-to-Zoom
+        # 8. Two-Hand Pinch-to-Zoom (strictly gated: dedicated zoom pose, neither hand in drag/scroll/palm-wheel)
+        any_busy_for_zoom = any(
+            o.pose.is_grabbing
+            or o.pose.is_scrolling
+            or o.pose.palm_wheel_state in ("active", "confirmed")
+            for o in outputs
+        )
         both_pinching = (
             self.enable_zoom
+            and (not any_busy_for_zoom)
             and len(outputs) == 2
             and hand_pinching.get("Left", False)
             and hand_pinching.get("Right", False)

@@ -1315,3 +1315,89 @@ def test_ui_tick_payload_excludes_static_i18n():
     # Changing language re-sends new i18n pack
     p4 = builder.build({"click_event_seq": 1}, dict(ui_cfg2, language="en"), "en", get_lang_pack("en"))
     assert "i18n" in p4 and p4["i18n"]["tabs"]["dashboard"] == "Dashboard"
+
+
+def test_zoom_not_triggered_during_drag():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["hand"]["click_hand"] = "Both"
+
+    class _DualHandClf:
+        def __init__(self) -> None:
+            self.left_pose = PoseName.THUMB_INDEX_MIDDLE_PINCH
+            self.right_pose = PoseName.THUMB_INDEX_PINCH
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            pose = self.left_pose if handedness == "Left" else self.right_pose
+            probs = idle_probabilities()
+            if pose != PoseName.IDLE:
+                probs[PoseName.IDLE] = 0.05
+                probs[pose] = 0.95
+            return PinchPrediction(pose, probs, "high")
+
+        def reset(self):
+            pass
+
+    clf = _DualHandClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    left_h = _make_open_hand(forward_z=-0.25)
+    right_h = [Landmark(p.x + 0.25, p.y, p.z) for p in left_h]
+
+    # Left hand enters drag while right hand pinches -> zoom MUST NOT trigger
+    for k in range(10):
+        spread = [Landmark(p.x + 0.25 + k * 0.02, p.y, p.z) for p in left_h]
+        eng.process_frame(
+            [HandInput("Left", left_h, left_h), HandInput("Right", spread, spread)],
+            k * 40.0,
+            1920.0,
+            1080.0,
+        )
+        assert eng.last_zoom.is_zooming is False
+        assert eng.last_zoom.step == 0
+
+    # When BOTH hands hold dedicated zoom pose (thumb_index_pinch) >= 120ms without drag -> zoom triggers
+    eng.reset()
+    clf.left_pose = PoseName.THUMB_INDEX_PINCH
+    clf.right_pose = PoseName.THUMB_INDEX_PINCH
+    eng.process_frame(
+        [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], 0.0, 1920.0, 1080.0
+    )
+    assert eng.last_zoom.is_zooming is False  # < 120ms hold gate
+    eng.process_frame(
+        [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], 140.0, 1920.0, 1080.0
+    )
+    assert eng.last_zoom.is_zooming is True
+
+
+def test_compute_tile_rect_halves():
+    from aerohand.platform.input_macos import compute_tile_rect
+
+    vis = (0.0, 28.0, 1440.0, 872.0)
+    left = compute_tile_rect("left", vis)
+    right = compute_tile_rect("right", vis)
+    top = compute_tile_rect("top", vis)
+    bottom = compute_tile_rect("bottom", vis)
+    fill = compute_tile_rect("fill", vis)
+    center = compute_tile_rect("center", vis)
+    assert left and right and top and bottom and fill and center
+
+    # Left/right are exact vertical halves
+    assert left[2] == pytest.approx(right[2])
+    assert left[3] == pytest.approx(right[3])
+    assert left[0] + left[2] < right[0]
+
+    # Top/bottom are exact horizontal halves (distinct from fill & center!)
+    assert top[2] == pytest.approx(bottom[2])
+    assert top[3] == pytest.approx(bottom[3])
+    assert top[1] + top[3] < bottom[1]
+    assert top[3] < fill[3] * 0.55
+
+    # Fill covers full visible rect, center is 72% x 78% centered
+    assert fill[2] == pytest.approx(1440.0 - 8.0)
+    assert fill[3] == pytest.approx(872.0 - 8.0)
+    assert center[2] == pytest.approx(1440.0 * 0.72)
+    assert center[3] == pytest.approx(872.0 * 0.78)

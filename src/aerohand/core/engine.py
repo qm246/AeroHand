@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from aerohand.core.filters import LandmarkSmoother
-from aerohand.core.kinematics import CursorKinematics
+from aerohand.core.kinematics import CursorKinematics, isotropic_distance_2d
 from aerohand.core.palm_frame import compute_hand_rotation, compute_pointing_dir_z
 from aerohand.core.palm_wheel import PalmWheelDetector, PalmWheelOutput
 from aerohand.core.pose_state_machine import PoseStateMachine
@@ -285,6 +285,7 @@ class HandCursorEngine:
         height: float,
         *,
         frame_brightness: Optional[float] = None,
+        frame_aspect: float = 4.0 / 3.0,
     ) -> List[HandOutput]:
         """Process one camera frame of 0..2 detected hands."""
         t0 = time.perf_counter()
@@ -334,7 +335,7 @@ class HandCursorEngine:
             index_tip = lms[8]
             wrist = lms[0]
             middle_mcp = lms[9]
-            palm_size = math.hypot(middle_mcp.x - wrist.x, middle_mcp.y - wrist.y)
+            palm_size = isotropic_distance_2d(wrist, middle_mcp, frame_aspect)
 
             index_x = index_tip.x * width
             index_y = index_tip.y * height
@@ -362,7 +363,9 @@ class HandCursorEngine:
                     oy = 0.0
                 hs.palm_wheel_offset = (ox, oy)
 
-            kin = hs.kinematics.process(src_x, src_y, lms, timestamp_ms, width, height)
+            kin = hs.kinematics.process(
+                src_x, src_y, lms, timestamp_ms, width, height, frame_aspect=frame_aspect
+            )
             hs.cursor_delta = (kin.delta_x, kin.delta_y) if kin.is_valid else (0.0, 0.0)
 
             dir_z = compute_pointing_dir_z(lms)

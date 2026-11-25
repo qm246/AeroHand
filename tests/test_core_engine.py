@@ -1142,3 +1142,36 @@ def test_drag_blocked_for_non_click_hand():
     assert primary is not None and primary.hand == "Left"
     rt._dispatch_actions([left_out, right_out], primary, 1000.0)
     assert clicks == [(321.0, 456.0, "left")]
+
+
+def test_crop_preserves_aspect_ratio():
+    import cv2
+
+    from aerohand.platform.camera import prepare_camera_frame
+
+    # Draw an exact circle of radius 180 px at the center of a 1280x720 (16:9) frame
+    img = np.zeros((720, 1280, 3), dtype=np.uint8)
+    cv2.circle(img, (640, 360), 180, (255, 255, 255), thickness=-1)
+
+    for ar in ("4:3", "16:9", "1:1", "auto"):
+        out, out_ar = prepare_camera_frame(img, target_width=640, target_height=480, aspect_ratio=ar, mirror=True)
+        ys, xs = np.where(out[:, :, 0] > 128)
+        bw = float(xs.max() - xs.min())
+        bh = float(ys.max() - ys.min())
+        ratio = bw / max(1.0, bh)
+        assert abs(ratio - 1.0) < 0.01, f"Circle distorted under aspect_ratio={ar}: bw={bw}, bh={bh}"
+        assert out_ar == pytest.approx(out.shape[1] / float(out.shape[0]))
+
+
+def test_distance_isotropy_16x9():
+    from aerohand.core.kinematics import isotropic_distance_2d
+
+    w, h = 1280.0, 720.0
+    ar = w / h
+    # Two segments of identical pixel length (100 px): one horizontal, one vertical
+    c = Landmark(0.5, 0.5, 0.0)
+    horiz = Landmark(0.5 + 100.0 / w, 0.5, 0.0)
+    vert = Landmark(0.5, 0.5 + 100.0 / h, 0.0)
+    d_h = isotropic_distance_2d(c, horiz, frame_aspect=ar)
+    d_v = isotropic_distance_2d(c, vert, frame_aspect=ar)
+    assert d_h == pytest.approx(d_v, rel=1e-6)

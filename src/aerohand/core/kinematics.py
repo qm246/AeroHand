@@ -19,6 +19,21 @@ from aerohand.core.filters import OneEuroFilter1D
 from aerohand.core.types import Landmark
 
 
+def isotropic_distance_2d(
+    a: Landmark,
+    b: Landmark,
+    frame_aspect: float = 1.0,
+) -> float:
+    """
+    Pixel-true isotropic 2D distance between normalized landmarks `a` and `b`
+    given camera frame aspect ratio `width / height` (area-preserving scaling).
+    """
+    ar = max(0.25, float(frame_aspect))
+    sx = math.sqrt(ar)
+    sy = 1.0 / sx
+    return math.hypot((a.x - b.x) * sx, (a.y - b.y) * sy)
+
+
 @dataclass
 class KinematicsOutput:
     x: float = 0.0
@@ -91,6 +106,8 @@ class CursorKinematics:
         timestamp_ms: float,
         width: float,
         height: float,
+        *,
+        frame_aspect: float = 1.0,
     ) -> KinematicsOutput:
         out = KinematicsOutput()
 
@@ -125,7 +142,7 @@ class CursorKinematics:
             if self.enable_distance_compensation and len(landmarks) >= 10:
                 wrist = landmarks[0]
                 middle_mcp = landmarks[9]
-                palm_size = math.hypot(wrist.x - middle_mcp.x, wrist.y - middle_mcp.y)
+                palm_size = isotropic_distance_2d(wrist, middle_mcp, frame_aspect)
                 if palm_size > 0.01:
                     distance_scale = max(0.5, min(3.0, self.reference_palm_size / palm_size))
             sensitivity *= distance_scale

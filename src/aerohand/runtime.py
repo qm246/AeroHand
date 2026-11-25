@@ -1077,6 +1077,7 @@ class AeroHandRuntime:
                     self._screen_w,
                     self._screen_h,
                     frame_brightness=cf.brightness,
+                    frame_aspect=cf.frame_aspect,
                 )
                 primary = self._select_primary_hand(outputs)
                 self._record_collector_frame(hands, primary, cf.timestamp_ms)

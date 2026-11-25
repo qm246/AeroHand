@@ -1518,3 +1518,139 @@ def test_pasteboard_snapshot_restores_non_string_types():
     assert clipboard_restore_delay_s("com.microsoft.VSCode") == 0.35
     assert clipboard_restore_delay_s("com.google.Chrome") == 0.35
     assert clipboard_restore_delay_s("com.apple.Notes") == 0.15
+
+
+def _load_train_tcn_module(name: str = "train_tcn_p2"):
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent.parent / "scripts" / "train_tcn.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_split_requires_all_classes_in_val():
+    mod = _load_train_tcn_module("train_tcn_split")
+    h = _make_open_hand()
+
+    def _mk_bundle(name: str, group_key: str, class_ids: List[int]):
+        wins = []
+        for cid in class_ids:
+            wins.append([mod.ParsedSample(cid, h, h, "Right", "Right", float(i * 33)) for i in range(5)])
+        return mod.SessionBundle(name=name, group_key=group_key, windows=wins, labels=np.array(class_ids, dtype=np.int64))
+
+    # Case 1: Only 2 classes across bundles -> missing_val reports the 5 missing classes
+    b_partial_1 = _mk_bundle("s1.json", "minh::bright", [0, 1])
+    b_partial_2 = _mk_bundle("s2.json", "minh::dim", [0, 1])
+    _tr, _va, missing = mod.split_session_groups([b_partial_1, b_partial_2])
+    assert len(missing) == 5
+
+    # Case 2: Multiple condition groups covering all 7 classes -> val split covers all 7 classes with 0 leakage
+    all_7 = list(range(7))
+    bundles = [
+        _mk_bundle("s1.json", "minh::0deg_bright", all_7),
+        _mk_bundle("s2.json", "minh::30deg_bright", all_7),
+        _mk_bundle("s3.json", "minh::45deg_dim", all_7),
+        _mk_bundle("s4.json", "minh::60deg_backlit", all_7),
+    ]
+    tr, va, missing2 = mod.split_session_groups(bundles, val_ratio=0.25)
+    assert missing2 == []
+    assert set(b.group_key for b in tr).isdisjoint(set(b.group_key for b in va))
+
+
+def test_sequences_break_on_time_gap():
+    mod = _load_train_tcn_module("train_tcn_gap")
+    h = _make_open_hand()
+    flat = [c for lm in h for c in (lm.x, lm.y, lm.z)]
+
+    # 6 contiguous frames (t=0..165ms) + 250ms gap (>100ms) + 6 contiguous frames (t=415..580ms)
+    samples = []
+    for i in range(6):
+        samples.append(
+            {"timestamp_ms": i * 33, "label_name": "idle", "handedness": "Right", "landmarks_2d": flat, "world_landmarks": flat}
+        )
+    for i in range(6):
+        samples.append(
+            {"timestamp_ms": 415 + i * 33, "label_name": "thumb_middle_pinch", "handedness": "Right", "landmarks_2d": flat, "world_landmarks": flat}
+        )
+
+    xs, ys = mod.samples_to_sequences(samples, feature_set="invariant348", seq_len=5, max_gap_ms=100.0)
+    # Without breaking, 12 frames would produce 8 windows; breaking across the 250ms gap gives (6-5+1)+(6-5+1) = 4 windows!
+    assert xs.shape == (4, 5, FEATURE_DIM_3D)
+    assert list(ys) == [0, 0, 2, 2]
+
+
+def test_augmentation_preserves_label_and_shape():
+    mod = _load_train_tcn_module("train_tcn_aug")
+    h = _make_open_hand()
+    win = [mod.ParsedSample(2, h, h, "Right", "Right", float(i * 33)) for i in range(5)]
+    rng = np.random.default_rng(123)
+
+    aug = mod.augment_window(win, rng)
+    assert len(aug) == 5
+    assert aug[-1].label_idx == 2
+    assert all(len(s.lms2d) == 21 and s.lms3d is not None and len(s.lms3d) == 21 for s in aug)
+
+    xs, ys = mod._featurize_windows([aug], feature_set="invariant348", seq_len=5)
+    assert xs.shape == (1, 5, FEATURE_DIM_3D)
+    assert np.all(np.isfinite(xs))
+    assert ys[0] == 2
+
+
+def test_temperature_loaded_by_onnx_classifier(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+
+    norm_fp = tmp_path / "norm.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 1,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+                "temperature": 2.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp = tmp_path / "dummy.onnx"
+    model_fp.write_bytes(b"placeholder")
+
+    class _FakeInput:
+        name = "input"
+
+    class _FakeOrtSession:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            return [_FakeInput()]
+
+        def run(self, _out, _feed):
+            return [np.array([[0.0, 0.0, 4.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _FakeOrtSession)
+
+    clf = ONNXPinchClassifier(model_path=model_fp, normalizer_path=norm_fp, sequence_length=1)
+    assert clf._temperature == pytest.approx(2.0)
+
+    h = _make_open_hand()
+    pred_t2 = clf.predict(h, h, "Right", 0.0)
+    # With T=2.0, scaled logit is 2.0 -> softmax prob = exp(2) / (exp(2) + 6)
+    expected_p = math.exp(2.0) / (math.exp(2.0) + 6.0)
+    assert pred_t2.pose == PoseName.THUMB_MIDDLE_PINCH
+    assert pred_t2.probabilities[PoseName.THUMB_MIDDLE_PINCH] == pytest.approx(expected_p, abs=1e-5)
+
+    # Compare against T=1.0 -> sharper probability exp(4)/(exp(4)+6) > T=2.0
+    clf._temperature = 1.0
+    pred_t1 = clf.predict(h, h, "Right", 33.0)
+    assert pred_t1.probabilities[PoseName.THUMB_MIDDLE_PINCH] > pred_t2.probabilities[PoseName.THUMB_MIDDLE_PINCH]

@@ -49,6 +49,7 @@ class ONNXPinchClassifier:
         self._input_name: str = "input"
         self._mean: np.ndarray = np.zeros(FEATURE_DIM_3D, dtype=np.float32)
         self._scale: np.ndarray = np.ones(FEATURE_DIM_3D, dtype=np.float32)
+        self._temperature: float = 1.0
         self._load()
 
     def _load(self) -> None:
@@ -66,6 +67,11 @@ class ONNXPinchClassifier:
         self._mean = np.asarray(norm["mean"], dtype=np.float32)
         scale = np.asarray(norm["scale"], dtype=np.float32)
         self._scale = np.where(np.abs(scale) > 1e-8, scale, 1.0).astype(np.float32)
+        raw_temp = norm.get("temperature", 1.0)
+        try:
+            self._temperature = max(1e-3, float(raw_temp))
+        except (TypeError, ValueError):
+            self._temperature = 1.0
 
         if self.feature_set == "auto":
             meta_fs = str(norm.get("feature_set", "")).lower()
@@ -128,7 +134,8 @@ class ONNXPinchClassifier:
             return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
 
         seq = np.stack(list(buf), axis=0)[None, :, :]  # (1, seq_len, F)
-        logits = np.asarray(self._session.run(None, {self._input_name: seq})[0]).reshape(-1)
+        logits = np.asarray(self._session.run(None, {self._input_name: seq})[0]).reshape(-1).astype(np.float64)
+        logits = logits / self._temperature
         logits = logits - float(np.max(logits))
         exps = np.exp(logits)
         probs_arr = exps / float(np.sum(exps))

@@ -555,7 +555,133 @@ def fit_temperature_scaling(val_logits: np.ndarray, y_val: np.ndarray) -> float:
     return round(best_t, 4)
 
 
-def train_and_export(args: argparse.Namespace) -> None:
+AB_DEFAULT_SEEDS: Tuple[int, ...] = (42, 1337, 2026)
+
+
+def aggregate_seed_metrics(runs: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate multi-seed evaluation metrics (mean/std) + average confusable-pair error totals."""
+    if not runs:
+        return {
+            "num_seeds": 0,
+            "macro_f1_mean": 0.0,
+            "macro_f1_std": 0.0,
+            "val_accuracy_mean": 0.0,
+            "idle_fp_rate_mean": 0.0,
+            "idle_fp_rate_std": 0.0,
+            "ft_per_hour_mean": None,
+            "confusable_pairs_mean": {},
+            "runs": [],
+        }
+
+    f1s = [float(r.get("macro_f1", 0.0)) for r in runs]
+    accs = [float(r.get("val_accuracy", 0.0)) for r in runs]
+    ifps = [float(r.get("idle_fp_rate", 0.0)) for r in runs]
+    fts = [float(r["ft_per_hour"]) for r in runs if r.get("ft_per_hour") is not None]
+
+    pair_totals: Dict[str, List[float]] = {}
+    for r in runs:
+        cp = r.get("confusable_pairs") or {}
+        if isinstance(cp, dict):
+            for k, v in cp.items():
+                if isinstance(v, dict):
+                    pair_totals.setdefault(k, []).append(float(v.get("total_errors", 0.0)))
+
+    return {
+        "num_seeds": len(runs),
+        "macro_f1_mean": round(float(np.mean(f1s)), 4),
+        "macro_f1_std": round(float(np.std(f1s)), 4),
+        "val_accuracy_mean": round(float(np.mean(accs)), 4),
+        "idle_fp_rate_mean": round(float(np.mean(ifps)), 4),
+        "idle_fp_rate_std": round(float(np.std(ifps)), 4),
+        "ft_per_hour_mean": round(float(np.mean(fts)), 3) if fts else None,
+        "confusable_pairs_mean": {
+            k: round(float(np.mean(vs)), 2) for k, vs in pair_totals.items()
+        },
+        "runs": list(runs),
+    }
+
+
+def evaluate_ab_decision(
+    summary_348: Dict[str, Any],
+    summary_885: Dict[str, Any],
+    *,
+    min_f1_gain: float = 0.02,
+) -> Dict[str, Any]:
+    """
+    Documented V040-03 feature-set selection rule:
+      - Default to `invariant348` (3D rotation/scale invariant, compact).
+      - Switch to `airmouse885` ONLY if it improves `macro_f1_mean` by strictly more than
+        `min_f1_gain` (+0.02) AND does not increase `idle_fp_rate_mean` or `ft_per_hour_mean`.
+    """
+    f1_348 = float(summary_348.get("macro_f1_mean", 0.0))
+    f1_885 = float(summary_885.get("macro_f1_mean", 0.0))
+    fp_348 = float(summary_348.get("idle_fp_rate_mean", 0.0))
+    fp_885 = float(summary_885.get("idle_fp_rate_mean", 0.0))
+    ft_348 = summary_348.get("ft_per_hour_mean")
+    ft_885 = summary_885.get("ft_per_hour_mean")
+
+    f1_delta = round(f1_885 - f1_348, 4)
+    fp_delta = round(fp_885 - fp_348, 4)
+    ft_delta = (
+        round(float(ft_885) - float(ft_348), 3)
+        if (ft_348 is not None and ft_885 is not None)
+        else None
+    )
+
+    f1_beats = f1_delta > float(min_f1_gain)
+    fp_ok = fp_885 <= fp_348 + 1e-9
+    ft_ok = True if (ft_delta is None) else (ft_delta <= 1e-9)
+
+    if f1_beats and fp_ok and ft_ok:
+        winner = "airmouse885"
+        reason = (
+            f"airmouse885 beat invariant348 by +{f1_delta:.4f} macro-F1 (> {min_f1_gain:.2f}) "
+            "without raising idle FP rate or FT/hour."
+        )
+    else:
+        winner = "invariant348"
+        reasons = []
+        if not f1_beats:
+            reasons.append(f"macro-F1 gain {f1_delta:+.4f} <= +{min_f1_gain:.2f}")
+        if not fp_ok:
+            reasons.append(f"idle_fp_rate increased by {fp_delta:+.4f}")
+        if not ft_ok and ft_delta is not None:
+            reasons.append(f"ft_per_hour increased by {ft_delta:+.3f}")
+        reason = "Retained default invariant348 (" + "; ".join(reasons) + ")."
+
+    return {
+        "winner": winner,
+        "min_f1_gain_required": float(min_f1_gain),
+        "macro_f1_delta": f1_delta,
+        "idle_fp_delta": fp_delta,
+        "ft_per_hour_delta": ft_delta,
+        "reason": reason,
+    }
+
+
+def build_ab_report(
+    runs_348: Sequence[Dict[str, Any]],
+    runs_885: Sequence[Dict[str, Any]],
+    *,
+    seeds: Sequence[int] = AB_DEFAULT_SEEDS,
+    min_f1_gain: float = 0.02,
+) -> Dict[str, Any]:
+    """Build structured `ab_report.json` comparing `invariant348` vs `airmouse885` across seeds."""
+    s348 = aggregate_seed_metrics(runs_348)
+    s885 = aggregate_seed_metrics(runs_885)
+    decision = evaluate_ab_decision(s348, s885, min_f1_gain=min_f1_gain)
+    return {
+        "schema": "aerohand_ab_report_v1",
+        "seeds": [int(s) for s in seeds],
+        "feature_sets": {
+            "invariant348": s348,
+            "airmouse885": s885,
+        },
+        "decision": decision,
+    }
+
+
+def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         import onnxruntime as ort
         import torch
@@ -818,6 +944,34 @@ def train_and_export(args: argparse.Namespace) -> None:
         f"idle_fp={best_metrics.get('idle_fp_rate', 0.0)*100:.2f}% | "
         f"T={temperature:.3f} | ONNX max_diff={max_diff:.2e}"
     )
+    return metrics_payload
+
+
+def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
+    """Train & compare `invariant348` vs `airmouse885` across multiple seeds and write `ab_report.json`."""
+    seeds = [int(s.strip()) for s in str(args.ab_seeds).split(",") if s.strip()]
+    if not seeds:
+        seeds = list(AB_DEFAULT_SEEDS)
+
+    runs_by_fs: Dict[str, List[Dict[str, Any]]] = {"invariant348": [], "airmouse885": []}
+    for fs in ("invariant348", "airmouse885"):
+        for sd in seeds:
+            run_args = argparse.Namespace(**vars(args))
+            run_args.feature_set = fs
+            run_args.seed = sd
+            run_args.name = f"{args.name}_{fs}_s{sd}"
+            m = train_and_export(run_args)
+            m["seed"] = sd
+            runs_by_fs[fs].append(m)
+
+    report = build_ab_report(runs_by_fs["invariant348"], runs_by_fs["airmouse885"], seeds=seeds)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ab_fp = out_dir / "ab_report.json"
+    ab_fp.write_text(json.dumps(report, indent=2), encoding="utf-8")
+    dec = report["decision"]
+    print(f"[A/B] Winner: {dec['winner']} | {dec['reason']} | Saved -> {ab_fp}")
+    return report
 
 
 def main() -> None:
@@ -827,6 +981,8 @@ def main() -> None:
     p.add_argument("--out-dir", type=str, default="models", help="Output directory for .onnx, normalizer, and metrics.json")
     p.add_argument("--name", type=str, default="aerohand_tcn", help="Base filename for exported artifacts")
     p.add_argument("--feature-set", choices=["invariant348", "airmouse885"], default="invariant348")
+    p.add_argument("--ab-compare", action="store_true", help="Run multi-seed A/B evaluation comparing invariant348 vs airmouse885")
+    p.add_argument("--ab-seeds", type=str, default="42,1337,2026", help="Comma-separated seeds for --ab-compare")
     p.add_argument("--loss", choices=["ce", "focal", "ls"], default="focal")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Enable landmark augmentation (default on)")
     p.add_argument("--augment-factor", type=int, default=2, help="Total training expansion factor when --augment is on")
@@ -839,7 +995,11 @@ def main() -> None:
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1.5e-3)
     p.add_argument("--seed", type=int, default=42)
-    train_and_export(p.parse_args())
+    ns = p.parse_args()
+    if ns.ab_compare:
+        run_ab_comparison(ns)
+    else:
+        train_and_export(ns)
 
 
 if __name__ == "__main__":

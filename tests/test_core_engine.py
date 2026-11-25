@@ -2776,3 +2776,46 @@ def test_save_blocked_by_quality_gate(tmp_path: Path):
     # Explicit override saves cleanly with condition_id populated
     fp = col.save(tmp_path, allow_low_quality=True)
     assert fp.is_file()
+
+
+def test_ab_report_contains_both_feature_sets():
+    mod = _load_train_tcn_module("train_tcn_ab_rep")
+    runs_348 = [
+        {"seed": 42, "macro_f1": 0.91, "val_accuracy": 0.93, "idle_fp_rate": 0.012, "ft_per_hour": 1.1, "confusable_pairs": {"thumb_index_pinch <-> idle": {"total_errors": 4}}},
+        {"seed": 1337, "macro_f1": 0.92, "val_accuracy": 0.94, "idle_fp_rate": 0.010, "ft_per_hour": 0.9, "confusable_pairs": {"thumb_index_pinch <-> idle": {"total_errors": 2}}},
+    ]
+    runs_885 = [
+        {"seed": 42, "macro_f1": 0.925, "val_accuracy": 0.94, "idle_fp_rate": 0.011, "ft_per_hour": 1.0, "confusable_pairs": {"thumb_index_pinch <-> idle": {"total_errors": 3}}},
+        {"seed": 1337, "macro_f1": 0.930, "val_accuracy": 0.945, "idle_fp_rate": 0.010, "ft_per_hour": 0.9, "confusable_pairs": {"thumb_index_pinch <-> idle": {"total_errors": 3}}},
+    ]
+    rep = mod.build_ab_report(runs_348, runs_885, seeds=[42, 1337])
+    assert set(rep["feature_sets"].keys()) == {"invariant348", "airmouse885"}
+    assert rep["feature_sets"]["invariant348"]["num_seeds"] == 2
+    assert rep["feature_sets"]["airmouse885"]["num_seeds"] == 2
+    assert "thumb_index_pinch <-> idle" in rep["feature_sets"]["invariant348"]["confusable_pairs_mean"]
+    assert rep["decision"]["winner"] in ("invariant348", "airmouse885")
+
+
+def test_default_feature_set_decision_rule():
+    mod = _load_train_tcn_module("train_tcn_ab_rule")
+
+    # Case 1: airmouse885 gain is <= 0.02 -> retain default invariant348
+    d1 = mod.evaluate_ab_decision(
+        {"macro_f1_mean": 0.90, "idle_fp_rate_mean": 0.01, "ft_per_hour_mean": 1.0},
+        {"macro_f1_mean": 0.915, "idle_fp_rate_mean": 0.01, "ft_per_hour_mean": 1.0},
+    )
+    assert d1["winner"] == "invariant348"
+
+    # Case 2: airmouse885 beats by > 0.02 BUT increases idle_fp_rate -> retain invariant348
+    d2 = mod.evaluate_ab_decision(
+        {"macro_f1_mean": 0.90, "idle_fp_rate_mean": 0.01, "ft_per_hour_mean": 1.0},
+        {"macro_f1_mean": 0.94, "idle_fp_rate_mean": 0.015, "ft_per_hour_mean": 1.0},
+    )
+    assert d2["winner"] == "invariant348"
+
+    # Case 3: airmouse885 beats by > 0.02 AND does not raise idle_fp_rate or ft_per_hour -> select airmouse885
+    d3 = mod.evaluate_ab_decision(
+        {"macro_f1_mean": 0.90, "idle_fp_rate_mean": 0.012, "ft_per_hour_mean": 1.2},
+        {"macro_f1_mean": 0.935, "idle_fp_rate_mean": 0.010, "ft_per_hour_mean": 0.8},
+    )
+    assert d3["winner"] == "airmouse885"

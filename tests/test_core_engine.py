@@ -404,6 +404,7 @@ def test_ax_tile_rects_i18n_audio_and_local_control_api(tmp_path: Path):
 
     # 5. Local Control HTTP API roundtrip on ephemeral port
     state = {"tracking": True, "cfg": load_config()}
+    tok_fp = tmp_path / "api_token"
     srv = LocalControlAPIServer(
         host="127.0.0.1",
         port=0,
@@ -413,18 +414,29 @@ def test_ax_tile_rects_i18n_audio_and_local_control_api(tmp_path: Path):
         apply_config=lambda c: state.__setitem__("cfg", c),
         set_tracking_enabled=lambda en: (state.__setitem__("tracking", en) or en),
         trigger_recenter=lambda: None,
+        token_path=tok_fp,
     )
     assert srv.start()
     try:
-        actual_port = srv._server.server_address[1]
-        with urllib.request.urlopen(f"http://127.0.0.1:{actual_port}/api/status", timeout=3) as resp:
+        actual_port = srv.bound_port
+        assert tok_fp.is_file()
+        assert (tok_fp.stat().st_mode & 0o777) == 0o600
+        tok = tok_fp.read_text(encoding="utf-8").strip()
+        assert tok == srv.token
+
+        req_get = urllib.request.Request(
+            f"http://127.0.0.1:{actual_port}/api/status",
+            headers={"X-AeroHand-Token": tok},
+            method="GET",
+        )
+        with urllib.request.urlopen(req_get, timeout=3) as resp:
             body = json.loads(resp.read().decode("utf-8"))
         assert body["ok"] is True and body["tracking"] is True
 
         req = urllib.request.Request(
             f"http://127.0.0.1:{actual_port}/api/tracking",
             data=json.dumps({"enabled": False}).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
+            headers={"Content-Type": "application/json", "X-AeroHand-Token": tok},
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=3) as resp:
@@ -583,3 +595,138 @@ def test_max_drag_watchdog_runs_without_primary():
     rt._dispatch_actions([], None, now[0])
     assert fake.events.count("release_all") == 1
     assert rt._drag_started_ms is None
+
+
+def _start_test_api(tmp_path: Path):
+    from aerohand.platform.control_api import LocalControlAPIServer
+
+    state = {"tracking": True, "cfg": load_config()}
+    srv = LocalControlAPIServer(
+        host="0.0.0.0",  # must be forced to 127.0.0.1
+        port=0,
+        get_status=lambda: {"ok": True, "tracking": state["tracking"]},
+        get_vitals=lambda: {"cpu_usage": 1.0},
+        get_config=lambda: state["cfg"],
+        apply_config=lambda c: state.__setitem__("cfg", c),
+        set_tracking_enabled=lambda en: (state.__setitem__("tracking", en) or en),
+        trigger_recenter=lambda: None,
+        token_path=tmp_path / "api_token",
+    )
+    assert srv.host == "127.0.0.1"
+    assert srv.start()
+    return srv, state
+
+
+def test_api_rejects_foreign_host(tmp_path: Path):
+    import http.client
+
+    srv, _ = _start_test_api(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+        conn.putrequest("GET", "/api/status", skip_host=True)
+        conn.putheader("Host", "evil.rebind.example:17420")
+        conn.putheader("X-AeroHand-Token", srv.token)
+        conn.endheaders()
+        resp = conn.getresponse()
+        assert resp.status == 403
+        conn.close()
+    finally:
+        srv.stop()
+
+
+def test_api_rejects_origin_header(tmp_path: Path):
+    import http.client
+    import json
+
+    srv, _ = _start_test_api(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+        payload = json.dumps({"key": "cursor.sensitivity", "value": 3.0}).encode("utf-8")
+        conn.request(
+            "PATCH",
+            "/api/settings",
+            body=payload,
+            headers={
+                "Host": f"127.0.0.1:{srv.bound_port}",
+                "Origin": "http://evil.example",
+                "Content-Type": "application/json",
+                "X-AeroHand-Token": srv.token,
+            },
+        )
+        resp = conn.getresponse()
+        assert resp.status == 403
+        conn.close()
+    finally:
+        srv.stop()
+
+
+def test_api_requires_token(tmp_path: Path):
+    import http.client
+
+    srv, _ = _start_test_api(tmp_path)
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+        conn.request("GET", "/api/status", headers={"Host": f"127.0.0.1:{srv.bound_port}"})
+        resp = conn.getresponse()
+        assert resp.status == 401
+        conn.close()
+
+        conn2 = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+        conn2.request(
+            "GET",
+            "/api/status",
+            headers={"Host": f"127.0.0.1:{srv.bound_port}", "X-AeroHand-Token": "wrong-token"},
+        )
+        resp2 = conn2.getresponse()
+        assert resp2.status == 401
+        conn2.close()
+    finally:
+        srv.stop()
+
+
+def test_api_rejects_unknown_setting_key(tmp_path: Path):
+    import http.client
+    import json
+
+    srv, _ = _start_test_api(tmp_path)
+    try:
+        for body in (
+            {"key": "nonexistent.evil_key", "value": 123},
+            {"key": "api.host", "value": "0.0.0.0"},
+            {"key": "cursor", "value": {"pointer_sensitivity": 9.9}},
+            {"key": "cursor.pointer_sensitivity", "value": [1, 2, 3]},
+        ):
+            conn = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+            raw = json.dumps(body).encode("utf-8")
+            conn.request(
+                "PATCH",
+                "/api/settings",
+                body=raw,
+                headers={
+                    "Host": f"127.0.0.1:{srv.bound_port}",
+                    "Content-Type": "application/json",
+                    "X-AeroHand-Token": srv.token,
+                },
+            )
+            resp = conn.getresponse()
+            assert resp.status == 400, f"Expected 400 for {body}, got {resp.status}"
+            conn.close()
+
+        # Oversized body (> 64 KiB) returns 413
+        conn3 = http.client.HTTPConnection("127.0.0.1", srv.bound_port, timeout=3)
+        big = b'{"key":"ui.language","value":"' + (b"a" * 70000) + b'"}'
+        conn3.request(
+            "PATCH",
+            "/api/settings",
+            body=big,
+            headers={
+                "Host": f"127.0.0.1:{srv.bound_port}",
+                "Content-Type": "application/json",
+                "X-AeroHand-Token": srv.token,
+            },
+        )
+        resp3 = conn3.getresponse()
+        assert resp3.status == 413
+        conn3.close()
+    finally:
+        srv.stop()

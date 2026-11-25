@@ -32,6 +32,7 @@ from typing import Any, Dict, Optional
 
 from aerohand import __version__
 from aerohand.config import load_config
+from aerohand.platform.control_api import read_api_token
 from aerohand.runtime import AeroHandRuntime
 
 _API_COMMANDS = frozenset({"status", "tracking", "settings", "vitals", "see", "recenter", "open", "run"})
@@ -63,10 +64,22 @@ def _api_request(
     method: str = "GET",
     body: Optional[Dict[str, Any]] = None,
     port: int = 17420,
+    token: Optional[str] = None,
 ) -> Dict[str, Any]:
     url = f"http://127.0.0.1:{port}{path}"
-    data = json.dumps(body).encode("utf-8") if body is not None else None
-    headers = {"Content-Type": "application/json"} if data is not None else {}
+    is_write = method.upper() in ("POST", "PATCH", "PUT")
+    if body is not None:
+        data: Optional[bytes] = json.dumps(body).encode("utf-8")
+    elif is_write:
+        data = b"{}"
+    else:
+        data = None
+    headers: Dict[str, str] = {}
+    if is_write or data is not None:
+        headers["Content-Type"] = "application/json"
+    tok = token if token is not None else read_api_token()
+    if tok:
+        headers["X-AeroHand-Token"] = tok
     req = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(req, timeout=8) as resp:

@@ -2695,3 +2695,84 @@ def test_replay_reports_false_triggers(tmp_path: Path):
     )
     assert rep_reg["baseline_diff"]["regressed_macro_f1"] is True
     assert rep_reg["passed"] is False
+
+
+def test_guided_targets_cover_all_classes_and_conditions(tmp_path: Path):
+    from aerohand.core.types import ALL_POSE_NAMES
+    from aerohand.ml.collector import (
+        COLLECTOR_CLASS_TARGETS,
+        CORPUS_TOTAL_TARGET,
+        DISTANCE_BUCKETS,
+        HARD_NEGATIVE_GROUPS,
+        LIGHTING_BUCKETS,
+        WRIST_ANGLE_BUCKETS,
+        compute_corpus_condition_matrix,
+        default_guided_steps,
+    )
+
+    assert CORPUS_TOTAL_TARGET == 26000
+    assert COLLECTOR_CLASS_TARGETS["idle"]["total"] == 8000
+    for p in ALL_POSE_NAMES:
+        assert p.value in COLLECTOR_CLASS_TARGETS
+        if p != PoseName.IDLE:
+            assert COLLECTOR_CLASS_TARGETS[p.value] == {"total": 3000, "Right": 2000, "Left": 1000}
+
+    steps = default_guided_steps()
+    covered_poses = {s.pose for s in steps}
+    covered_hn = {s.hard_negative_group for s in steps if s.hard_negative_group}
+    assert covered_poses == set(ALL_POSE_NAMES)
+    assert covered_hn == set(HARD_NEGATIVE_GROUPS)
+
+    # Save sessions spanning all 4 wrist-angle buckets (25% each >= 15%) and check matrix
+    h = _make_open_hand()
+    for angle in WRIST_ANGLE_BUCKETS:
+        col = PinchDataCollector(
+            session_meta={"subject": "minh", "wrist_angle": angle, "distance": "mid", "lighting": "bright"}
+        )
+        col.set_recording(True)
+        col.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+        for i in range(5):
+            col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+        col.save(tmp_path)
+
+    mat = compute_corpus_condition_matrix(tmp_path)
+    assert mat["total_frames"] == 20
+    assert mat["angle_balanced"] is True
+    assert set(mat["by_angle"].keys()) == set(WRIST_ANGLE_BUCKETS)
+    assert set(mat["by_distance"].keys()) == set(DISTANCE_BUCKETS)
+    assert set(mat["by_lighting"].keys()) == set(LIGHTING_BUCKETS)
+    assert set(mat["by_hard_negative_group"].keys()) == set(HARD_NEGATIVE_GROUPS)
+
+
+def test_save_blocked_by_quality_gate(tmp_path: Path):
+    from aerohand.ml.collector import QualityGateError
+    from aerohand.runtime import AeroHandRuntime
+
+    col = PinchDataCollector(session_meta={"subject": "minh", "wrist_angle": "0", "distance": "mid", "lighting": "dim"})
+    col.set_pose(PoseName.THUMB_RING_PINCH)
+    col.set_recording(True)
+    h = _make_open_hand()
+    clipped = [Landmark(0.01 if i == 0 else p.x, p.y, p.z) for i, p in enumerate(h)]
+    col.add_frame(clipped, h, "Right", 0.40, 1000)
+    col.add_frame(h, h, "Right", 0.45, 1300)  # gap > 100ms, low confidence, clipped
+
+    # Default save MUST block and raise QualityGateError (subclass of ValueError)
+    with pytest.raises(QualityGateError) as exc_info:
+        col.save(tmp_path)
+    assert "low_confidence" in exc_info.value.warnings
+    assert "hand_clipped_edge" in exc_info.value.warnings
+    assert "time_gaps" in exc_info.value.warnings
+    assert list(tmp_path.glob("*.json")) == []
+
+    # Runtime wrapper catches cleanly without crashing and reports saved=False + blocked_warnings
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=True, collect_dir=tmp_path)
+    rt.collector = col
+    st = rt.collector_save()
+    assert st["saved"] is False
+    assert "low_confidence" in st["blocked_warnings"]
+
+    # Explicit override saves cleanly with condition_id populated
+    fp = col.save(tmp_path, allow_low_quality=True)
+    assert fp.is_file()

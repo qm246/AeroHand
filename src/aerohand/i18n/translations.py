@@ -169,6 +169,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "not_intended_btn": "🚫 Không phải tôi muốn",
             "not_intended_saved": "✓ Đã lưu mẫu âm tính khó (idle) để huấn luyện",
             "not_intended_empty": "Chưa có khung hình tay gần đây để lưu mẫu âm tính",
+            "save_blocked": "⛔ Đã chặn lưu do không đạt cổng chất lượng: ",
+            "matrix_title": "Ma trận phủ điều kiện (26k mục tiêu • góc 0°/30°/45°/60° ≥ 15% mỗi góc)",
         },
     },
     "en": {
@@ -333,6 +335,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "not_intended_btn": "🚫 Not intended",
             "not_intended_saved": "✓ Saved hard-negative (idle) clip for TCN training",
             "not_intended_empty": "No recent hand frames available to save",
+            "save_blocked": "⛔ Save blocked by quality gate: ",
+            "matrix_title": "Condition Coverage Matrix (26k target • 0°/30°/45°/60° ≥ 15% each)",
         },
     },
 }

@@ -39,7 +39,12 @@ from aerohand.core.engine import (
 from aerohand.core.kinematics import CursorLerpInterpolator
 from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
-from aerohand.ml.collector import FrameRingBuffer, PinchDataCollector
+from aerohand.ml.collector import (
+    FrameRingBuffer,
+    PinchDataCollector,
+    QualityGateError,
+    compute_corpus_condition_matrix,
+)
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
 from aerohand.platform.audio import AudioFeedback
@@ -244,6 +249,8 @@ class AeroHandRuntime:
         self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
         self._cached_corpus_counts: Dict[str, Dict[str, int]] = {}
+        self._cached_condition_matrix: Optional[Dict[str, Any]] = None
+        self._collector_last_save_error: Optional[List[str]] = None
 
         self._api_server: Optional[LocalControlAPIServer] = None
         self._stop_event = threading.Event()
@@ -498,6 +505,10 @@ class AeroHandRuntime:
             except Exception:
                 continue
         self._cached_corpus_counts = agg
+        self._cached_condition_matrix = compute_corpus_condition_matrix(
+            self.collect_dir,
+            negatives_dir=self.negatives_dir,
+        )
         return self._cached_saved_sessions
 
     def collector_toggle_recording(self) -> Dict[str, Any]:
@@ -533,15 +544,26 @@ class AeroHandRuntime:
         self.collector.stop_guided()
         return self.collector_status()
 
-    def collector_save(self) -> Dict[str, Any]:
-        out = self.collector.save(self.collect_dir)
+    def collector_save(self, *, allow_low_quality: bool = False) -> Dict[str, Any]:
+        try:
+            out = self.collector.save(self.collect_dir, allow_low_quality=allow_low_quality)
+        except QualityGateError as exc:
+            self._collector_last_save_error = list(exc.warnings)
+            self._last_action_text = f"Save blocked ({', '.join(exc.warnings)})"
+            st = self.collector_status()
+            st["saved"] = False
+            st["blocked_warnings"] = list(exc.warnings)
+            return st
+        self._collector_last_save_error = None
         self._last_action_text = f"Saved dataset: {out.name}"
         self._refresh_saved_sessions_cache()
         st = self.collector_status()
+        st["saved"] = True
         st["saved_path"] = str(out)
         return st
 
     def collector_clear(self) -> Dict[str, Any]:
+        self._collector_last_save_error = None
         self.collector.clear()
         self._refresh_saved_sessions_cache()
         return self.collector_status()
@@ -604,6 +626,8 @@ class AeroHandRuntime:
             "negatives_dir": str(self.negatives_dir),
             "negatives_saved": self._negatives_saved_count,
             "last_trigger": self.frame_ring.last_trigger,
+            "last_save_blocked_warnings": list(self._collector_last_save_error or []),
+            "condition_matrix": self._cached_condition_matrix or {},
             "saved_sessions": list(self._cached_saved_sessions or []),
         }
 

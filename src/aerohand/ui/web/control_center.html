@@ -631,6 +631,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
           <div id="col-quality-banner" style="font-size:11.5px;color:var(--green);margin-bottom:6px"></div>
           <div id="col-hold-hint" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
           <div id="col-bars"></div>
+          <div style="margin-top:8px;font-size:11px;color:var(--muted)" id="lbl-col-matrix">Ma trận phủ điều kiện (26k mục tiêu)</div>
+          <div class="code-box" id="col-matrix-box" style="margin-top:4px;max-height:110px;overflow-y:auto">—</div>
           <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;margin-bottom:4px">
             <span style="font-size:11px;color:var(--muted)" id="lbl-train-cmd">Lệnh huấn luyện ONNX 1D-TCN (invariant348 mặc định):</span>
             <button class="btn sm" id="btn-copy-train" onclick="copyTrainCmd()">📋 Sao chép lệnh train</button>
@@ -1300,8 +1302,12 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
 
       const qBan = document.getElementById("col-quality-banner");
       const q = col.quality || {};
+      const blocked = col.last_save_blocked_warnings || [];
       if (qBan) {
-        if (col.total > 0 && q.warnings && q.warnings.length) {
+        if (blocked.length) {
+          qBan.style.color = "var(--rose)";
+          qBan.textContent = (colI18n.save_blocked || "⛔ Save blocked: ") + blocked.map(w => colI18n["warn_" + w] || w).join(" • ");
+        } else if (col.total > 0 && q.warnings && q.warnings.length) {
           qBan.style.color = "var(--amber)";
           qBan.textContent = q.warnings.map(w => colI18n["warn_" + w] || w).join(" • ");
         } else if (col.total > 0) {
@@ -1310,6 +1316,24 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         } else {
           qBan.textContent = "";
         }
+      }
+
+      const matLbl = document.getElementById("lbl-col-matrix");
+      if (matLbl) matLbl.textContent = colI18n.matrix_title || "Condition Matrix";
+      const matBox = document.getElementById("col-matrix-box");
+      if (matBox) {
+        const mat = col.condition_matrix || {};
+        const ang = mat.by_angle || {};
+        const sh = mat.angle_shares || {};
+        const dist = mat.by_distance || {};
+        const lt = mat.by_lighting || {};
+        const hn = mat.by_hard_negative_group || {};
+        const tot = mat.total_frames || 0;
+        matBox.textContent =
+          `Total: ${tot} / ${mat.target_total || 26000}\n` +
+          `Angles: 0°=${ang["0"] || 0} (${Math.round((sh["0"] || 0)*100)}%) | 30°=${ang["30"] || 0} (${Math.round((sh["30"] || 0)*100)}%) | 45°=${ang["45"] || 0} (${Math.round((sh["45"] || 0)*100)}%) | 60°=${ang["60"] || 0} (${Math.round((sh["60"] || 0)*100)}%)\n` +
+          `Dist: near=${dist.near || 0} mid=${dist.mid || 0} far=${dist.far || 0} | Light: bright=${lt.bright || 0} backlit=${lt.backlit || 0} dim=${lt.dim || 0}\n` +
+          `Hard-neg (≥500): ` + Object.entries(hn).map(([k, v]) => `${k}:${v}`).join(" ");
       }
 
       const prog = col.corpus_progress || {};

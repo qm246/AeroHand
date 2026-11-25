@@ -41,6 +41,22 @@ HARD_NEGATIVE_GROUPS: Tuple[str, ...] = (
     "transitions",
 )
 
+WRIST_ANGLE_BUCKETS: Tuple[str, ...] = ("0", "30", "45", "60")
+DISTANCE_BUCKETS: Tuple[str, ...] = ("near", "mid", "far")
+LIGHTING_BUCKETS: Tuple[str, ...] = ("bright", "backlit", "dim")
+HARD_NEGATIVE_MIN_PER_GROUP: int = 500
+MIN_ANGLE_SHARE: float = 0.15
+CORPUS_TOTAL_TARGET: int = sum(v["total"] for v in COLLECTOR_CLASS_TARGETS.values())  # 26000
+
+
+class QualityGateError(ValueError):
+    """Raised when `PinchDataCollector.save()` blocks a session that fails pre-save quality checks."""
+
+    def __init__(self, warnings: Sequence[str], report: Optional[Dict[str, Any]] = None) -> None:
+        self.warnings: List[str] = list(warnings)
+        self.report: Dict[str, Any] = dict(report or {})
+        super().__init__(f"Session blocked by quality gate: {', '.join(self.warnings)}")
+
 
 @dataclass(frozen=True)
 class GuidedStep:
@@ -51,12 +67,17 @@ class GuidedStep:
 
 
 def default_guided_steps(step_duration_s: float = 5.0) -> List[GuidedStep]:
-    """Build a structured 7-class + hard-negative guided recording script."""
+    """Build a structured 7-class + all-8 hard-negative guided recording script (14 steps)."""
     d = max(2.0, float(step_duration_s))
     return [
         GuidedStep(PoseName.IDLE, d, "Resting open/relaxed hand", "resting"),
         GuidedStep(PoseName.IDLE, d, "Near-miss pinch (1-2 cm apart)", "near_miss"),
-        GuidedStep(PoseName.IDLE, d, "Typing / fist / natural hand motion", "typing"),
+        GuidedStep(PoseName.IDLE, d, "Typing on keyboard", "typing"),
+        GuidedStep(PoseName.IDLE, d, "Touching hair / face / glasses", "hair_face"),
+        GuidedStep(PoseName.IDLE, d, "Holding cup / phone", "cup_phone"),
+        GuidedStep(PoseName.IDLE, d, "Waving / gesturing casually", "waving"),
+        GuidedStep(PoseName.IDLE, d, "Fist open/close & stretching", "fist_open"),
+        GuidedStep(PoseName.IDLE, d, "Fast pose-to-pose transitions", "transitions"),
         GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Thumb + Index pinch (hold & loose)"),
         GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "Thumb + Middle pinch (tap & hold)"),
         GuidedStep(PoseName.THUMB_RING_PINCH, d, "Thumb + Ring pinch (still & sliding)"),
@@ -64,6 +85,118 @@ def default_guided_steps(step_duration_s: float = 5.0) -> List[GuidedStep]:
         GuidedStep(PoseName.THUMB_PINKY_BASE, d, "Thumb + Pinky base touch"),
         GuidedStep(PoseName.THUMB_INDEX_MIDDLE_PINCH, d, "3-Finger drag pinch (still & moving)"),
     ]
+
+
+def compute_condition_id(meta: Dict[str, Any]) -> str:
+    """Derive a canonical `condition_id` from wrist angle, distance, and lighting metadata."""
+    existing = str(meta.get("condition_id") or "").strip()
+    if existing:
+        return existing
+    angle = _slugify(str(meta.get("wrist_angle", "0")), "0")
+    dist = _slugify(str(meta.get("distance", "mid")), "mid")
+    light = _slugify(str(meta.get("lighting", "bright")), "bright")
+    return f"{angle}deg_{dist}_{light}"
+
+
+def compute_corpus_condition_matrix(
+    sessions_dir: Optional[str | Path] = None,
+    *,
+    negatives_dir: Optional[str | Path] = None,
+    live_samples: Optional[Sequence[Dict[str, Any]]] = None,
+    live_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute the 26k dataset Class x Condition progress matrix across saved sessions,
+    hard-negative clips, and optional in-memory unsaved samples (V040-02).
+    """
+    by_class: Dict[str, Dict[str, int]] = {
+        p.value: {
+            "total": 0,
+            "Right": 0,
+            "Left": 0,
+            "target": COLLECTOR_CLASS_TARGETS[p.value]["total"],
+            "target_right": COLLECTOR_CLASS_TARGETS[p.value]["Right"],
+            "target_left": COLLECTOR_CLASS_TARGETS[p.value]["Left"],
+        }
+        for p in ALL_POSE_NAMES
+    }
+    by_class_angle: Dict[str, Dict[str, int]] = {
+        p.value: {a: 0 for a in WRIST_ANGLE_BUCKETS} for p in ALL_POSE_NAMES
+    }
+    by_angle: Dict[str, int] = {a: 0 for a in WRIST_ANGLE_BUCKETS}
+    by_distance: Dict[str, int] = {d: 0 for d in DISTANCE_BUCKETS}
+    by_lighting: Dict[str, int] = {lt: 0 for lt in LIGHTING_BUCKETS}
+    by_hard_neg: Dict[str, int] = {g: 0 for g in HARD_NEGATIVE_GROUPS}
+    total_frames = 0
+
+    def _ingest(samples: Sequence[Dict[str, Any]], meta: Dict[str, Any], force_idle: bool = False) -> None:
+        nonlocal total_frames
+        angle = str(meta.get("wrist_angle", "0")).replace("deg", "").strip()
+        if angle not in by_angle:
+            angle = "0"
+        dist = str(meta.get("distance", "mid")).strip().lower()
+        light = str(meta.get("lighting", "bright")).strip().lower()
+        for s in samples:
+            if not isinstance(s, dict):
+                continue
+            pname = PoseName.IDLE.value if force_idle else str(s.get("label_name") or s.get("labelName") or "")
+            if pname not in by_class:
+                continue
+            hand = "Left" if str(s.get("handedness", "Right")) == "Left" else "Right"
+            by_class[pname]["total"] += 1
+            by_class[pname][hand] += 1
+            by_class_angle[pname][angle] += 1
+            by_angle[angle] += 1
+            if dist in by_distance:
+                by_distance[dist] += 1
+            if light in by_lighting:
+                by_lighting[light] += 1
+            hng = str(s.get("hard_negative_group") or "").strip()
+            if hng in by_hard_neg:
+                by_hard_neg[hng] += 1
+            total_frames += 1
+
+    for folder, force_idle in ((sessions_dir, False), (negatives_dir, True)):
+        if folder is None:
+            continue
+        p = Path(folder)
+        if not p.is_dir():
+            continue
+        for fp in sorted(p.glob("*.json")):
+            try:
+                data = json.loads(fp.read_text(encoding="utf-8"))
+                if not isinstance(data, dict):
+                    continue
+                meta = data.get("session_meta") if isinstance(data.get("session_meta"), dict) else {}
+                samples = data.get("samples")
+                if isinstance(samples, list):
+                    _ingest(samples, meta, force_idle=force_idle)
+            except Exception:
+                continue
+
+    if live_samples:
+        _ingest(live_samples, live_meta or {}, force_idle=False)
+
+    angle_shares = {
+        a: round((by_angle[a] / total_frames), 4) if total_frames > 0 else 0.0
+        for a in WRIST_ANGLE_BUCKETS
+    }
+    angle_balanced = total_frames > 0 and all(share >= MIN_ANGLE_SHARE for share in angle_shares.values())
+    hard_neg_ready = all(cnt >= HARD_NEGATIVE_MIN_PER_GROUP for cnt in by_hard_neg.values())
+    return {
+        "total_frames": total_frames,
+        "target_total": CORPUS_TOTAL_TARGET,
+        "by_class": by_class,
+        "by_class_angle": by_class_angle,
+        "by_angle": by_angle,
+        "angle_shares": angle_shares,
+        "angle_balanced": angle_balanced,
+        "by_distance": by_distance,
+        "by_lighting": by_lighting,
+        "by_hard_negative_group": by_hard_neg,
+        "hard_negative_min_per_group": HARD_NEGATIVE_MIN_PER_GROUP,
+        "hard_negatives_ready": hard_neg_ready,
+    }
 
 
 def _slugify(val: str, fallback: str = "x") -> str:
@@ -362,23 +495,29 @@ class PinchDataCollector:
             "gap_count": gap_count,
         }
 
-    def save(self, out_dir: str | Path) -> Path:
+    def save(self, out_dir: str | Path, *, allow_low_quality: bool = False) -> Path:
+        quality = self.evaluate_quality()
+        if not allow_low_quality and not quality["ok"]:
+            raise QualityGateError(quality["warnings"], quality)
+
+        meta = dict(self._session_meta)
+        meta["subject"] = str(meta.get("subject") or "").strip() or "user"
+        meta["condition_id"] = compute_condition_id(meta)
+
         out_root = Path(out_dir)
         out_root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        m = self._session_meta
-        subj = _slugify(m.get("subject", "user"), "user")
-        hand = _slugify(m.get("hand", "Right"), "Right")
-        angle = _slugify(m.get("wrist_angle", "0"), "0")
-        dist = _slugify(m.get("distance", "mid"), "mid")
-        light = _slugify(m.get("lighting", "bright"), "bright")
+        subj = _slugify(meta.get("subject", "user"), "user")
+        hand = _slugify(meta.get("hand", "Right"), "Right")
+        angle = _slugify(meta.get("wrist_angle", "0"), "0")
+        dist = _slugify(meta.get("distance", "mid"), "mid")
+        light = _slugify(meta.get("lighting", "bright"), "bright")
         out_fp = out_root / f"aerohand_pinch_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}.json"
-        quality = self.evaluate_quality()
         payload = {
             "schema": "aerohand_pinch_v2",
             "schema_version": 2,
             "collected_at": self._started_at_iso,
-            "session_meta": dict(self._session_meta),
+            "session_meta": meta,
             "quality_report": quality,
             "total_samples": len(self._samples),
             "counts": self.counts(),

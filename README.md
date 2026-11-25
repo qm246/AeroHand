@@ -4,11 +4,11 @@
 
 **Ứng dụng điều khiển macOS không chạm độ trễ thấp — xử lý 100% cục bộ trên máy.**
 
-🇻🇳 **Tiếng Việt** · [🇺🇸 English](./docs/README.en.md) · [📐 Kiến trúc hệ thống](./docs/ARCHITECTURE.md)
+🇻🇳 **Tiếng Việt** · [🇺🇸 English](./docs/README.en.md) · [📐 Kiến trúc hệ thống](./docs/ARCHITECTURE.md) · [📊 Đánh giá ML](./docs/ML_EVALUATION.md)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-teal.svg)](LICENSE)
 [![Platform: macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)](#cài-đặt--chạy-nhanh-macos-apple-silicon)
-[![Version: v0.3.0](https://img.shields.io/badge/Version-0.3.0-emerald.svg)](#)
+[![Version: v0.4.0](https://img.shields.io/badge/Version-0.4.0-emerald.svg)](#)
 
 </div>
 
@@ -22,20 +22,20 @@
 
 ---
 
-## Tính năng nổi bật (v0.3.0)
+## Tính năng nổi bật (v0.4.0)
 
-- **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác* kèm **Wizard hiệu chỉnh cá nhân 30 giây**), **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì, tải nhẹ 5 Hz khi ẩn cửa sổ và lưu cấu hình có debounce 500 ms.
-- **4 lớp Overlay nổi đa màn hình (1 panel click-through / màn hình, chuẩn hóa `ScreenGeometry`)**:
-  - Đĩa tròn **Palm Wheel 5 cánh** kèm breadcrumb menu con (theo tay hoặc cố định giữa màn hình).
+- **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác* kèm **Wizard hiệu chỉnh cá nhân 7 bước** có bước **Chụm lỏng 1–2 cm**), dòng trạng thái trực tiếp **"Vì sao không kích hoạt?"**, **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì, tải nhẹ 5 Hz khi ẩn cửa sổ và lưu cấu hình có debounce 500 ms.
+- **4 lớp Overlay nổi đa màn hình tự phục hồi (`ScreenGeometry` + `WKNavigationDelegate` reload)**:
+  - Đĩa tròn **Palm Wheel 5 cánh** kèm breadcrumb menu con (đồng bộ `overlay_ready`, chống rebuild khi đổi Space/Dock).
   - Vòng sóng **Click Pulse** ngay tại con trỏ khi Click / Double-Click / Chuột phải / Drag.
   - Khung kính mờ **Window Tile Ghost Preview** xem trước chính xác nửa trái/phải/trên/dưới, toàn màn hình và căn giữa.
-  - **Toast gợi ý cử chỉ tự đồng bộ gesture map sống**, sóng âm **Voice Dictation** và **cảnh báo thông minh** (ánh sáng yếu, tay quá xa/gần, sát mép khung hình, fallback ONNX).
-- **Con trỏ & click chính xác vượt trội**: Nội suy **Adaptive 60 Hz Lerp** (40→70 theo vận tốc), **Click Lookback 90 ms** + **Pre-click Dwell Lock 120 ms** chống lệch điểm ngắm khi bấm, chốt pointing gate khi đang kéo thả, tách độc lập **tay trỏ** và **tay click/drag**, và camera **crop giữ tỷ lệ đồng nhất** với queue size-1 chống méo hình.
+  - **Toast gợi ý cử chỉ tự đồng bộ gesture map sống**, sóng âm & thông báo lọc **Voice Dictation**, và **cảnh báo thông minh**.
+- **Con trỏ & click chính xác, chống "dính chuột"**: Nội suy **Adaptive 60 Hz Lerp** (40→70) đồng bộ neo sau click, **Click Lookback 90 ms** có chốt tốc độ (`<= 250 px/s`) và giới hạn lệch (`<= 24 px`), **Dwell Lock đơn lần kèm cooldown 400 ms**, mở rộng **neo pre-pinch cho cả Drag Start & Chuột phải**, tách độc lập tay trỏ và tay click/drag.
 - **Chia cửa sổ chuẩn bằng Accessibility API (`AXUIElement`)**: hoạt động mọi ứng dụng macOS, hỗ trợ đa màn hình (Multi-Monitor) và hiệu ứng animation mượt.
-- **Voice Dictation Tiếng Việt (`vi-VN`) & Tiếng Anh (`en-US`)**: dùng Apple `SFSpeechRecognizer` 100% on-device kèm fallback tự động `mlx_whisper` cục bộ; chèn chữ có dấu UTF-8 và **snapshot/khôi phục toàn bộ kiểu clipboard** (giữ nguyên ảnh PNG, file URL, RTF; delay 0.35s cho app Electron/Chromium).
-- **Bảo mật & Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`) được bảo vệ bằng **kiểm tra `Host` + chặn `Origin` (chống CSRF / DNS rebinding)**, xác thực **`X-AeroHand-Token`** lưu quyền `0600`, giới hạn body 64 KiB và whitelist key; `aerohand` CLI tự đọc token; URL Scheme `aerohand://`; Per-App Profiles; phím tắt tùy biến có kiểm tra trùng; và Launch at Login.
-- **ML Studio & Guarded ONNX 1D-TCN**: Data Collector trong app hỗ trợ **kịch bản hướng dẫn có đếm ngược**, **tự cắt 300 ms chuyển tiếp đầu/cuối**, **metadata phiên**, **giữ phím `0–6` gắn nhãn**, **hủy 5 giây vừa quay**, và **Quality Gate**; `train_tcn.py` hỗ trợ group split chống rò rỉ, cắt chuỗi theo gap `>100 ms`, landmark augmentation, Focal Loss, Temperature Scaling và xuất `metrics.json`; runtime có **Shadow Mode** và **Auto-Fallback** về Heuristic 3D khi p95 > 8 ms hoặc lỗi liên tiếp.
-- **Ổn định 24/7 trên macOS**: chạy MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS, tránh lỗi rò rỉ `CVPixelBuffer` Metal) + `objc.autorelease_pool()` + **watchdog chống kẹt chuột level-triggered** (mất tay chính, chỉ còn tay phụ, treo camera > 500 ms, hoặc drag > 20 s).
+- **Voice Dictation cục bộ an toàn không kích hoạt nhầm**: Phân xử chặt **Zoom 2 tay vs Đọc giọng nói 1 tay** (`dictation_arm_ms: 350 ms`, `zoom_arbitration_ms: 300 ms`, hủy micro ngay không nhận diện khi tay thứ 2 chụm), **cổng lọc năng lượng VAD** (`min_duration_s: 0.6s`, `min_rms: 0.01`, `min_voiced_ms: 250 ms`), **chặn chữ ảo im lặng (hallucination blocklist)**, nhật ký 50 sự kiện trong `aerohand vitals`, và **snapshot/khôi phục toàn bộ kiểu clipboard** (delay 0.35s cho Electron/Chromium).
+- **Bảo mật & Hệ sinh thái tự động hóa**: Local HTTP Control API (`127.0.0.1:17420`) bảo vệ bằng `Host` + chặn `Origin` + `X-AeroHand-Token` (`0600`) + giới hạn 64 KiB + whitelist key; `aerohand` CLI; URL Scheme `aerohand://`; Per-App Profiles; phím tắt tùy biến (gồm `Cmd+Shift+N` gắn nhãn âm tính khó); Launch at Login.
+- **ML Studio, Khai thác Âm tính Khó & Đánh giá Ngoại tuyến**: Nút **"Không phải tôi muốn"** (`Cmd+Shift+N`) lưu clip ±1,5 s vào `data/negatives/`; ma trận phủ điều kiện 26.000 khung hình + **Quality Gate chặn lưu** dữ liệu kém chất lượng; script **`scripts/replay_eval.py`** đo false triggers/giờ ngoại tuyến; **`train_tcn.py --ab-compare`** so sánh đa seed `invariant348` vs `airmouse885`; runtime có **Shadow Mode** và **Auto-Fallback** về Heuristic 3D khi p95 > 8 ms hoặc lỗi liên tiếp.
+- **Ổn định 24/7 trên macOS**: MediaPipe **CPU XNNPACK NEON** mặc định (`0` rò rỉ bộ nhớ, ~30 FPS) + `objc.autorelease_pool()` + **watchdog chống kẹt chuột level-triggered**.
 
 ---
 
@@ -92,8 +92,9 @@ Liên kết nhanh cho **Apple Shortcuts / Raycast**:
 
 ### 4. Chạy chế độ dòng lệnh & kiểm thử
 ```bash
-uv run pytest -q                              # Chạy toàn bộ 52 unit/integration test
+uv run pytest -q                              # Chạy toàn bộ 81 unit/integration test
 uv run ruff check src tests scripts           # Kiểm tra lint
+uv run python scripts/replay_eval.py --help   # Đánh giá hồi quy & FT/giờ ngoại tuyến
 uv run aerohand run --dry-run --preview       # Chạy thử bằng cửa sổ OpenCV
 ```
 

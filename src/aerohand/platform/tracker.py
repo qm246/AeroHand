@@ -21,6 +21,10 @@ from aerohand.core.types import Handedness, HandInput, Landmark
 logger = logging.getLogger(__name__)
 
 
+def _safe_float(val: object, default: float = 1.0) -> float:
+    return default if val is None else float(val)
+
+
 def resolve_model_path(model_path: str) -> Path:
     p = Path(model_path)
     if p.is_absolute() and p.is_file():
@@ -109,7 +113,12 @@ class MediaPipeHandTracker:
         hands: List[HandInput] = []
         for idx, raw_lms in enumerate(res.hand_landmarks):
             lms = [
-                Landmark(x=float(p.x), y=float(p.y), z=float(p.z), visibility=float(getattr(p, "visibility", 1.0)))
+                Landmark(
+                    x=float(p.x),
+                    y=float(p.y),
+                    z=float(p.z),
+                    visibility=_safe_float(getattr(p, "visibility", None), 1.0),
+                )
                 for p in raw_lms
             ]
             wlms: Optional[List[Landmark]] = None
@@ -119,7 +128,7 @@ class MediaPipeHandTracker:
                         x=float(p.x),
                         y=float(p.y),
                         z=float(p.z),
-                        visibility=float(getattr(p, "visibility", 1.0)),
+                        visibility=_safe_float(getattr(p, "visibility", None), 1.0),
                     )
                     for p in res.hand_world_landmarks[idx]
                 ]
@@ -128,7 +137,7 @@ class MediaPipeHandTracker:
             if res.handedness and idx < len(res.handedness) and res.handedness[idx]:
                 cat = res.handedness[idx][0]
                 raw_label = cat.category_name or cat.display_name or "Right"
-                score = float(cat.score)
+                score = _safe_float(getattr(cat, "score", None), 1.0)
             hands.append(
                 HandInput(
                     handedness=self._normalize_handedness(raw_label),

@@ -278,6 +278,25 @@ class VoiceDictationController:
             return False
         return self.start()
 
+    def cancel(self, reason: str = "cancelled") -> bool:
+        """Stop microphone stream immediately and DISCARD audio (no transcription, no paste)."""
+        with self._lock:
+            was_recording = self._recording
+            self._recording = False
+            self._audio_level = 0.0
+            stream = self._stream
+            self._stream = None
+            self._chunks = []
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+        if was_recording:
+            logger.info(f"[DICTATION] Recording cancelled ({reason}); audio discarded.")
+        return was_recording
+
     def stop_and_transcribe(self) -> None:
         with self._lock:
             if not self._recording:

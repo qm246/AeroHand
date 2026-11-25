@@ -175,6 +175,7 @@ class PoseOutput:
     is_dictating: bool = False
     dictation_just_started: bool = False
     dictation_just_ended: bool = False
+    dictation_cancelled: bool = False
     is_scrolling: bool = False
     is_scroll_inertia: bool = False
     scroll_dx: float = 0.0

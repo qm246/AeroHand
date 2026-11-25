@@ -172,6 +172,39 @@ def resolve_profile_config(base_cfg: Dict[str, Any], bundle_id: Optional[str]) -
     return deep_merge(base_cfg, filtered)
 
 
+# Documented safe numeric ranges `(min_val, max_val)` enforced by `validate_and_clamp_config`
+SAFE_NUMERIC_RANGES: Dict[str, Tuple[float, float]] = {
+    "gestures.dictation_arm_ms": (200.0, 800.0),
+    "gestures.zoom_arbitration_ms": (0.0, 1000.0),
+    "gestures.zoom_hold_ms": (0.0, 1000.0),
+    "dictation.min_duration_s": (0.1, 10.0),
+    "dictation.min_rms": (0.0005, 0.5),
+    "dictation.min_voiced_ms": (50.0, 5000.0),
+    "cursor.click_dwell_lock_ms": (0.0, 500.0),
+    "cursor.click_dwell_lock_cooldown_ms": (0.0, 2000.0),
+    "cursor.click_lookback_ms": (0.0, 300.0),
+    "cursor.click_lookback_max_speed_px_s": (0.0, 5000.0),
+    "cursor.click_lookback_max_offset_px": (0.0, 200.0),
+    "cursor.drag_lookback_ms": (0.0, 200.0),
+    "cursor.drag_dwell_lock_ms": (0.0, 300.0),
+    "collector.negative_window_s": (0.5, 10.0),
+}
+
+
+def validate_and_clamp_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Clamp documented safety-critical numeric parameters into safe bounds (in-place)."""
+    for dotted_key, (lo, hi) in SAFE_NUMERIC_RANGES.items():
+        found, val = get_nested_key(cfg, dotted_key)
+        if not found or isinstance(val, bool) or not isinstance(val, (int, float)):
+            continue
+        clamped = max(lo, min(hi, float(val)))
+        if isinstance(val, int) and float(lo).is_integer() and float(hi).is_integer():
+            set_nested_key(cfg, dotted_key, int(round(clamped)))
+        else:
+            set_nested_key(cfg, dotted_key, clamped)
+    return cfg
+
+
 def load_config(
     config_path: Optional[str | Path] = None,
     overrides_path: Optional[str | Path] = None,
@@ -187,7 +220,7 @@ def load_config(
             ov = yaml.safe_load(f) or {}
         if isinstance(ov, dict):
             cfg = deep_merge(cfg, ov)
-    return cfg
+    return validate_and_clamp_config(cfg)
 
 
 def save_user_overrides(

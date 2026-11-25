@@ -63,8 +63,10 @@ gestures:
   enable_dictation: true
   enable_zoom: true
   zoom_speed: 1.0
-  zoom_pose: "thumb_index_pinch"       # Dedicated 2-hand zoom pose (never collides with drag/click)
+  zoom_pose: "thumb_index_pinch"       # Dedicated 2-hand zoom pose (arbitrated cleanly against dictation)
   zoom_hold_ms: 120                    # Both hands must hold zoom pose >= 120 ms before zooming
+  zoom_arbitration_ms: 300             # Window (ms) where 2nd hand entering zoom cancels/suppresses dictation
+  dictation_arm_ms: 350                # Single-hand hold duration (200..800 ms) required to arm dictation
   latch_gate_while_pose_active: true   # Keep classifying active pose even if hand tilts past dirZ gate
 
 smoothing:

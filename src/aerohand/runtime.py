@@ -924,8 +924,16 @@ class AeroHandRuntime:
             return None
 
         # 2. Two-Hand Pinch-to-Zoom takes priority when both hands actively zoom
+        # Always honour dictation_cancelled across ANY hand before returning early for Zoom!
+        for ho in outputs:
+            if ho.pose.dictation_cancelled:
+                self.dictation.cancel(reason="two_hand_zoom")
+                self._last_action_text = "Dictation cancelled (Zoom)"
+
         z_out = self.engine.last_zoom
         if z_out.is_zooming:
+            if self.dictation.is_recording:
+                self.dictation.cancel(reason="two_hand_zoom")
             with self._lerp_lock:
                 self._lerp_active = False
             if z_out.step != 0:
@@ -1015,8 +1023,11 @@ class AeroHandRuntime:
             if cp.is_grabbing:
                 active_hint = "grab"
 
-        # Voice Dictation hold gesture (`thumb_index_pinch`)
-        if p.dictation_just_started:
+        # Voice Dictation hold gesture (`thumb_index_pinch`, arbitrated against 2-hand Zoom)
+        if p.dictation_cancelled:
+            self.dictation.cancel(reason="two_hand_zoom")
+            self._last_action_text = "Dictation cancelled (Zoom)"
+        elif p.dictation_just_started:
             self.audio.play_wheel_tick()
             self._practice["dictation"] = True
             self.dictation.start()

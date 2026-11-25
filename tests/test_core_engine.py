@@ -1901,3 +1901,151 @@ def test_overlay_hydration_reset_and_screen_signature():
     s3 = screen_frames_signature([(0.0, 0.0, 1512.0, 982.0), (-1920.0, 0.0, 1920.0, 1080.0)])
     assert s1 == s2
     assert s1 != s3
+
+
+def test_zoom_two_hands_never_starts_dictation():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _BothIndexPinch:
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    eng = HandCursorEngine(cfg, classifier=_BothIndexPinch())
+    left_h = _make_open_hand(forward_z=-0.25)
+    right_h = [Landmark(p.x + 0.25, p.y, p.z) for p in left_h]
+
+    # Hold both hands in thumb_index_pinch for 600 ms -> Zoom engages, Dictation NEVER starts
+    dict_starts = 0
+    for k in range(18):
+        outs = eng.process_frame(
+            [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)],
+            k * 35.0,
+            1920.0,
+            1080.0,
+        )
+        for o in outs:
+            if o.pose.dictation_just_started or o.pose.is_dictating:
+                dict_starts += 1
+    assert dict_starts == 0
+    assert eng.last_zoom.is_zooming is True
+
+
+def test_dictation_cancelled_when_second_hand_pinches_within_arbitration_window():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["gestures"]["dictation_arm_ms"] = 350
+
+    class _StaggeredZoom:
+        def __init__(self) -> None:
+            self.left_active = False
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            active = (handedness == "Right") or self.left_active
+            if active:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _StaggeredZoom()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    left_h = _make_open_hand(forward_z=-0.25)
+    right_h = [Landmark(p.x + 0.25, p.y, p.z) for p in left_h]
+
+    # Right hand pinches alone and arms dictation after 350ms
+    started = False
+    for ts in [0.0, 33.0, 66.0, 200.0, 380.0, 420.0]:
+        outs = eng.process_frame(
+            [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)],
+            ts,
+            1920.0,
+            1080.0,
+        )
+        r_out = next(o for o in outs if o.hand == "Right")
+        if r_out.pose.dictation_just_started:
+            started = True
+    assert started is True
+
+    # Left hand now enters zoom pose -> dictation MUST be cancelled (NOT ended for transcription!)
+    clf.left_active = True
+    outs_cancel = eng.process_frame(
+        [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)],
+        460.0,
+        1920.0,
+        1080.0,
+    )
+    r_cancel = next(o for o in outs_cancel if o.hand == "Right")
+    assert r_cancel.pose.dictation_cancelled is True
+    assert r_cancel.pose.dictation_just_ended is False
+    assert r_cancel.pose.is_dictating is False
+
+
+def test_single_hand_dictation_requires_arm_ms():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["gestures"]["dictation_arm_ms"] = 350
+
+    class _IndexPinch:
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    eng = HandCursorEngine(cfg, classifier=_IndexPinch())
+    fwd = _make_open_hand(forward_z=-0.25)
+
+    # Pose enters on 3rd frame (enter_frames=3 -> t=66ms). At 260ms (< 66+350=416ms), NOT armed yet!
+    for ts in [0.0, 33.0, 66.0, 260.0, 390.0]:
+        o = eng.process_frame([HandInput("Right", fwd, fwd)], ts, 1920.0, 1080.0)[0]
+        assert o.pose.dictation_just_started is False
+        assert o.pose.is_dictating is False
+
+    # At t=420ms (>= 66+350ms) -> arms dictation cleanly once!
+    o_arm = eng.process_frame([HandInput("Right", fwd, fwd)], 420.0, 1920.0, 1080.0)[0]
+    assert o_arm.pose.dictation_just_started is True
+    assert o_arm.pose.is_dictating is True
+    # Subsequent frame keeps is_dictating=True without re-firing dictation_just_started
+    o_next = eng.process_frame([HandInput("Right", fwd, fwd)], 460.0, 1920.0, 1080.0)[0]
+    assert o_next.pose.dictation_just_started is False
+    assert o_next.pose.is_dictating is True
+
+
+def test_dictation_cancel_discards_audio():
+    from aerohand.platform.dictation import VoiceDictationController
+
+    pasted: List[str] = []
+    ctrl = VoiceDictationController({"enabled": True}, on_text_ready=lambda t: pasted.append(t))
+    # Simulate active recording with loud audio chunks
+    ctrl._recording = True
+    ctrl._chunks = [np.ones(16000, dtype=np.float32) * 0.2]
+    assert ctrl.cancel(reason="two_hand_zoom") is True
+    assert ctrl.is_recording is False
+    assert ctrl._chunks == []
+    assert pasted == []

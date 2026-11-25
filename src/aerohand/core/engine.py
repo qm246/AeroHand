@@ -298,6 +298,9 @@ class _PerHandState:
     palm_wheel: PalmWheelDetector
     is_grabbing: bool = False
     is_dictating: bool = False
+    dictation_pose_enter_ms: Optional[float] = None
+    dictation_started_ms: Optional[float] = None
+    zoom_pose_enter_ms: Optional[float] = None
     is_pointing_latched: bool = False
     last_click_ms: float = -1e9
     last_click_count: int = 0
@@ -319,6 +322,9 @@ class _PerHandState:
         self.palm_wheel.reset()
         self.is_grabbing = False
         self.is_dictating = False
+        self.dictation_pose_enter_ms = None
+        self.dictation_started_ms = None
+        self.zoom_pose_enter_ms = None
         self.is_pointing_latched = False
         self.palm_wheel_was_active = False
         self.palm_wheel_offset = (0.0, 0.0)
@@ -398,6 +404,8 @@ class HandCursorEngine:
             self.zoom_pose: PoseName = PoseName(str(gest_cfg.get("zoom_pose", "thumb_index_pinch")))
         except ValueError:
             self.zoom_pose = PoseName.THUMB_INDEX_PINCH
+        self.zoom_arbitration_ms: float = max(0.0, min(1000.0, float(gest_cfg.get("zoom_arbitration_ms", 300.0))))
+        self.dictation_arm_ms: float = max(200.0, min(800.0, float(gest_cfg.get("dictation_arm_ms", 350.0))))
         self.latch_gate_while_pose_active: bool = bool(gest_cfg.get("latch_gate_while_pose_active", True))
         self.zoom.update_config(gest_cfg)
 
@@ -498,6 +506,9 @@ class HandCursorEngine:
             hs.window_tile.reset()
             hs.is_grabbing = False
             hs.is_dictating = False
+            hs.dictation_pose_enter_ms = None
+            hs.dictation_started_ms = None
+            hs.zoom_pose_enter_ms = None
 
     def _effective_click_hand(self) -> str:
         return self.cursor_hand if str(self.click_hand).lower() == "same" else self.click_hand
@@ -692,7 +703,13 @@ class HandCursorEngine:
 
             # Record dedicated zoom pose eligibility (never mixes click/drag/scroll/palm-wheel)
             hand_pinch_pts[hand] = (lms[4].x, lms[4].y)
-            hand_pinching[hand] = (pred_pose == self.zoom_pose) and (not pw_active)
+            in_zoom_pose = (pred_pose == self.zoom_pose) and (not pw_active)
+            hand_pinching[hand] = in_zoom_pose
+            if in_zoom_pose:
+                if hs.zoom_pose_enter_ms is None:
+                    hs.zoom_pose_enter_ms = timestamp_ms
+            else:
+                hs.zoom_pose_enter_ms = None
 
             # 6. Pre-click dwell lock & Pose State Machine
             tg1 = time.perf_counter()
@@ -754,8 +771,12 @@ class HandCursorEngine:
                             )
                         else:
                             hs.click_anchor_pos = (cursor_out.x, cursor_out.y)
+                    if hs.pose_sm.get_hold_action(ev.pose) == "dictation" and self.enable_dictation:
+                        hs.dictation_pose_enter_ms = timestamp_ms
                 elif ev.type == "tap":
                     tap_act = hs.pose_sm.get_tap_action(ev.pose)
+                    if hs.pose_sm.get_hold_action(ev.pose) == "dictation":
+                        hs.dictation_pose_enter_ms = None
                     if tap_act == "left_click" and self._is_click_allowed_for_hand(hand):
                         debounce_ok = (not self.enable_click_debounce) or (
                             (timestamp_ms - hs.last_click_ms) > self.click_debounce_ms
@@ -786,16 +807,20 @@ class HandCursorEngine:
                         hs.is_grabbing = True
                         grab_started = True
                     elif hold_act == "dictation" and self.enable_dictation:
-                        hs.is_dictating = True
-                        dictation_started = True
+                        # Arming is deferred to post-classification arbitration (`dictation_arm_ms`)
+                        if hs.dictation_pose_enter_ms is None:
+                            hs.dictation_pose_enter_ms = timestamp_ms
                 elif ev.type == "hold_end":
                     hold_act = hs.pose_sm.get_hold_action(ev.pose)
                     if hold_act == "drag" and hs.is_grabbing:
                         hs.is_grabbing = False
                         grab_ended = True
-                    elif hold_act == "dictation" and hs.is_dictating:
-                        hs.is_dictating = False
-                        dictation_ended = True
+                    elif hold_act == "dictation":
+                        hs.dictation_pose_enter_ms = None
+                        if hs.is_dictating:
+                            hs.is_dictating = False
+                            hs.dictation_started_ms = None
+                            dictation_ended = True
                     # Dual behavior: thumb_ring_pinch held still -> right click on release
                     if (
                         ev.pose == PoseName.THUMB_RING_PINCH
@@ -873,24 +898,79 @@ class HandCursorEngine:
 
             outputs.append(HandOutput(hand=hand, cursor=cursor_out, pose=pose_out))
 
-        # 8. Two-Hand Pinch-to-Zoom (strictly gated: dedicated zoom pose, neither hand in drag/scroll/palm-wheel)
+        # 8. Two-Hand Zoom vs Single-Hand Dictation Arbitration (V031-01)
         any_busy_for_zoom = any(
             o.pose.is_grabbing
             or o.pose.is_scrolling
             or o.pose.palm_wheel_state in ("active", "confirmed")
             for o in outputs
         )
-        both_pinching = (
+        both_in_zoom_pose = (
             self.enable_zoom
             and (not any_busy_for_zoom)
             and len(outputs) == 2
             and hand_pinching.get("Left", False)
             and hand_pinching.get("Right", False)
         )
+        zoom_intent = both_in_zoom_pose
+        # Also detect second hand entering zoom_pose within zoom_arbitration_ms of an active/arming dictation
+        if (not zoom_intent) and self.enable_zoom and len(outputs) == 2 and (not any_busy_for_zoom):
+            l_enter = self._hands["Left"].zoom_pose_enter_ms
+            r_enter = self._hands["Right"].zoom_pose_enter_ms
+            if l_enter is not None and r_enter is not None and abs(l_enter - r_enter) <= self.zoom_arbitration_ms:
+                zoom_intent = True
+
+        # Count hands currently in whichever pose is mapped to dictation (preset-agnostic)
+        dict_pose_hands = [
+            o.hand
+            for o in outputs
+            if (
+                (
+                    o.pose.active_pose is not None
+                    and self._hands[o.hand].pose_sm.get_hold_action(o.pose.active_pose) == "dictation"
+                )
+                or (
+                    o.pose.pose != PoseName.IDLE
+                    and self._hands[o.hand].pose_sm.get_hold_action(o.pose.pose) == "dictation"
+                )
+            )
+        ]
+
+        for o in outputs:
+            hs = self._hands[o.hand]
+            if zoom_intent:
+                # Suppress arming and cancel any already-started dictation without transcribing!
+                hs.dictation_pose_enter_ms = None
+                o.pose.dictation_just_started = False
+                o.pose.dictation_just_ended = False
+                if hs.is_dictating:
+                    hs.is_dictating = False
+                    hs.dictation_started_ms = None
+                    o.pose.is_dictating = False
+                    o.pose.dictation_cancelled = True
+                continue
+
+            # Single-hand dictation arming: requires exactly 1 hand in dictation pose AND held >= dictation_arm_ms
+            if (
+                self.enable_dictation
+                and (not hs.is_dictating)
+                and hs.dictation_pose_enter_ms is not None
+                and o.pose.active_pose is not None
+                and hs.pose_sm.get_hold_action(o.pose.active_pose) == "dictation"
+                and len(dict_pose_hands) == 1
+                and (timestamp_ms - hs.dictation_pose_enter_ms) >= self.dictation_arm_ms
+            ):
+                hs.is_dictating = True
+                hs.dictation_started_ms = timestamp_ms
+                o.pose.is_dictating = True
+                o.pose.dictation_just_started = True
+            elif o.pose.active_pose is None or hs.pose_sm.get_hold_action(o.pose.active_pose) != "dictation":
+                hs.dictation_pose_enter_ms = None
+
         self.last_zoom = self.zoom.process(
             hand_pinch_pts.get("Left"),
             hand_pinch_pts.get("Right"),
-            both_pinching,
+            both_in_zoom_pose,
             timestamp_ms,
         )
 

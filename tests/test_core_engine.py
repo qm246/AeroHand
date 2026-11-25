@@ -1654,3 +1654,93 @@ def test_temperature_loaded_by_onnx_classifier(tmp_path: Path, monkeypatch):
     clf._temperature = 1.0
     pred_t1 = clf.predict(h, h, "Right", 33.0)
     assert pred_t1.probabilities[PoseName.THUMB_MIDDLE_PINCH] > pred_t2.probabilities[PoseName.THUMB_MIDDLE_PINCH]
+
+
+def test_collector_trims_edges():
+    from aerohand.ml.collector import GuidedStep, PinchDataCollector
+
+    col = PinchDataCollector(trim_edge_ms=300.0, countdown_s=1.0, step_duration_s=2.0)
+    h = _make_open_hand()
+    col.start_guided([GuidedStep(PoseName.THUMB_MIDDLE_PINCH, duration_s=2.0)], now_ms=0.0)
+    # Countdown ends at t=1000ms
+    col.tick_guided(now_ms=1000.0)
+    assert col.is_recording is True
+    # Feed frames every 100ms from 1000..3000ms (21 frames covering 2000ms)
+    for ts in range(1000, 3001, 100):
+        col.add_frame(h, h, "Right", 0.95, ts)
+    # Complete step at t=3000ms -> first 300ms (1000..1200) & last 300ms (2800..3000) MUST be trimmed!
+    col.tick_guided(now_ms=3000.0)
+    assert col.is_recording is False
+    kept_ts = [s["timestamp_ms"] for s in col._samples]
+    assert min(kept_ts) >= 1300
+    assert max(kept_ts) <= 2700
+    assert len(kept_ts) == 15
+
+    # Undo last 0.5s removes samples >= 2200ms
+    removed = col.undo_last(seconds=0.5)
+    assert removed > 0
+    assert all(s["timestamp_ms"] < 2200 for s in col._samples)
+
+
+def test_collector_records_primary_hand():
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["hand"]["cursor_hand"] = "Right"
+    cfg["collector"]["record_hand"] = "primary"
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    rt.collector.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+    rt.collector.set_recording(True)
+
+    h = _make_open_hand()
+    # hands[0] is Left, hands[1] is Right; primary is Right -> MUST record Right, NOT hands[0]!
+    hands = [HandInput("Left", h, h, confidence=0.9), HandInput("Right", h, h, confidence=0.95)]
+    primary = _make_hand_output("Right")
+    rt._record_collector_frame(hands, primary, 1000)
+    assert len(rt.collector._samples) == 1
+    assert rt.collector._samples[0]["handedness"] == "Right"
+    assert rt.collector._samples[0]["hand_id"] == "Right"
+
+
+def test_collector_metadata_in_header(tmp_path: Path):
+    import json
+
+    col = PinchDataCollector(
+        session_meta={
+            "subject": "minh",
+            "hand": "Right",
+            "wrist_angle": "45",
+            "distance": "mid",
+            "lighting": "dim",
+            "camera": "FaceTimeHD",
+        }
+    )
+    col.set_pose(PoseName.THUMB_INDEX_PINCH)
+    col.toggle_recording()
+    h = _make_open_hand()
+    col.add_frame(h, h, "Right", 0.92, 1000)
+    fp = col.save(tmp_path)
+
+    assert "minh" in fp.name and "45deg" in fp.name and "dim" in fp.name
+    data = json.loads(fp.read_text(encoding="utf-8"))
+    assert data["schema_version"] == 2
+    assert data["session_meta"]["subject"] == "minh"
+    assert data["session_meta"]["wrist_angle"] == "45"
+    assert data["session_meta"]["lighting"] == "dim"
+
+
+def test_quality_gate_flags_low_confidence():
+    col = PinchDataCollector()
+    col.set_pose(PoseName.THUMB_RING_PINCH)
+    col.toggle_recording()
+    h = _make_open_hand()
+    # Low confidence (< 0.58), clipped at edge (x=0.01), and a 250ms gap (> 100ms)
+    clipped = [Landmark(0.01 if i == 0 else p.x, p.y, p.z) for i, p in enumerate(h)]
+    col.add_frame(clipped, h, "Right", 0.42, 1000)
+    col.add_frame(h, h, "Right", 0.50, 1250)
+    q = col.evaluate_quality()
+    assert q["ok"] is False
+    assert "low_confidence" in q["warnings"]
+    assert "hand_clipped_edge" in q["warnings"]
+    assert "time_gaps" in q["warnings"]

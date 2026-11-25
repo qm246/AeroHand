@@ -911,9 +911,24 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "collector_toggle":
             if self.runtime is not None:
                 self.runtime.collector_toggle_recording()
+        elif act == "collector_set_recording":
+            if self.runtime is not None:
+                self.runtime.collector_set_recording(bool(msg.get("active", False)))
         elif act == "collector_pose":
             if self.runtime is not None:
                 self.runtime.collector_set_pose(str(msg.get("pose", "idle")))
+        elif act == "collector_meta":
+            if self.runtime is not None and isinstance(msg.get("meta"), dict):
+                self.runtime.collector_set_meta(msg["meta"])
+        elif act == "collector_undo":
+            if self.runtime is not None:
+                self.runtime.collector_undo(float(msg.get("seconds", 5.0)))
+        elif act == "collector_guided_start":
+            if self.runtime is not None:
+                self.runtime.collector_start_guided()
+        elif act == "collector_guided_stop":
+            if self.runtime is not None:
+                self.runtime.collector_stop_guided()
         elif act == "collector_save":
             if self.runtime is not None:
                 self.runtime.collector_save()

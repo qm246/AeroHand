@@ -106,6 +106,8 @@ classifier:
   onnx_normalizer_path: "models/aerohand_tcn_normalizer.json"
   sequence_length: 5
   feature_set: "invariant348"          # "invariant348" | "airmouse885"
+  shadow_mode: false                   # Run ONNX alongside heuristic & log disagreement without acting
+  max_onnx_p95_ms: 8.0                 # Auto-fallback to heuristic if ONNX p95 latency > 8ms
   heuristic_3d:
     pinch_on_dist: 0.34
     pinch_off_dist: 0.62
@@ -115,6 +117,12 @@ classifier:
     dual_pinch_off_dist: 0.65
     min_margin: 0.08
     require_pointing_gate_for_actions: true
+
+collector:
+  record_hand: "primary"               # "primary" | "both"
+  trim_edge_ms: 300                    # Trim first/last 300 ms of guided recording segments
+  countdown_s: 3.0                     # Pre-step countdown for guided protocol
+  step_duration_s: 5.0                 # Default capture duration per guided step
 
 pose_state_machine:
   pose_hold_threshold_ms: 180

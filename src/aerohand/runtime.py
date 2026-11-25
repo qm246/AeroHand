@@ -208,9 +208,16 @@ class AeroHandRuntime:
             on_text_ready=self._on_dictation_text,
         )
         self.vitals_mon = SystemVitalsMonitor()
-        self.collector: PinchDataCollector = PinchDataCollector()
+        col_cfg = config.get("collector") or {}
+        self.collector_record_hand: str = str(col_cfg.get("record_hand", "primary")).lower()
+        self.collector: PinchDataCollector = PinchDataCollector(
+            trim_edge_ms=float(col_cfg.get("trim_edge_ms", 300.0)),
+            countdown_s=float(col_cfg.get("countdown_s", 3.0)),
+            step_duration_s=float(col_cfg.get("step_duration_s", 5.0)),
+        )
         self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
+        self._cached_corpus_counts: Dict[str, Dict[str, int]] = {}
 
         self._api_server: Optional[LocalControlAPIServer] = None
         self._stop_event = threading.Event()
@@ -373,6 +380,9 @@ class AeroHandRuntime:
         self.input_ctl.keyboard_guard_s = float(tg.get("keyboard_ms", 1500)) / 1000.0
         self.input_ctl.mouse_guard_s = float(tg.get("mouse_ms", 1000)) / 1000.0
 
+        col_cfg = effective.get("collector") or {}
+        self.collector_record_hand = str(col_cfg.get("record_hand", "primary")).lower()
+
         self.audio.update_config(effective.get("audio"))
         self.dictation.update_config(effective.get("dictation"))
 
@@ -414,8 +424,31 @@ class AeroHandRuntime:
     # ------------------------------------------------------------------
 
     def _refresh_saved_sessions_cache(self) -> List[str]:
+        import json as _json
+
         sessions = sorted(self.collect_dir.glob("*.json")) if self.collect_dir.is_dir() else []
         self._cached_saved_sessions = [fp.name for fp in sessions[-10:]]
+        agg: Dict[str, Dict[str, int]] = {p.value: {"total": 0, "Right": 0, "Left": 0} for p in ALL_POSE_NAMES}
+        for fp in sessions:
+            try:
+                data = _json.loads(fp.read_text(encoding="utf-8"))
+                cbh = data.get("counts_by_hand")
+                if isinstance(cbh, dict):
+                    for pname, hand_map in cbh.items():
+                        if pname in agg and isinstance(hand_map, dict):
+                            r = int(hand_map.get("Right", 0))
+                            l_cnt = int(hand_map.get("Left", 0))
+                            agg[pname]["Right"] += r
+                            agg[pname]["Left"] += l_cnt
+                            agg[pname]["total"] += r + l_cnt
+                else:
+                    cnts = data.get("counts") or {}
+                    for pname, n in cnts.items():
+                        if pname in agg:
+                            agg[pname]["total"] += int(n)
+            except Exception:
+                continue
+        self._cached_corpus_counts = agg
         return self._cached_saved_sessions
 
     def collector_toggle_recording(self) -> Dict[str, Any]:
@@ -423,11 +456,32 @@ class AeroHandRuntime:
         self._refresh_saved_sessions_cache()
         return self.collector_status()
 
+    def collector_set_recording(self, active: bool) -> Dict[str, Any]:
+        self.collector.set_recording(active)
+        return self.collector_status()
+
     def collector_set_pose(self, pose_name: str) -> Dict[str, Any]:
         try:
             self.collector.set_pose(PoseName(pose_name))
         except ValueError:
             pass
+        return self.collector_status()
+
+    def collector_set_meta(self, meta: Dict[str, Any]) -> Dict[str, Any]:
+        self.collector.set_session_meta(meta)
+        return self.collector_status()
+
+    def collector_undo(self, seconds: float = 5.0) -> Dict[str, Any]:
+        removed = self.collector.undo_last(seconds=seconds)
+        self._last_action_text = f"Undid {removed} samples"
+        return self.collector_status()
+
+    def collector_start_guided(self) -> Dict[str, Any]:
+        self.collector.start_guided()
+        return self.collector_status()
+
+    def collector_stop_guided(self) -> Dict[str, Any]:
+        self.collector.stop_guided()
         return self.collector_status()
 
     def collector_save(self) -> Dict[str, Any]:
@@ -444,14 +498,35 @@ class AeroHandRuntime:
         return self.collector_status()
 
     def collector_status(self) -> Dict[str, Any]:
+        from aerohand.ml.collector import COLLECTOR_CLASS_TARGETS
+
         counts = self.collector.counts()
+        by_hand = self.collector.counts_by_hand()
         if self._cached_saved_sessions is None:
             self._refresh_saved_sessions_cache()
+        combined: Dict[str, Dict[str, int]] = {}
+        for p in ALL_POSE_NAMES:
+            pk = p.value
+            base = self._cached_corpus_counts.get(pk, {"total": 0, "Right": 0, "Left": 0})
+            cur_r = by_hand.get(pk, {}).get("Right", 0)
+            cur_l = by_hand.get(pk, {}).get("Left", 0)
+            combined[pk] = {
+                "total": base["total"] + counts.get(pk, 0),
+                "Right": base["Right"] + cur_r,
+                "Left": base["Left"] + cur_l,
+                "target": COLLECTOR_CLASS_TARGETS[pk]["total"],
+            }
         return {
             "recording": self.collector.is_recording,
             "current_pose": self.collector.current_pose.value,
             "counts": counts,
+            "counts_by_hand": by_hand,
+            "corpus_progress": combined,
             "total": sum(counts.values()),
+            "session_meta": self.collector.session_meta,
+            "guided": self.collector.guided_status(),
+            "quality": self.collector.evaluate_quality(),
+            "record_hand": self.collector_record_hand,
             "sessions_dir": str(self.collect_dir),
             "saved_sessions": list(self._cached_saved_sessions or []),
         }
@@ -594,9 +669,22 @@ class AeroHandRuntime:
         primary: Optional[HandOutput],
         timestamp_ms: int,
     ) -> None:
-        """Record landmarks for the active primary hand (never blindly `hands[0]`)."""
+        """Record landmarks for the configured hand (`primary` or `both` with `hand_id`), never `hands[0]` blindly."""
+        self.collector.tick_guided(now_ms=float(timestamp_ms))
         if not self.collector.is_recording or not hands:
             return
+        if self.collector_record_hand == "both":
+            for h_inp in hands:
+                self.collector.add_frame(
+                    h_inp.landmarks,
+                    h_inp.world_landmarks,
+                    h_inp.handedness,
+                    h_inp.confidence,
+                    timestamp_ms,
+                    hand_id=h_inp.handedness,
+                )
+            return
+
         target_hand: Optional[str] = primary.hand if primary is not None else None
         chosen = None
         if target_hand is not None:

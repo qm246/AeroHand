@@ -574,17 +574,54 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         </div>
 
         <div class="card">
-          <div class="card-title"><span>STUDIO THU THẬP DỮ LIỆU HUẤN LUYỆN TCN (TRONG APP)</span><span class="pill-tag" id="col-total">0 mẫu</span></div>
-          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px">
-            <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
-            <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
-            <button class="btn" onclick="post('collector_save')">💾 Lưu JSON</button>
-            <button class="btn danger" onclick="post('collector_clear')">🗑 Xóa tạm</button>
+          <div class="card-title"><span id="t-col-hdr">STUDIO THU THẬP DỮ LIỆU HUẤN LUYỆN TCN (TRONG APP)</span><span class="pill-tag" id="col-total">0 mẫu</span></div>
+          <div class="grid-3" style="margin-bottom:8px">
+            <div class="row"><div class="row-label"><strong id="lbl-col-subj">Người quay</strong></div>
+              <input type="text" id="col-meta-subj" value="user" style="width:110px" onchange="sendColMeta()" />
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-col-hand">Tay ghi</strong></div>
+              <select id="col-rec-hand" onchange="setKey('collector.record_hand', this.value); sendColMeta();">
+                <option value="primary">Tay chính (Primary)</option>
+                <option value="both">Cả 2 tay (hand_id)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-col-angle">Góc cổ tay</strong></div>
+              <select id="col-meta-angle" onchange="sendColMeta()">
+                <option value="0">0°</option><option value="30">30°</option><option value="45">45°</option><option value="60">60°</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-col-dist">Khoảng cách</strong></div>
+              <select id="col-meta-dist" onchange="sendColMeta()">
+                <option value="near">Gần (Near)</option><option value="mid" selected>Vừa (Mid)</option><option value="far">Xa (Far)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-col-light">Ánh sáng</strong></div>
+              <select id="col-meta-light" onchange="sendColMeta()">
+                <option value="bright">Đủ sáng (Bright)</option><option value="backlit">Nghịch sáng (Backlit)</option><option value="dim">Thiếu sáng (Dim)</option>
+              </select>
+            </div>
+            <div class="row"><div class="row-label"><strong id="lbl-col-active">Nhãn đang ghi</strong></div>
+              <span class="pill-tag" id="col-active-badge">idle</span>
+            </div>
           </div>
+
+          <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+            <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
+            <button class="btn" id="btn-col-guided" onclick="toggleGuided()">🎬 Quay theo kịch bản hướng dẫn</button>
+            <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
+            <button class="btn" id="btn-col-undo" onclick="post('collector_undo',{seconds:5})">↩ Hủy 5 giây vừa quay</button>
+            <button class="btn" onclick="post('collector_save')" id="btn-col-save">💾 Lưu JSON</button>
+            <button class="btn danger" onclick="post('collector_clear')" id="btn-col-clear">🗑 Xóa tạm</button>
+          </div>
+          <div id="col-guided-banner" style="font-size:12px;color:var(--teal);margin-bottom:6px;display:none"></div>
+          <div id="col-quality-banner" style="font-size:11.5px;color:var(--green);margin-bottom:6px"></div>
+          <div id="col-hold-hint" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
           <div id="col-bars"></div>
-          <div class="code-box" style="margin-top:10px"># Sau khi quay đủ ~300–500 mẫu mỗi cử chỉ, chạy lệnh sau để huấn luyện & xuất ONNX:
-cd /Users/macos/Documents/AeroHand && uv sync --extra train
-uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invariant348</div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-top:10px;margin-bottom:4px">
+            <span style="font-size:11px;color:var(--muted)" id="lbl-train-cmd">Lệnh huấn luyện ONNX 1D-TCN (invariant348 mặc định):</span>
+            <button class="btn sm" id="btn-copy-train" onclick="copyTrainCmd()">📋 Sao chép lệnh train</button>
+          </div>
+          <div class="code-box" id="train-cmd-box">cd /Users/macos/Documents/AeroHand && uv sync --extra train && uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invariant348 --loss focal --augment</div>
         </div>
 
         <div class="card">
@@ -644,6 +681,64 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     const [w, h] = val.split("x").map(Number);
     post("set_keys", { updates: { "camera.width": w, "camera.height": h } });
   }
+
+  let LAST_GUIDED_ACTIVE = false;
+  function sendColMeta() {
+    post("collector_meta", {
+      meta: {
+        subject: (document.getElementById("col-meta-subj") || {}).value || "user",
+        hand: (document.getElementById("col-rec-hand") || {}).value === "both" ? "Both" : getPath(STATE.cfg, "hand.cursor_hand", "Right"),
+        wrist_angle: (document.getElementById("col-meta-angle") || {}).value || "0",
+        distance: (document.getElementById("col-meta-dist") || {}).value || "mid",
+        lighting: (document.getElementById("col-meta-light") || {}).value || "bright",
+        camera: getPath(STATE.cfg, "camera.device_id", "") || "default",
+      },
+    });
+  }
+
+  function toggleGuided() {
+    sendColMeta();
+    post(LAST_GUIDED_ACTIVE ? "collector_guided_stop" : "collector_guided_start");
+  }
+
+  function copyTrainCmd() {
+    const box = document.getElementById("train-cmd-box");
+    const btn = document.getElementById("btn-copy-train");
+    if (!box) return;
+    const text = box.textContent.trim();
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).catch(() => {});
+    }
+    if (btn) {
+      const colI18n = (STATE.i18n && STATE.i18n.collector) || {};
+      const orig = btn.textContent;
+      btn.textContent = colI18n.copied || "✓ Copied!";
+      setTimeout(() => { btn.textContent = orig; }, 1400);
+    }
+  }
+
+  // Hold-key labeling (0-6) when ML Studio tab is active (PinchDataCollector.ts parity)
+  let HELD_LABEL_KEY = null;
+  window.addEventListener("keydown", (e) => {
+    if (CURRENT_TAB !== "ml" || e.repeat) return;
+    const tag = (e.target && e.target.tagName) ? e.target.tagName.toUpperCase() : "";
+    if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+    if (e.key >= "0" && e.key <= "6") {
+      const idx = parseInt(e.key, 10);
+      if (idx >= 0 && idx < POSE_KEYS.length) {
+        HELD_LABEL_KEY = e.key;
+        post("collector_pose", { pose: POSE_KEYS[idx] });
+        post("collector_set_recording", { active: true });
+      }
+    }
+  });
+  window.addEventListener("keyup", (e) => {
+    if (HELD_LABEL_KEY !== null && e.key === HELD_LABEL_KEY) {
+      HELD_LABEL_KEY = null;
+      post("collector_pose", { pose: "idle" });
+      post("collector_set_recording", { active: false });
+    }
+  });
 
   function switchTab(tab) {
     CURRENT_TAB = tab;
@@ -985,6 +1080,21 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     document.getElementById("cfg-cls-backend").value = getPath(c, "classifier.backend", "heuristic_3d");
     const delSel = document.getElementById("cfg-trk-del");
     if (delSel) delSel.value = getPath(c, "tracker.delegate", "CPU");
+    const recHandSel = document.getElementById("col-rec-hand");
+    if (recHandSel) recHandSel.value = getPath(c, "collector.record_hand", "primary");
+    const colI18n = i18n.collector || {};
+    setTxt("t-col-hdr", "STUDIO THU THẬP DỮ LIỆU HUẤN LUYỆN TCN (TRONG APP)", "IN-APP TCN DATA COLLECTOR STUDIO");
+    setTxt("lbl-col-subj", "Người quay", "Subject");
+    setTxt("lbl-col-hand", "Tay ghi", "Record Hand");
+    setTxt("lbl-col-angle", "Góc cổ tay", "Wrist Angle");
+    setTxt("lbl-col-dist", "Khoảng cách", "Distance");
+    setTxt("lbl-col-light", "Ánh sáng", "Lighting");
+    setTxt("lbl-col-active", "Nhãn đang ghi", "Active Label");
+    setTxt("btn-col-undo", colI18n.undo_5s || "↩ Hủy 5 giây vừa quay", colI18n.undo_5s || "↩ Undo Last 5s");
+    setTxt("btn-col-save", "💾 Lưu JSON", "💾 Save JSON");
+    setTxt("btn-col-clear", "🗑 Xóa tạm", "🗑 Clear");
+    setTxt("btn-copy-train", colI18n.copy_cmd || "📋 Sao chép lệnh train", colI18n.copy_cmd || "📋 Copy Train Command");
+    setTxt("col-hold-hint", colI18n.hold_hint || "", colI18n.hold_hint || "");
     document.getElementById("col-pose-sel").innerHTML = POSE_KEYS
       .map((p, idx) => `<option value="${p}">[${idx}] ${poses[p] || p}</option>`).join("");
 
@@ -993,9 +1103,9 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
       `<div class="bar-row"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="pb-${p}" style="width:0%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--muted)" id="pv-${p}">0%</span></div>`
     ).join("");
 
-    // Collector bars
+    // Collector progress bars vs target (idle=8000, pinch=3000)
     document.getElementById("col-bars").innerHTML = POSE_KEYS.map(p =>
-      `<div class="bar-row"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="cb-${p}" style="width:0%"></div></div><span style="font-size:11.5px;text-align:right;color:var(--teal)" id="cv-${p}">0</span></div>`
+      `<div class="bar-row" style="grid-template-columns:195px 1fr 125px"><span style="font-size:12px">${poses[p] || p}</span><div class="bar-bg"><div class="bar-fill" id="cb-${p}" style="width:0%"></div></div><span style="font-size:11px;text-align:right;color:var(--teal)" id="cv-${p}">0 / 3000</span></div>`
     ).join("");
 
     // Practice cards (100% synced to active gesture bindings!)
@@ -1103,15 +1213,65 @@ uv run python scripts/train_tcn.py --sessions data/sessions --feature-set invari
     // Collector & Timing (only update when ML tab active to save DOM work)
     if (CURRENT_TAB === "ml") {
       const col = snap.collector || {};
+      const colI18n = i18n.collector || {};
       document.getElementById("col-total").textContent = (col.total || 0) + (isVi ? " mẫu" : " samples");
       document.getElementById("btn-col-rec").textContent = col.recording ? (isVi ? "⏹ Dừng ghi mẫu" : "⏹ Stop Recording") : (isVi ? "⏺ Bắt đầu ghi mẫu" : "⏺ Start Recording");
+
+      const badgeEl = document.getElementById("col-active-badge");
+      if (badgeEl) {
+        const curPose = col.current_pose || "idle";
+        badgeEl.textContent = (i18n.poses && i18n.poses[curPose]) || curPose;
+        badgeEl.style.background = col.recording ? "rgba(251,113,133,0.22)" : "rgba(96,165,250,0.16)";
+        badgeEl.style.color = col.recording ? "var(--rose)" : "var(--blue)";
+      }
+
+      const g = col.guided || {};
+      LAST_GUIDED_ACTIVE = !!g.active;
+      const gBtn = document.getElementById("btn-col-guided");
+      if (gBtn) gBtn.textContent = g.active ? (colI18n.guided_stop || "⏹ Stop") : (colI18n.guided_start || "🎬 Guided");
+      const gBan = document.getElementById("col-guided-banner");
+      if (gBan) {
+        if (g.active && g.pose) {
+          const pLbl = (i18n.poses && i18n.poses[g.pose]) || g.pose;
+          const tmpl = g.phase === "countdown" ? (colI18n.countdown || "{pose} {sec}s") : (colI18n.recording_step || "{pose} {sec}s");
+          gBan.style.display = "block";
+          gBan.textContent = `[${(g.step_index || 0) + 1}/${g.total_steps || 9}] ` + tmpl.replace("{pose}", pLbl).replace("{sec}", String(g.remaining_s || 0)) + (g.condition_note ? ` — ${g.condition_note}` : "");
+        } else if (g.phase === "done") {
+          gBan.style.display = "block";
+          gBan.textContent = colI18n.guided_done || "Done!";
+        } else {
+          gBan.style.display = "none";
+        }
+      }
+
+      const qBan = document.getElementById("col-quality-banner");
+      const q = col.quality || {};
+      if (qBan) {
+        if (col.total > 0 && q.warnings && q.warnings.length) {
+          qBan.style.color = "var(--amber)";
+          qBan.textContent = q.warnings.map(w => colI18n["warn_" + w] || w).join(" • ");
+        } else if (col.total > 0) {
+          qBan.style.color = "var(--green)";
+          qBan.textContent = (colI18n.quality_ok || "OK") + ` (conf=${q.mean_confidence || 1.0})`;
+        } else {
+          qBan.textContent = "";
+        }
+      }
+
+      const prog = col.corpus_progress || {};
       const cnts = col.counts || {};
       for (const p of POSE_KEYS) {
-        const n = cnts[p] || 0;
+        const entry = prog[p] || { total: cnts[p] || 0, Right: 0, Left: 0, target: p === "idle" ? 8000 : 3000 };
+        const n = entry.total || 0;
+        const tgt = entry.target || 3000;
+        const pct = Math.min(100, Math.round((n / tgt) * 100));
         const cb = document.getElementById("cb-" + p);
         const cv = document.getElementById("cv-" + p);
-        if (cb) cb.style.width = Math.min(100, Math.round((n / 400) * 100)) + "%";
-        if (cv) cv.textContent = String(n);
+        if (cb) {
+          cb.style.width = pct + "%";
+          cb.style.background = n >= tgt ? "var(--green)" : "linear-gradient(90deg, var(--teal), var(--blue))";
+        }
+        if (cv) cv.textContent = `${n}/${tgt} (R:${entry.Right || 0} L:${entry.Left || 0})`;
       }
       document.getElementById("prof-headroom").textContent = `Headroom: ${(t.headroom_ms || 0).toFixed(1)} ms (${(t.utilization_pct || 0).toFixed(0)}%)`;
       const tRows = [

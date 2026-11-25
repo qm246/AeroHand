@@ -63,6 +63,7 @@ gestures:
   enable_dictation: true
   enable_zoom: true
   zoom_speed: 1.0
+  latch_gate_while_pose_active: true   # Keep classifying active pose even if hand tilts past dirZ gate
 
 smoothing:
   enable_landmark_smoothing: true

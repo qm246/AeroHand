@@ -941,3 +941,83 @@ def test_pending_config_applied_on_processing_thread():
     assert applied_threads[0] != worker_tid[0]
     assert rt.engine.config["cursor"]["pointer_sensitivity"] == 3.4
     assert rt._flush_pending_config() is False
+
+
+def test_active_drag_survives_gate_closing():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["gestures"]["latch_gate_while_pose_active"] = True
+
+    class _ConstDragClassifier:
+        def __init__(self) -> None:
+            self.pose = PoseName.THUMB_INDEX_MIDDLE_PINCH
+
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            if self.pose != PoseName.IDLE:
+                probs[PoseName.IDLE] = 0.05
+                probs[self.pose] = 0.95
+            return PinchPrediction(self.pose, probs, "high")
+
+        def reset(self):
+            pass
+
+    clf = _ConstDragClassifier()
+    eng = HandCursorEngine(cfg, classifier=clf)
+
+    # Point forward and hold 3-finger pinch long enough to start drag
+    fwd = _make_open_hand(forward_z=-0.25)
+    eng.process_frame([HandInput("Right", fwd, fwd)], 0.0, 1920.0, 1080.0)
+    eng.process_frame([HandInput("Right", fwd, fwd)], 33.0, 1920.0, 1080.0)
+    outs_hold = eng.process_frame([HandInput("Right", fwd, fwd)], 260.0, 1920.0, 1080.0)
+    assert outs_hold[0].pose.is_grabbing is True
+
+    # Hand tilts upward so dirZ crosses -0.11 (pointing gate closes) mid-drag
+    tilted_away = _make_open_hand(forward_z=+0.05)
+    for k in range(6):
+        outs_tilted = eng.process_frame(
+            [HandInput("Right", tilted_away, tilted_away)], 300.0 + k * 33.0, 1920.0, 1080.0
+        )
+        assert outs_tilted[0].cursor.is_pointing is False
+        assert outs_tilted[0].pose.is_grabbing is True
+
+    # When pinch actually releases -> drag ends cleanly even with gate closed
+    clf.pose = PoseName.IDLE
+    ended = False
+    for k in range(5):
+        outs_rel = eng.process_frame(
+            [HandInput("Right", tilted_away, tilted_away)], 550.0 + k * 33.0, 1920.0, 1080.0
+        )
+        if outs_rel[0].pose.grab_just_ended:
+            ended = True
+    assert ended is True
+
+
+def test_new_pose_blocked_when_gate_closed():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["gestures"]["latch_gate_while_pose_active"] = True
+
+    class _AlwaysClickClassifier:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high")
+
+        def reset(self):
+            pass
+
+    eng = HandCursorEngine(cfg, classifier=_AlwaysClickClassifier())
+    away = _make_open_hand(forward_z=+0.10)
+    for k in range(5):
+        outs = eng.process_frame([HandInput("Right", away, away)], k * 33.0, 1920.0, 1080.0)
+        assert outs[0].cursor.is_pointing is False
+        assert outs[0].pose.active_pose is None
+        assert outs[0].pose.is_pinching is False

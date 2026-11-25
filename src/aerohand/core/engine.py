@@ -28,7 +28,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from aerohand.core.filters import LandmarkSmoother
 from aerohand.core.kinematics import CursorKinematics
 from aerohand.core.palm_frame import compute_hand_rotation, compute_pointing_dir_z
-from aerohand.core.palm_wheel import PalmWheelDetector
+from aerohand.core.palm_wheel import PalmWheelDetector, PalmWheelOutput
 from aerohand.core.pose_state_machine import PoseStateMachine
 from aerohand.core.scroll_controller import ScrollController
 from aerohand.core.spaces_nav import SpacesNavController
@@ -148,6 +148,7 @@ class HandCursorEngine:
         self.enable_spaces_nav: bool = bool(gest_cfg.get("enable_spaces_nav", True))
         self.enable_dictation: bool = bool(gest_cfg.get("enable_dictation", True))
         self.enable_zoom: bool = bool(gest_cfg.get("enable_zoom", True))
+        self.latch_gate_while_pose_active: bool = bool(gest_cfg.get("latch_gate_while_pose_active", True))
         self.zoom.update_config(gest_cfg)
 
         cur_cfg = config.get("cursor") or {}
@@ -311,8 +312,13 @@ class HandCursorEngine:
             pre_ms += (time.perf_counter() - tp0) * 1000.0
 
             # 2. Palm Wheel detection FIRST so cursor smoothly switches to palm center
+            # Suppress Palm Wheel while an active pinch pose (e.g. drag/scroll) is held
             tg0 = time.perf_counter()
-            pw_out = hs.palm_wheel.process(lms, timestamp_ms, handedness=hand)
+            if hs.pose_sm.active_pose is not None:
+                hs.palm_wheel.reset()
+                pw_out = PalmWheelOutput()
+            else:
+                pw_out = hs.palm_wheel.process(lms, timestamp_ms, handedness=hand)
             pw_active = pw_out.state in ("active", "confirmed")
             gest_ms += (time.perf_counter() - tg0) * 1000.0
 
@@ -377,10 +383,15 @@ class HandCursorEngine:
                 palm_size=palm_size,
             )
 
-            # 5. Pluggable Pinch Classification (fail-open to IDLE)
+            # 5. Pluggable Pinch Classification (fail-open to IDLE; latch gate while pose is active)
             pose_probs = idle_probabilities()
             pred_pose = PoseName.IDLE
-            gate_allows = (not self.require_pointing_gate_for_actions) or is_pointing
+            pose_active = hs.pose_sm.active_pose is not None
+            gate_allows = (
+                (not self.require_pointing_gate_for_actions)
+                or is_pointing
+                or (self.latch_gate_while_pose_active and pose_active)
+            )
             tm0 = time.perf_counter()
             if self.classifier is not None and not pw_active and gate_allows:
                 try:

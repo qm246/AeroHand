@@ -260,3 +260,74 @@ def compute_palm_facing_dot(
     if mag < 1e-7:
         return 0.0
     return (nz / mag) if mirrored else (-nz / mag)
+
+
+def compute_finger_extension_ratios(pf: PalmFrameResult) -> dict[str, float]:
+    """
+    Compute 3D scale-invariant extension ratio `||tip - wrist|| / ||mcp - wrist||`
+    for index, middle, ring, and pinky fingers inside `pf` (~1.75-2.0 straight, ~0.8-1.2 curled).
+    """
+    pairs = (
+        ("index", INDEX_TIP, INDEX_MCP),
+        ("middle", MIDDLE_TIP, MIDDLE_MCP),
+        ("ring", RING_TIP, RING_MCP),
+        ("pinky", PINKY_TIP, PINKY_MCP),
+    )
+    out: dict[str, float] = {}
+    for name, tip_i, mcp_i in pairs:
+        mcp_d = pf.dist(WRIST, mcp_i)
+        tip_d = pf.dist(WRIST, tip_i)
+        out[name] = round(tip_d / max(mcp_d, 1e-6), 4)
+    return out
+
+
+def extract_frame_diagnostics(
+    landmarks_2d: Sequence[Landmark],
+    world_landmarks: Optional[Sequence[Landmark]],
+    handedness: str,
+) -> dict[str, Any]:
+    """Read-only diagnostic features for offline false-trigger analysis (V041-03)."""
+    src = world_landmarks if (world_landmarks is not None and len(world_landmarks) >= 21) else landmarks_2d
+    is_left = str(handedness) == "Left"
+    pf = compute_palm_frame(src, anchor="palm_center", is_left_hand=is_left, scale_metric="palm_width")
+    if pf is None:
+        return {
+            "thumb_distances": {},
+            "curled_count": 0,
+            "half_curled_count": 0,
+            "finger_extensions": {},
+            "palm_facing_dot": 0.0,
+            "dir_z": compute_pointing_dir_z(landmarks_2d),
+        }
+
+    d_idx = pf.dist(THUMB_TIP, INDEX_TIP)
+    d_mid = pf.dist(THUMB_TIP, MIDDLE_TIP)
+    d_ring = pf.dist(THUMB_TIP, RING_TIP)
+    d_pinky = pf.dist(THUMB_TIP, PINKY_TIP)
+    d_pbase = pf.dist(THUMB_TIP, PINKY_MCP)
+    d_dual = max(d_idx, d_mid)
+
+    curled = 0
+    half_curled = 0
+    for tip_idx in (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP):
+        d_palm = float(np.linalg.norm(pf.coords_normalized[tip_idx]))
+        if d_palm < 0.72:
+            curled += 1
+        if d_palm < 1.05:
+            half_curled += 1
+
+    return {
+        "thumb_distances": {
+            "d_idx": round(d_idx, 4),
+            "d_mid": round(d_mid, 4),
+            "d_ring": round(d_ring, 4),
+            "d_pinky": round(d_pinky, 4),
+            "d_pbase": round(d_pbase, 4),
+            "d_dual": round(d_dual, 4),
+        },
+        "curled_count": curled,
+        "half_curled_count": half_curled,
+        "finger_extensions": compute_finger_extension_ratios(pf),
+        "palm_facing_dot": round(compute_palm_facing_dot(landmarks_2d, is_left_hand=is_left), 4),
+        "dir_z": round(compute_pointing_dir_z(landmarks_2d), 4),
+    }

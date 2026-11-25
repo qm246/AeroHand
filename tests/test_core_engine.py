@@ -3178,3 +3178,101 @@ def test_bench_delegates_to_replay_eval(tmp_path: Path):
     rep = bench_mod.benchmark_dir(dev_dir)
     assert rep["total_frames"] == 10
     assert "false_triggers" in rep and "total_upper_bound_per_hour" in rep["false_triggers"]
+
+
+def test_replay_counts_dictation_starts(tmp_path: Path):
+    from aerohand.ml.base import PinchPrediction
+
+    mod = _load_replay_eval_module("replay_eval_dict_ft")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    # 25 frames spanning ~800ms (> dictation_arm_ms=350ms + enter_frames=3)
+    for i in range(25):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    neg_fp = col.save(tmp_path)
+
+    class _FalseDictClf:
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        classifier=_FalseDictClf(),
+        min_exposure_hours_for_claim=0.0,
+    )
+    assert rep["false_triggers"]["dictation_starts"] == 1
+    assert rep["false_triggers"]["by_type"]["dictation_start"] == 1
+    assert len(rep["false_triggers"]["per_scenario"]) == 1
+
+
+def test_ft_jsonl_contains_feature_fields(tmp_path: Path):
+    import json
+
+    from aerohand.ml.base import PinchPrediction
+
+    mod = _load_replay_eval_module("replay_eval_jsonl")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h = _make_open_hand(forward_z=-0.25)
+    for i in range(20):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    neg_fp = col.save(tmp_path)
+
+    class _FalseClickClf:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            self.n += 1
+            probs = idle_probabilities()
+            if 4 <= self.n <= 6:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            self.n = 0
+
+    jsonl_fp = tmp_path / "ft_events.jsonl"
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        classifier=_FalseClickClf(),
+        ft_jsonl_path=jsonl_fp,
+        min_exposure_hours_for_claim=0.0,
+    )
+    lines = [json.loads(ln) for ln in jsonl_fp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) == rep["false_triggers"]["total"] == 1
+    ev = lines[0]
+    for req_key in (
+        "scenario",
+        "timestamp_ms",
+        "hand",
+        "trigger_type",
+        "pose_probabilities",
+        "thumb_distances",
+        "curled_count",
+        "finger_extensions",
+        "wrist_speed",
+        "dir_z",
+        "palm_size",
+        "hand_visible_ms",
+    ):
+        assert req_key in ev
+    assert set(ev["thumb_distances"].keys()) == {"d_idx", "d_mid", "d_ring", "d_pinky", "d_pbase", "d_dual"}
+    assert set(ev["finger_extensions"].keys()) == {"index", "middle", "ring", "pinky"}

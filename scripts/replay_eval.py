@@ -31,6 +31,7 @@ import numpy as np
 
 from aerohand.config import load_config
 from aerohand.core.engine import HandCursorEngine
+from aerohand.core.palm_frame import compute_hand_rotation, extract_frame_diagnostics
 from aerohand.core.types import ALL_POSE_NAMES, HandInput
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
@@ -43,6 +44,16 @@ from aerohand.ml.recording_io import (
 )
 
 NUM_CLASSES: int = len(ALL_POSE_NAMES)
+ALL_TRIGGER_TYPES: Tuple[str, ...] = (
+    "left_click",
+    "right_click",
+    "drag_start",
+    "scroll_stroke",
+    "palm_wheel",
+    "window_tile",
+    "spaces_nav",
+    "dictation_start",
+)
 
 
 def _collect_json_paths(inputs: Sequence[str | Path]) -> List[Path]:
@@ -148,10 +159,13 @@ def evaluate_recordings(
     min_exposure_hours_for_claim: float = 1.5,
     baseline: Optional[Dict[str, Any]] = None,
     max_f1_regression: float = 0.01,
+    ft_jsonl_path: Optional[str | Path] = None,
+    allow_sealed_aerohand: bool = False,
 ) -> Dict[str, Any]:
     """
     Deterministically replay all session and negative JSON files through `HandCursorEngine`
-    and aggregate classification, Poisson-UCB false-trigger-per-hour, and click-anchor telemetry.
+    and aggregate classification, Poisson-UCB false-trigger-per-hour (all 8 trigger types),
+    per-scenario breakdown, optional per-event FT JSONL diagnostics, and click-anchor stats.
 
     Exposure definitions (reported separately):
       - `hand_present_idle_hours`: cumulative frame-to-frame time (gaps <= 500 ms) where a hand
@@ -162,7 +176,9 @@ def evaluate_recordings(
     base_cfg = deepcopy(config) if config is not None else load_config()
     y_true_all: List[int] = []
     y_pred_all: List[int] = []
-    ft_counts = {"clicks": 0, "right_clicks": 0, "drags": 0, "dictation_starts": 0}
+    ft_by_type: Dict[str, int] = {k: 0 for k in ALL_TRIGGER_TYPES}
+    ft_events: List[Dict[str, Any]] = []
+    scenario_stats: Dict[str, Dict[str, Any]] = {}
     anchor_offsets_px: List[float] = []
     idle_duration_ms = 0.0
     total_duration_ms = 0.0
@@ -174,12 +190,29 @@ def evaluate_recordings(
     ]
 
     for fp, is_neg in work_items:
-        assert_not_heldout(fp)
-        frames, rec_meta = load_recording_frames(fp, force_idle=is_neg)
+        assert_not_heldout(fp, allow_sealed_aerohand=allow_sealed_aerohand)
+        frames, rec_meta = load_recording_frames(
+            fp, force_idle=is_neg, allow_sealed_aerohand=allow_sealed_aerohand
+        )
         if not frames:
             continue
         evaluated_files.append(fp.name)
-        wall_clock_ms += float(rec_meta.get("wall_clock_ms", 0.0))
+        sc_name = str(rec_meta.get("scenario") or fp.stem)
+        file_wall_ms = float(rec_meta.get("wall_clock_ms", 0.0))
+        wall_clock_ms += file_wall_ms
+
+        sc = scenario_stats.setdefault(
+            sc_name,
+            {
+                "scenario": sc_name,
+                "files": [],
+                "idle_duration_ms": 0.0,
+                "wall_clock_ms": 0.0,
+                "counts": {k: 0 for k in ALL_TRIGGER_TYPES},
+            },
+        )
+        sc["files"].append(fp.name)
+        sc["wall_clock_ms"] += file_wall_ms
 
         clf = classifier
         if clf is None:
@@ -195,11 +228,20 @@ def evaluate_recordings(
         eng.anchor_cursor("Left", width * 0.5, height * 0.5)
 
         prev_present_ts: Optional[float] = None
+        prev_scrolling = False
+        visible_since_by_hand: Dict[str, float] = {}
+        prev_wrist_by_hand: Dict[str, Tuple[float, float, float]] = {}
+        prev_rot_by_hand: Dict[str, Tuple[float, float, float, float]] = {}
+
         for fr in frames:
             ts = float(fr["timestamp_ms"])
             if not fr["hand_present"] or not fr["landmarks_2d"]:
                 eng.process_frame([], ts, width, height)
                 prev_present_ts = None
+                prev_scrolling = False
+                visible_since_by_hand.clear()
+                prev_wrist_by_hand.clear()
+                prev_rot_by_hand.clear()
                 continue
 
             if prev_present_ts is not None:
@@ -208,11 +250,44 @@ def evaluate_recordings(
                     total_duration_ms += dt
                     if fr["is_idle_gt"]:
                         idle_duration_ms += dt
+                        sc["idle_duration_ms"] += dt
+                else:
+                    visible_since_by_hand.clear()
+                    prev_wrist_by_hand.clear()
+                    prev_rot_by_hand.clear()
             else:
                 total_duration_ms += 33.33
                 if fr["is_idle_gt"]:
                     idle_duration_ms += 33.33
+                    sc["idle_duration_ms"] += 33.33
             prev_present_ts = ts
+
+            hand = str(fr["handedness"])
+            if hand not in visible_since_by_hand:
+                visible_since_by_hand[hand] = ts
+            hand_visible_ms = max(0.0, ts - visible_since_by_hand[hand])
+
+            w0 = fr["landmarks_2d"][0]
+            wrist_speed = 0.0
+            if hand in prev_wrist_by_hand:
+                px, py, pts = prev_wrist_by_hand[hand]
+                dt_s = (ts - pts) / 1000.0
+                if 0.005 <= dt_s <= 0.35:
+                    wrist_speed = math.hypot(w0.x - px, w0.y - py) / dt_s
+            prev_wrist_by_hand[hand] = (w0.x, w0.y, ts)
+
+            rot = compute_hand_rotation(fr["landmarks_2d"])
+            wrist_ang_speed = 0.0
+            if rot is not None:
+                if hand in prev_rot_by_hand:
+                    pp, pyaw, proll, pts = prev_rot_by_hand[hand]
+                    dt_s = (ts - pts) / 1000.0
+                    if 0.005 <= dt_s <= 0.35:
+                        dp = ((rot.pitch - pp + 180.0) % 360.0) - 180.0
+                        dy = ((rot.yaw - pyaw + 180.0) % 360.0) - 180.0
+                        dr = ((rot.roll - proll + 180.0) % 360.0) - 180.0
+                        wrist_ang_speed = math.sqrt(dp * dp + dy * dy + dr * dr) / dt_s
+                prev_rot_by_hand[hand] = (rot.pitch, rot.yaw, rot.roll, ts)
 
             h_in = HandInput(
                 handedness=fr["handedness"],
@@ -223,6 +298,7 @@ def evaluate_recordings(
             )
             outs = eng.process_frame([h_in], ts, width, height)
             if not outs:
+                prev_scrolling = False
                 continue
             ho = outs[0]
             y_true_all.append(int(fr["label_idx"]))
@@ -233,15 +309,61 @@ def evaluate_recordings(
                     math.hypot(float(ho.pose.click_x) - ho.cursor.x, float(ho.pose.click_y) - ho.cursor.y)
                 )
 
+            fired: List[str] = []
             if fr["is_idle_gt"]:
-                if ho.pose.is_clicking:
-                    ft_counts["clicks"] += 1
-                if ho.pose.is_right_clicking:
-                    ft_counts["right_clicks"] += 1
-                if ho.pose.grab_just_started:
-                    ft_counts["drags"] += 1
-                if ho.pose.dictation_just_started:
-                    ft_counts["dictation_starts"] += 1
+                p = ho.pose
+                if p.is_clicking:
+                    fired.append("left_click")
+                if p.is_right_clicking:
+                    fired.append("right_click")
+                if p.grab_just_started:
+                    fired.append("drag_start")
+                if p.is_scrolling and not prev_scrolling:
+                    fired.append("scroll_stroke")
+                if p.palm_wheel_action is not None:
+                    fired.append("palm_wheel")
+                if p.window_tile_direction is not None:
+                    fired.append("window_tile")
+                if p.spaces_nav_direction is not None:
+                    fired.append("spaces_nav")
+                if p.dictation_just_started:
+                    fired.append("dictation_start")
+            prev_scrolling = bool(ho.pose.is_scrolling)
+
+            if fired:
+                diag = extract_frame_diagnostics(
+                    fr["landmarks_2d"], fr["world_landmarks"], fr["handedness"]
+                )
+                probs_d = {k.value: round(float(v), 4) for k, v in ho.pose.pose_probabilities.items()}
+                for trig in fired:
+                    ft_by_type[trig] += 1
+                    sc["counts"][trig] += 1
+                    ft_events.append(
+                        {
+                            "scenario": sc_name,
+                            "file": fp.name,
+                            "timestamp_ms": round(ts, 2),
+                            "hand": hand,
+                            "trigger_type": trig,
+                            "pose_probabilities": probs_d,
+                            "thumb_distances": diag["thumb_distances"],
+                            "curled_count": diag["curled_count"],
+                            "half_curled_count": diag["half_curled_count"],
+                            "finger_extensions": diag["finger_extensions"],
+                            "wrist_speed": round(wrist_speed, 4),
+                            "wrist_ang_speed_deg_s": round(wrist_ang_speed, 2),
+                            "dir_z": round(float(ho.cursor.pointing_dir_z), 4),
+                            "palm_size": round(float(ho.cursor.palm_size), 5),
+                            "palm_facing_dot": diag["palm_facing_dot"],
+                            "hand_visible_ms": round(hand_visible_ms, 1),
+                        }
+                    )
+
+    if ft_jsonl_path is not None:
+        jfp = Path(ft_jsonl_path)
+        jfp.parent.mkdir(parents=True, exist_ok=True)
+        lines = [json.dumps(ev, ensure_ascii=False) for ev in ft_events]
+        jfp.write_text(("\n".join(lines) + "\n") if lines else "", encoding="utf-8")
 
     cls_metrics = compute_classification_metrics(
         np.asarray(y_true_all, dtype=np.int64),
@@ -250,14 +372,14 @@ def evaluate_recordings(
 
     idle_hours = idle_duration_ms / 3_600_000.0
     wall_hours = wall_clock_ms / 3_600_000.0
-    total_ft = sum(ft_counts.values())
+    total_ft = sum(ft_by_type.values())
 
-    def _per_hour(cnt: int) -> float:
+    def _per_hour(cnt: int, exp_h: float = idle_hours) -> float:
         if cnt == 0:
             return 0.0
-        if idle_hours <= 1e-9:
+        if exp_h <= 1e-9:
             return float("inf")
-        return round(float(cnt) / idle_hours, 3)
+        return round(float(cnt) / exp_h, 3)
 
     def _cat_stats(cnt: int) -> Dict[str, Any]:
         return {
@@ -268,13 +390,36 @@ def evaluate_recordings(
             "upper_bound_per_hour": poisson_upper_bound_rate(cnt, idle_hours, ci_level=ci_level),
         }
 
+    per_scenario: List[Dict[str, Any]] = []
+    for sc_key in sorted(scenario_stats.keys()):
+        entry = scenario_stats[sc_key]
+        sc_idle_h = entry["idle_duration_ms"] / 3_600_000.0
+        sc_wall_h = entry["wall_clock_ms"] / 3_600_000.0
+        sc_total = sum(entry["counts"].values())
+        per_scenario.append(
+            {
+                "scenario": sc_key,
+                "files": entry["files"],
+                "hand_present_idle_hours": round(sc_idle_h, 6),
+                "wall_clock_hours": round(sc_wall_h, 6),
+                "total_ft": sc_total,
+                "rate_per_hour": _per_hour(sc_total, sc_idle_h),
+                "upper_bound_per_hour": poisson_upper_bound_rate(sc_total, sc_idle_h, ci_level=ci_level),
+                "counts": dict(entry["counts"]),
+            }
+        )
+
     total_ucb = poisson_upper_bound_rate(total_ft, idle_hours, ci_level=ci_level)
     required_for_target = (
         poisson_upper_bound_count(0, ci_level=ci_level) / float(max_ft_per_hour)
         if max_ft_per_hour > 0.0
         else float("inf")
     )
-    eff_min_exp = max(float(min_exposure_hours_for_claim), required_for_target) if min_exposure_hours_for_claim > 0.0 else 0.0
+    eff_min_exp = (
+        max(float(min_exposure_hours_for_claim), required_for_target)
+        if min_exposure_hours_for_claim > 0.0
+        else 0.0
+    )
     exposure_sufficient = idle_hours >= eff_min_exp
     exposure_notice = (
         "sufficient exposure to certify target"
@@ -283,28 +428,36 @@ def evaluate_recordings(
     )
 
     ft_report = {
-        **ft_counts,
+        # Legacy aliases preserved for backward compatibility
+        "clicks": ft_by_type["left_click"],
+        "right_clicks": ft_by_type["right_click"],
+        "drags": ft_by_type["drag_start"],
+        "dictation_starts": ft_by_type["dictation_start"],
+        # Complete 8-trigger breakdown (V041-03)
+        "by_type": dict(ft_by_type),
         "total": total_ft,
         "ci_level": float(ci_level),
         "idle_duration_s": round(idle_duration_ms / 1000.0, 3),
         "wall_clock_duration_s": round(wall_clock_ms / 1000.0, 3),
         "hand_present_idle_hours": round(idle_hours, 6),
         "wall_clock_hours": round(wall_hours, 6),
-        "clicks_per_hour": _per_hour(ft_counts["clicks"]),
-        "right_clicks_per_hour": _per_hour(ft_counts["right_clicks"]),
-        "drags_per_hour": _per_hour(ft_counts["drags"]),
-        "dictation_per_hour": _per_hour(ft_counts["dictation_starts"]),
+        "clicks_per_hour": _per_hour(ft_by_type["left_click"]),
+        "right_clicks_per_hour": _per_hour(ft_by_type["right_click"]),
+        "drags_per_hour": _per_hour(ft_by_type["drag_start"]),
+        "dictation_per_hour": _per_hour(ft_by_type["dictation_start"]),
         "total_ft_per_hour": _per_hour(total_ft),
         "total_upper_bound_per_hour": total_ucb,
         "exposure_sufficient": exposure_sufficient,
         "exposure_notice": exposure_notice,
         "categories": {
-            "clicks": _cat_stats(ft_counts["clicks"]),
-            "right_clicks": _cat_stats(ft_counts["right_clicks"]),
-            "drags": _cat_stats(ft_counts["drags"]),
-            "dictation_starts": _cat_stats(ft_counts["dictation_starts"]),
+            **{k: _cat_stats(ft_by_type[k]) for k in ALL_TRIGGER_TYPES},
+            "clicks": _cat_stats(ft_by_type["left_click"]),
+            "drags": _cat_stats(ft_by_type["drag_start"]),
+            "dictation_starts": _cat_stats(ft_by_type["dictation_start"]),
             "total": _cat_stats(total_ft),
         },
+        "per_scenario": per_scenario,
+        "ft_events_count": len(ft_events),
     }
 
     if anchor_offsets_px:
@@ -392,6 +545,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         help="Minimum idle hand-present hours required to certify target (default 1.5h ~= 3/2.0)",
     )
     parser.add_argument("--max-f1-regression", type=float, default=0.01, help="Fail if macro-F1 drops more than this vs baseline")
+    parser.add_argument("--ft-jsonl", type=str, default=None, help="Optional JSONL path to write per-event false-trigger diagnostics")
     parser.add_argument("--out", type=str, default=None, help="Optional path to write JSON evaluation report")
     args = parser.parse_args(argv)
 
@@ -415,6 +569,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         min_exposure_hours_for_claim=args.min_exposure_hours_for_claim,
         baseline=baseline_data,
         max_f1_regression=args.max_f1_regression,
+        ft_jsonl_path=args.ft_jsonl,
     )
     if not report["false_triggers"]["exposure_sufficient"]:
         print(f"[WARN] {report['false_triggers']['exposure_notice']}", file=sys.stderr)

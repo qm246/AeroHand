@@ -3276,3 +3276,95 @@ def test_ft_jsonl_contains_feature_fields(tmp_path: Path):
         assert req_key in ev
     assert set(ev["thumb_distances"].keys()) == {"d_idx", "d_mid", "d_ring", "d_pinky", "d_pbase", "d_dual"}
     assert set(ev["finger_extensions"].keys()) == {"index", "middle", "ring", "pinky"}
+
+
+def test_second_hand_pinch_does_not_cancel_long_dictation():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["gestures"]["dictation_arm_ms"] = 350
+    cfg["gestures"]["dictation_priority_ms"] = 1000
+
+    class _LongDictClf:
+        def __init__(self) -> None:
+            self.left_active = False
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            if handedness == "Right" or self.left_active:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _LongDictClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    left_h = _make_open_hand(forward_z=-0.25)
+    right_h = [Landmark(p.x + 0.25, p.y, p.z) for p in left_h]
+
+    # Arm dictation on Right hand (~t=420ms) and keep speaking for 1.2s (t=1650ms)
+    for ts in [0.0, 33.0, 66.0, 200.0, 420.0, 800.0, 1200.0, 1650.0]:
+        outs = eng.process_frame(
+            [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], ts, 1920.0, 1080.0
+        )
+    r_now = next(o for o in outs if o.hand == "Right")
+    assert r_now.pose.is_dictating is True
+
+    # Left hand now incidentally forms thumb-index curl at t=1700..1900ms -> MUST NOT cancel dictation or zoom!
+    clf.left_active = True
+    for ts in [1700.0, 1750.0, 1850.0, 1950.0]:
+        outs2 = eng.process_frame(
+            [HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], ts, 1920.0, 1080.0
+        )
+        r_after = next(o for o in outs2 if o.hand == "Right")
+        assert r_after.pose.dictation_cancelled is False
+        assert r_after.pose.is_dictating is True
+        assert eng.last_zoom.is_zooming is False
+        assert eng.last_refusal_code == "dictation_priority"
+
+
+def test_zoom_still_cancels_dictation_within_arbitration_window():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["gestures"]["dictation_arm_ms"] = 350
+    cfg["gestures"]["dictation_priority_ms"] = 1000
+    cfg["gestures"]["zoom_arbitration_ms"] = 300
+
+    class _JoinZoomClf:
+        def __init__(self) -> None:
+            self.left_active = False
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            if handedness == "Right" or self.left_active:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _JoinZoomClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    left_h = _make_open_hand(forward_z=-0.25)
+    right_h = [Landmark(p.x + 0.25, p.y, p.z) for p in left_h]
+
+    # Arm dictation at t=420ms, then second hand joins 80ms later (well below 1000ms priority)
+    for ts in [0.0, 33.0, 66.0, 200.0, 420.0]:
+        eng.process_frame([HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], ts, 1920.0, 1080.0)
+    clf.left_active = True
+    outs = eng.process_frame([HandInput("Left", left_h, left_h), HandInput("Right", right_h, right_h)], 500.0, 1920.0, 1080.0)
+    r_out = next(o for o in outs if o.hand == "Right")
+    assert r_out.pose.dictation_cancelled is True
+    assert r_out.pose.is_dictating is False

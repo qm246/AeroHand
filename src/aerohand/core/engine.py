@@ -498,6 +498,7 @@ class HandCursorEngine:
             self.zoom_pose = PoseName.THUMB_INDEX_PINCH
         self.zoom_arbitration_ms: float = max(0.0, min(1000.0, float(gest_cfg.get("zoom_arbitration_ms", 300.0))))
         self.dictation_arm_ms: float = max(200.0, min(800.0, float(gest_cfg.get("dictation_arm_ms", 350.0))))
+        self.dictation_priority_ms: float = max(0.0, min(5000.0, float(gest_cfg.get("dictation_priority_ms", 1000.0))))
         self.latch_gate_while_pose_active: bool = bool(gest_cfg.get("latch_gate_while_pose_active", True))
         self.zoom.update_config(gest_cfg)
 
@@ -1137,23 +1138,39 @@ class HandCursorEngine:
 
             outputs.append(HandOutput(hand=hand, cursor=cursor_out, pose=pose_out))
 
-        # 8. Two-Hand Zoom vs Single-Hand Dictation Arbitration (V031-01)
+        # 8. Two-Hand Zoom vs Single-Hand Dictation Arbitration (V031-01 + V041-04 priority)
         any_busy_for_zoom = any(
             o.pose.is_grabbing
             or o.pose.is_scrolling
             or o.pose.palm_wheel_state in ("active", "confirmed")
             for o in outputs
         )
-        both_in_zoom_pose = (
+        raw_both_in_zoom_pose = (
             self.enable_zoom
             and (not any_busy_for_zoom)
             and len(outputs) == 2
             and hand_pinching.get("Left", False)
             and hand_pinching.get("Right", False)
         )
+        # V041-04: Once dictation has been active >= dictation_priority_ms, ignore incidental 2nd-hand zoom
+        dictation_has_priority = any(
+            self._hands[o.hand].is_dictating
+            and self._hands[o.hand].dictation_started_ms is not None
+            and (timestamp_ms - self._hands[o.hand].dictation_started_ms) >= self.dictation_priority_ms
+            for o in outputs
+        )
+        dictation_priority_suppressed_zoom = dictation_has_priority and raw_both_in_zoom_pose
+        both_in_zoom_pose = raw_both_in_zoom_pose and (not dictation_has_priority)
+
         zoom_intent = both_in_zoom_pose
         # Also detect second hand entering zoom_pose within zoom_arbitration_ms of an active/arming dictation
-        if (not zoom_intent) and self.enable_zoom and len(outputs) == 2 and (not any_busy_for_zoom):
+        if (
+            (not zoom_intent)
+            and (not dictation_has_priority)
+            and self.enable_zoom
+            and len(outputs) == 2
+            and (not any_busy_for_zoom)
+        ):
             l_enter = self._hands["Left"].zoom_pose_enter_ms
             r_enter = self._hands["Right"].zoom_pose_enter_ms
             if l_enter is not None and r_enter is not None and abs(l_enter - r_enter) <= self.zoom_arbitration_ms:
@@ -1224,9 +1241,11 @@ class HandCursorEngine:
             warning = TrackingWarning(level="warning", code="low_light")
         self.last_warning = warning
 
-        # Compute concise "Why didn't it trigger?" diagnostic code (V040-04)
+        # Compute concise "Why didn't it trigger?" diagnostic code (V040-04 + V041-04)
         refusal_code: Optional[str] = None
-        if zoom_intent or self.last_zoom.is_zooming:
+        if dictation_priority_suppressed_zoom:
+            refusal_code = "dictation_priority"
+        elif zoom_intent or self.last_zoom.is_zooming:
             refusal_code = "two_hand_zoom_active"
         elif any(
             (not self._hands[o.hand].is_dictating)

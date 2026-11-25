@@ -175,6 +175,7 @@ def resolve_profile_config(base_cfg: Dict[str, Any], bundle_id: Optional[str]) -
 # Documented safe numeric ranges `(min_val, max_val)` enforced by `validate_and_clamp_config`
 SAFE_NUMERIC_RANGES: Dict[str, Tuple[float, float]] = {
     "gestures.dictation_arm_ms": (200.0, 800.0),
+    "gestures.dictation_priority_ms": (0.0, 5000.0),
     "gestures.zoom_arbitration_ms": (0.0, 1000.0),
     "gestures.zoom_hold_ms": (0.0, 1000.0),
     "dictation.min_duration_s": (0.1, 10.0),

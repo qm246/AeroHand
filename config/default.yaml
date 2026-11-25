@@ -67,6 +67,7 @@ gestures:
   zoom_hold_ms: 120                    # Both hands must hold zoom pose >= 120 ms before zooming
   zoom_arbitration_ms: 300             # Window (ms) where 2nd hand entering zoom cancels/suppresses dictation
   dictation_arm_ms: 350                # Single-hand hold duration (200..800 ms) required to arm dictation
+  dictation_priority_ms: 1000          # Once dictation runs >= 1000 ms, ignore incidental 2nd-hand zoom until end
   latch_gate_while_pose_active: true   # Keep classifying active pose even if hand tilts past dirZ gate
 
 smoothing:

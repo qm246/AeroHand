@@ -31,105 +31,28 @@ import numpy as np
 
 from aerohand.config import load_config
 from aerohand.core.engine import HandCursorEngine
-from aerohand.core.types import ALL_POSE_NAMES, Handedness, HandInput, Landmark, PoseName
+from aerohand.core.types import ALL_POSE_NAMES, HandInput
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+from aerohand.ml.recording_io import (
+    POSE_TO_IDX,
+    assert_not_heldout,
+    collect_json_paths,
+    load_recording_frames,
+)
 
-POSE_TO_IDX: Dict[str, int] = {p.value: i for i, p in enumerate(ALL_POSE_NAMES)}
 NUM_CLASSES: int = len(ALL_POSE_NAMES)
 
 
-def _to_landmarks(raw: Any) -> List[Landmark]:
-    if not raw or not isinstance(raw, list):
-        return []
-    first = raw[0]
-    if isinstance(first, (int, float)) and len(raw) >= 63:
-        return [
-            Landmark(x=float(raw[i]), y=float(raw[i + 1]), z=float(raw[i + 2]))
-            for i in range(0, 63, 3)
-        ]
-    if isinstance(first, dict) and len(raw) >= 21:
-        return [
-            Landmark(x=float(p["x"]), y=float(p["y"]), z=float(p.get("z", 0.0)))
-            for p in raw[:21]
-        ]
-    return []
-
-
 def _collect_json_paths(inputs: Sequence[str | Path]) -> List[Path]:
-    out: List[Path] = []
-    for item in inputs:
-        p = Path(item)
-        if p.is_file() and p.suffix == ".json":
-            out.append(p)
-        elif p.is_dir():
-            out.extend(sorted(p.rglob("*.json")))
-    return sorted(set(out))
+    return collect_json_paths(inputs)
 
 
 def load_replay_samples(path: Path, *, force_idle: bool = False) -> List[Dict[str, Any]]:
-    """Parse a v1/v2 or Airpoint SDK v4.0 JSON recording into normalized chronological frames."""
-    raw = json.loads(path.read_text(encoding="utf-8"))
-    samples = raw.get("samples", raw) if isinstance(raw, dict) else raw
-    if not isinstance(samples, list):
-        return []
-
-    parsed: List[Dict[str, Any]] = []
-    fallback_ts = 0.0
-    for s in samples:
-        if not isinstance(s, dict):
-            continue
-        raw_2d = s.get("landmarks_2d")
-        if raw_2d is None:
-            raw_2d = s.get("landmarks")
-        lms2d = _to_landmarks(raw_2d)
-        if len(lms2d) < 21:
-            continue
-        raw_3d = s.get("world_landmarks")
-        if raw_3d is None:
-            raw_3d = s.get("worldLandmarks")
-        lms3d = _to_landmarks(raw_3d) or None
-
-        if force_idle:
-            label_name = PoseName.IDLE.value
-        else:
-            raw_lbl = s.get("label_name")
-            if raw_lbl is None:
-                raw_lbl = s.get("labelName")
-            if raw_lbl is None and s.get("label") == 0:
-                raw_lbl = PoseName.IDLE.value
-            label_name = str(raw_lbl).strip() if raw_lbl is not None else PoseName.IDLE.value
-            if label_name not in POSE_TO_IDX:
-                continue
-
-        ts_raw = s.get("timestamp_ms")
-        if ts_raw is None:
-            ts_raw = s.get("timestamp")
-        if ts_raw is None:
-            ts_ms = fallback_ts
-            fallback_ts += 33.33
-        else:
-            ts_ms = float(ts_raw)
-            fallback_ts = ts_ms + 33.33
-
-        handed: Handedness = "Left" if str(s.get("handedness", "Right")) == "Left" else "Right"
-        conf = float(s.get("confidence", 0.95))
-        parsed.append(
-            {
-                "timestamp_ms": ts_ms,
-                "label_name": label_name,
-                "label_idx": POSE_TO_IDX[label_name],
-                "handedness": handed,
-                "confidence": conf,
-                "landmarks_2d": lms2d,
-                "world_landmarks": lms3d,
-                "is_idle_gt": label_name == PoseName.IDLE.value,
-            }
-        )
-
-    parsed.sort(key=lambda item: item["timestamp_ms"])
-    return parsed
+    """Load any supported recording (v1/v2, SDK v4.0, or GestureCtl) via shared `recording_io`."""
+    frames, _ = load_recording_frames(path, force_idle=force_idle)
+    return frames
 
 
 def compute_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, Any]:
@@ -251,16 +174,12 @@ def evaluate_recordings(
     ]
 
     for fp, is_neg in work_items:
-        frames = load_replay_samples(fp, force_idle=is_neg)
+        assert_not_heldout(fp)
+        frames, rec_meta = load_recording_frames(fp, force_idle=is_neg)
         if not frames:
             continue
         evaluated_files.append(fp.name)
-        if len(frames) >= 2:
-            span = float(frames[-1]["timestamp_ms"]) - float(frames[0]["timestamp_ms"])
-            if span > 0.0:
-                wall_clock_ms += span
-        else:
-            wall_clock_ms += 33.33
+        wall_clock_ms += float(rec_meta.get("wall_clock_ms", 0.0))
 
         clf = classifier
         if clf is None:
@@ -275,11 +194,16 @@ def evaluate_recordings(
         eng.anchor_cursor("Right", width * 0.5, height * 0.5)
         eng.anchor_cursor("Left", width * 0.5, height * 0.5)
 
-        prev_ts: Optional[float] = None
+        prev_present_ts: Optional[float] = None
         for fr in frames:
             ts = float(fr["timestamp_ms"])
-            if prev_ts is not None:
-                dt = ts - prev_ts
+            if not fr["hand_present"] or not fr["landmarks_2d"]:
+                eng.process_frame([], ts, width, height)
+                prev_present_ts = None
+                continue
+
+            if prev_present_ts is not None:
+                dt = ts - prev_present_ts
                 if 0.0 < dt <= 500.0:
                     total_duration_ms += dt
                     if fr["is_idle_gt"]:
@@ -288,7 +212,7 @@ def evaluate_recordings(
                 total_duration_ms += 33.33
                 if fr["is_idle_gt"]:
                     idle_duration_ms += 33.33
-            prev_ts = ts
+            prev_present_ts = ts
 
             h_in = HandInput(
                 handedness=fr["handedness"],

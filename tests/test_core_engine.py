@@ -3030,3 +3030,151 @@ def test_replay_eval_fails_when_exposure_insufficient(tmp_path: Path):
     assert rep["false_triggers"]["exposure_sufficient"] is False
     assert "insufficient exposure" in rep["false_triggers"]["exposure_notice"]
     assert rep["passed"] is False
+
+
+def _load_script_module(rel_path: str, name: str):
+    import importlib.util
+    import sys
+
+    spec = importlib.util.spec_from_file_location(
+        name, Path(__file__).resolve().parent.parent / rel_path
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_converter_flips_handedness_like_bench(tmp_path: Path):
+    import json
+
+    conv_mod = _load_script_module("scripts/convert_gesturectl.py", "convert_gctl_flip")
+    h = _make_open_hand()
+    lms_dicts = [{"x": p.x, "y": p.y, "z": p.z, "visibility": 1.0} for p in h]
+    src = tmp_path / "d_dev_sample.json"
+    src.write_text(
+        json.dumps(
+            {
+                "fps": 30.0,
+                "frames": [
+                    {
+                        "timestamp_ms": 1000,
+                        "hand": {"handedness": "Left", "score": 0.95, "landmarks": lms_dicts, "world_landmarks": lms_dicts},
+                    },
+                    {
+                        "timestamp_ms": 1033,
+                        "hand": {"handedness": "Right", "score": 0.92, "landmarks": lms_dicts, "world_landmarks": lms_dicts},
+                    },
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    out_dir = tmp_path / "converted"
+    res = conv_mod.convert_gesturectl_file(src, out_dir)
+    out_data = json.loads(Path(res["output_path"]).read_text(encoding="utf-8"))
+    assert out_data["schema_version"] == 2
+    assert out_data["session_meta"]["handedness_flipped"] is True
+    assert [s["handedness"] for s in out_data["samples"]] == ["Right", "Left"]
+
+
+def test_converter_refuses_heldout_path(tmp_path: Path):
+    conv_mod = _load_script_module("scripts/convert_gesturectl.py", "convert_gctl_ho")
+    ho_dir = tmp_path / "m01_v2" / "heldout"
+    ho_dir.mkdir(parents=True)
+    ho_fp = ho_dir / "d_heldout_01.json"
+    ho_fp.write_text("{}", encoding="utf-8")
+    with pytest.raises(ValueError, match="REFUSED"):
+        conv_mod.convert_gesturectl_file(ho_fp, tmp_path / "out")
+
+
+def test_cue_phase_press_label_requires_pinch_distance(tmp_path: Path):
+    import json
+
+    conv_mod = _load_script_module("scripts/convert_gesturectl.py", "convert_gctl_cue")
+    open_h = _make_open_hand()
+    closed_h = list(open_h)
+    closed_h[4] = Landmark(open_h[8].x + 0.002, open_h[8].y + 0.002, open_h[8].z)
+
+    def _to_d(lms):
+        return [{"x": p.x, "y": p.y, "z": p.z} for p in lms]
+
+    # Build a cadence session: rest (0..1000ms), press with 1 unclosed frame + 5 closed frames (1000..2200ms)
+    frames = []
+    for i in range(15):  # 0..462ms rest (well before 1000ms transition)
+        frames.append({"timestamp_ms": i * 33, "cue_phase": "rest", "handedness": "Left", "score": 0.95, "landmarks": _to_d(open_h), "world_landmarks": _to_d(open_h)})
+    # Transition at 1000ms; frames at 1500..1700ms are outside +/-300ms trim window
+    frames.append({"timestamp_ms": 1000, "cue_phase": "press", "handedness": "Left", "score": 0.95, "landmarks": _to_d(closed_h), "world_landmarks": _to_d(closed_h)})
+    # Unclosed press frame at 1500ms MUST be dropped by 3D distance check
+    frames.append({"timestamp_ms": 1500, "cue_phase": "press", "handedness": "Left", "score": 0.95, "landmarks": _to_d(open_h), "world_landmarks": _to_d(open_h)})
+    # Truly closed press frames at 1533..1632ms MUST be kept as thumb_index_pinch
+    for i in range(4):
+        frames.append({"timestamp_ms": 1533 + i * 33, "cue_phase": "press", "handedness": "Left", "score": 0.95, "landmarks": _to_d(closed_h), "world_landmarks": _to_d(closed_h)})
+
+    src = tmp_path / "clicks_pinch_cadence_near_test.json"
+    src.write_text(json.dumps({"fps": 30.0, "frames": frames}), encoding="utf-8")
+    res = conv_mod.convert_gesturectl_file(src, tmp_path / "converted", pinch_on_dist=0.34, trim_ms=300.0)
+    assert res["dropped_unclosed_press"] == 1
+    assert res["dropped_edge_trim"] >= 1
+    assert res["counts"]["thumb_index_pinch"] == 4
+    assert res["counts"]["idle"] > 0
+
+
+def test_converted_file_roundtrips_to_replay_eval(tmp_path: Path):
+    import json
+
+    conv_mod = _load_script_module("scripts/convert_gesturectl.py", "convert_gctl_rt")
+    replay_mod = _load_replay_eval_module("replay_eval_conv_rt")
+    dom_mod = _load_script_module("scripts/domain_check.py", "domain_check_rt")
+
+    h = _make_open_hand(forward_z=-0.25)
+    lms_d = [{"x": p.x, "y": p.y, "z": p.z} for p in h]
+    src = tmp_path / "d_dev_01_drink_water.json"
+    src.write_text(
+        json.dumps(
+            {
+                "fps": 30.0,
+                "frames": [
+                    {"timestamp_ms": 1000 + i * 33, "hand": {"handedness": "Left", "score": 0.95, "landmarks": lms_d, "world_landmarks": lms_d}}
+                    for i in range(12)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = conv_mod.convert_gesturectl_file(src, tmp_path / "converted")
+    out_fp = Path(res["output_path"])
+    rep = replay_mod.evaluate_recordings(negative_paths=[out_fp], min_exposure_hours_for_claim=0.0)
+    assert rep["total_frames"] == 12
+    assert rep["sessions_evaluated"] == [out_fp.name]
+
+    # Also verify domain_check KS comparison works cleanly
+    dom = dom_mod.compare_domains([out_fp], [out_fp])
+    assert dom["domain_shift_detected"] is False
+    assert dom["features"]["palm_size"]["ks_stat"] == 0.0
+
+
+def test_bench_delegates_to_replay_eval(tmp_path: Path):
+    import json
+
+    bench_mod = _load_script_module("scripts/bench_d_dev_replay.py", "bench_delegate_test")
+    h = _make_open_hand(forward_z=-0.25)
+    lms_d = [{"x": p.x, "y": p.y, "z": p.z} for p in h]
+    dev_dir = tmp_path / "dev_set"
+    dev_dir.mkdir()
+    (dev_dir / "d_dev_01_test.json").write_text(
+        json.dumps(
+            {
+                "fps": 30.0,
+                "frames": [
+                    {"timestamp_ms": 1000 + i * 33, "hand": {"handedness": "Left", "score": 0.95, "landmarks": lms_d, "world_landmarks": lms_d}}
+                    for i in range(10)
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    rep = bench_mod.benchmark_dir(dev_dir)
+    assert rep["total_frames"] == 10
+    assert "false_triggers" in rep and "total_upper_bound_per_hour" in rep["false_triggers"]

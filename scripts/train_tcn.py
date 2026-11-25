@@ -36,6 +36,7 @@ import numpy as np
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 from aerohand.ml.features_3d import FEATURE_DIM_3D, extract_invariant_3d_features
 from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
+from aerohand.ml.recording_io import assert_not_heldout, collect_json_paths, load_recording_frames
 
 POSE_TO_IDX: Dict[str, int] = {p.value: idx for idx, p in enumerate(ALL_POSE_NAMES)}
 NUM_CLASSES: int = len(ALL_POSE_NAMES)
@@ -329,17 +330,36 @@ def load_session_bundle(
     max_gap_ms: float = 100.0,
     skip_stats: Optional[Dict[str, int]] = None,
 ) -> SessionBundle:
-    data = json.loads(session_path.read_text(encoding="utf-8"))
-    samples = data.get("samples") or data.get("frames") or []
+    assert_not_heldout(session_path)
+    frames, rec_meta = load_recording_frames(session_path, force_idle=force_idle)
+    # Convert normalized `recording_io` frames into sample dicts compatible with `_segment_samples_into_windows`
+    norm_samples: List[Dict[str, Any]] = []
+    for fr in frames:
+        if not fr["hand_present"] or not fr["landmarks_2d"]:
+            continue
+        norm_samples.append(
+            {
+                "timestamp_ms": fr["timestamp_ms"],
+                "label_name": fr["label_name"],
+                "handedness": fr["handedness"],
+                "hand_id": f"{fr['hand_id']}#s{fr.get('segment_id', 0)}",
+                "landmarks_2d": [c for lm in fr["landmarks_2d"][:21] for c in (lm.x, lm.y, lm.z)],
+                "world_landmarks": (
+                    [c for lm in fr["world_landmarks"][:21] for c in (lm.x, lm.y, lm.z)]
+                    if fr["world_landmarks"]
+                    else []
+                ),
+            }
+        )
     windows, ys = _segment_samples_into_windows(
-        samples,
+        norm_samples,
         seq_len=seq_len,
         force_idle=force_idle,
         max_gap_ms=max_gap_ms,
         skip_stats=skip_stats,
     )
     prefix = "neg:" if force_idle else ""
-    group_key = prefix + _session_group_key(data, session_path.name)
+    group_key = prefix + _session_group_key({"session_meta": rec_meta.get("session_meta") or {}}, session_path.name)
     return SessionBundle(name=f"{prefix}{session_path.name}", group_key=group_key, windows=windows, labels=ys)
 
 
@@ -739,7 +759,8 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             return (((1.0 - pt) ** self.gamma) * ce).mean()
 
     sessions_dir = Path(args.sessions)
-    files = sorted(sessions_dir.glob("*.json"))
+    assert_not_heldout(sessions_dir)
+    files = collect_json_paths([sessions_dir]) if sessions_dir.exists() else []
     if not files:
         raise SystemExit(
             f"No session JSON files found in {sessions_dir}.\n"
@@ -755,7 +776,8 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
 
     if args.negatives_dir:
         neg_dir = Path(args.negatives_dir)
-        for fp in sorted(neg_dir.glob("*.json")):
+        assert_not_heldout(neg_dir)
+        for fp in collect_json_paths([neg_dir]):
             b = load_session_bundle(
                 fp, seq_len=args.seq_len, force_idle=True, max_gap_ms=args.max_gap_ms, skip_stats=skip_stats
             )

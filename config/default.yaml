@@ -97,6 +97,8 @@ cursor:
   click_lookback_max_offset_px: 24.0   # Clamp lookback anchor offset to <= 24 px from live pointer
   click_dwell_lock_ms: 120.0           # Freeze pointer up to 120 ms while click probability rises > 0.4
   click_dwell_lock_cooldown_ms: 400.0  # Cooldown (ms) after an expired dwell lock before re-arming
+  drag_lookback_ms: 60.0               # Anchor drag start & right-click to pre-pinch position (60 ms earlier)
+  drag_dwell_lock_ms: 80.0             # Brief stabilization lock before drag start (released on grab_just_started)
   deadzone_px: 0.35                    # Micro-jitter floor
   reacquire_skip_frames: 2             # Ignore first 2 frames after hand reappears
   enable_pointing_gate: true

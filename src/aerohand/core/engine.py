@@ -309,12 +309,18 @@ class _PerHandState:
     cursor_delta: Tuple[float, float] = (0.0, 0.0)
     last_seen_ms: float = -1e9
     click_anchor_pos: Optional[Tuple[float, float]] = None
+    drag_anchor_pos: Optional[Tuple[float, float]] = None
+    right_click_anchor_pos: Optional[Tuple[float, float]] = None
     prev_click_prob: float = 0.0
     dwell_lock_until_ms: float = 0.0
     dwell_lock_pos: Optional[Tuple[float, float]] = None
     dwell_lock_used_in_attempt: bool = False
     dwell_lock_cooldown_until_ms: float = 0.0
     last_low_click_prob_ms: Optional[float] = None
+    prev_drag_prob: float = 0.0
+    drag_dwell_lock_until_ms: float = 0.0
+    drag_dwell_lock_pos: Optional[Tuple[float, float]] = None
+    drag_dwell_lock_used: bool = False
 
     def reset(self) -> None:
         self.kinematics.reset()
@@ -333,12 +339,18 @@ class _PerHandState:
         self.palm_wheel_offset = (0.0, 0.0)
         self.cursor_delta = (0.0, 0.0)
         self.click_anchor_pos = None
+        self.drag_anchor_pos = None
+        self.right_click_anchor_pos = None
         self.prev_click_prob = 0.0
         self.dwell_lock_until_ms = 0.0
         self.dwell_lock_pos = None
         self.dwell_lock_used_in_attempt = False
         self.dwell_lock_cooldown_until_ms = 0.0
         self.last_low_click_prob_ms = None
+        self.prev_drag_prob = 0.0
+        self.drag_dwell_lock_until_ms = 0.0
+        self.drag_dwell_lock_pos = None
+        self.drag_dwell_lock_used = False
 
 
 class HandCursorEngine:
@@ -438,6 +450,8 @@ class HandCursorEngine:
         self.click_dwell_lock_cooldown_ms: float = max(
             0.0, float(cur_cfg.get("click_dwell_lock_cooldown_ms", 400.0))
         )
+        self.drag_lookback_ms: float = max(0.0, float(cur_cfg.get("drag_lookback_ms", 60.0)))
+        self.drag_dwell_lock_ms: float = max(0.0, float(cur_cfg.get("drag_dwell_lock_ms", 80.0)))
 
         psm_cfg = config.get("pose_state_machine") or {}
         self.enable_click_debounce: bool = bool(psm_cfg.get("enable_click_debounce", True))
@@ -793,6 +807,53 @@ class HandCursorEngine:
                 hs.dwell_lock_pos = None
             hs.prev_click_prob = click_prob
 
+            # Brief pre-drag dwell lock (V031-05): stabilizes 3-finger pinch closure, NEVER locks active drag
+            drag_poses = [
+                pose_k
+                for pose_k, act in hs.pose_sm.hold_actions.items()
+                if act == "drag"
+            ]
+            drag_prob = max((float(pose_probs.get(pk, 0.0)) for pk in drag_poses), default=0.0)
+            if (
+                self.drag_dwell_lock_ms > 0.0
+                and self._is_hand_allowed_for_click_actions(hand)
+                and not hs.is_grabbing
+                and not pw_active
+            ):
+                if hs.drag_dwell_lock_pos is not None and timestamp_ms >= hs.drag_dwell_lock_until_ms:
+                    hs.drag_dwell_lock_pos = None
+                    hs.drag_dwell_lock_until_ms = 0.0
+                if drag_prob < 0.20 and hs.pose_sm.active_pose is None:
+                    hs.drag_dwell_lock_used = False
+                    hs.drag_dwell_lock_pos = None
+                    hs.drag_dwell_lock_until_ms = 0.0
+                elif (
+                    (not hs.drag_dwell_lock_used)
+                    and hs.drag_dwell_lock_pos is None
+                    and drag_prob > 0.40
+                    and drag_prob > hs.prev_drag_prob
+                ):
+                    hs.drag_dwell_lock_until_ms = timestamp_ms + self.drag_dwell_lock_ms
+                    hs.drag_dwell_lock_pos = (cursor_out.x, cursor_out.y)
+                    hs.drag_dwell_lock_used = True
+
+                click_locked = timestamp_ms < hs.dwell_lock_until_ms and hs.dwell_lock_pos is not None
+                if (
+                    (not click_locked)
+                    and timestamp_ms < hs.drag_dwell_lock_until_ms
+                    and hs.drag_dwell_lock_pos is not None
+                ):
+                    cursor_out.x, cursor_out.y = hs.drag_dwell_lock_pos
+                    cursor_out.delta_x = 0.0
+                    cursor_out.delta_y = 0.0
+                    hs.cursor_delta = (0.0, 0.0)
+            else:
+                if drag_prob < 0.20 and hs.pose_sm.active_pose is None:
+                    hs.drag_dwell_lock_used = False
+                hs.drag_dwell_lock_until_ms = 0.0
+                hs.drag_dwell_lock_pos = None
+            hs.prev_drag_prob = drag_prob
+
             if hs.pose_sm.active_pose is not None:
                 hs.pose_sm.add_motion(math.hypot(hs.cursor_delta[0], hs.cursor_delta[1]))
 
@@ -806,8 +867,12 @@ class HandCursorEngine:
             click_x: Optional[float] = None
             click_y: Optional[float] = None
             is_right_clicking = False
+            right_click_x: Optional[float] = None
+            right_click_y: Optional[float] = None
             grab_started = False
             grab_ended = False
+            drag_x: Optional[float] = None
+            drag_y: Optional[float] = None
             dictation_started = False
             dictation_ended = False
 
@@ -825,12 +890,38 @@ class HandCursorEngine:
                             )
                         else:
                             hs.click_anchor_pos = (cursor_out.x, cursor_out.y)
+                    if hs.pose_sm.get_hold_action(ev.pose) == "drag" and self._is_hand_allowed_for_click_actions(hand):
+                        if self.drag_lookback_ms > 0.0:
+                            hs.drag_anchor_pos = hs.kinematics.lookup_position_guarded(
+                                timestamp_ms - self.drag_lookback_ms,
+                                (cursor_out.x, cursor_out.y),
+                                max_speed_px_s=self.click_lookback_max_speed_px_s,
+                                max_offset_px=self.click_lookback_max_offset_px,
+                                fallback_pos=hs.drag_dwell_lock_pos,
+                            )
+                        else:
+                            hs.drag_anchor_pos = (cursor_out.x, cursor_out.y)
+                    if (
+                        ev.pose == PoseName.THUMB_RING_PINCH
+                        or hs.pose_sm.get_tap_action(ev.pose) == "right_click"
+                    ) and self._is_hand_allowed_for_click_actions(hand):
+                        if self.drag_lookback_ms > 0.0:
+                            hs.right_click_anchor_pos = hs.kinematics.lookup_position_guarded(
+                                timestamp_ms - self.drag_lookback_ms,
+                                (cursor_out.x, cursor_out.y),
+                                max_speed_px_s=self.click_lookback_max_speed_px_s,
+                                max_offset_px=self.click_lookback_max_offset_px,
+                            )
+                        else:
+                            hs.right_click_anchor_pos = (cursor_out.x, cursor_out.y)
                     if hs.pose_sm.get_hold_action(ev.pose) == "dictation" and self.enable_dictation:
                         hs.dictation_pose_enter_ms = timestamp_ms
                 elif ev.type == "tap":
                     tap_act = hs.pose_sm.get_tap_action(ev.pose)
                     if hs.pose_sm.get_hold_action(ev.pose) == "dictation":
                         hs.dictation_pose_enter_ms = None
+                    if hs.pose_sm.get_hold_action(ev.pose) == "drag":
+                        hs.drag_anchor_pos = None
                     if tap_act == "left_click" and self._is_click_allowed_for_hand(hand):
                         debounce_ok = (not self.enable_click_debounce) or (
                             (timestamp_ms - hs.last_click_ms) > self.click_debounce_ms
@@ -855,11 +946,28 @@ class HandCursorEngine:
                         hs.dwell_lock_pos = None
                     elif tap_act == "right_click" and self.enable_right_click and self._is_hand_allowed_for_click_actions(hand):
                         is_right_clicking = True
+                        if hs.right_click_anchor_pos is not None:
+                            right_click_x, right_click_y = hs.right_click_anchor_pos
+                        else:
+                            right_click_x, right_click_y = cursor_out.x, cursor_out.y
+                        hs.right_click_anchor_pos = None
+                    elif ev.pose == PoseName.THUMB_RING_PINCH:
+                        hs.right_click_anchor_pos = None
                 elif ev.type == "hold_start":
                     hold_act = hs.pose_sm.get_hold_action(ev.pose)
                     if hold_act == "drag" and self.enable_grab and self._is_hand_allowed_for_click_actions(hand):
                         hs.is_grabbing = True
                         grab_started = True
+                        if hs.drag_anchor_pos is not None:
+                            drag_x, drag_y = hs.drag_anchor_pos
+                        else:
+                            drag_x, drag_y = cursor_out.x, cursor_out.y
+                        hs.drag_anchor_pos = None
+                        # Release all dwell locks immediately once drag starts so dragging moves freely
+                        hs.drag_dwell_lock_until_ms = 0.0
+                        hs.drag_dwell_lock_pos = None
+                        hs.dwell_lock_until_ms = 0.0
+                        hs.dwell_lock_pos = None
                     elif hold_act == "dictation" and self.enable_dictation:
                         # Arming is deferred to post-classification arbitration (`dictation_arm_ms`)
                         if hs.dictation_pose_enter_ms is None:
@@ -869,6 +977,7 @@ class HandCursorEngine:
                     if hold_act == "drag" and hs.is_grabbing:
                         hs.is_grabbing = False
                         grab_ended = True
+                        hs.drag_anchor_pos = None
                     elif hold_act == "dictation":
                         hs.dictation_pose_enter_ms = None
                         if hs.is_dictating:
@@ -883,6 +992,12 @@ class HandCursorEngine:
                         and ev.motion_distance < self.still_right_click_motion_px
                     ):
                         is_right_clicking = True
+                        if hs.right_click_anchor_pos is not None:
+                            right_click_x, right_click_y = hs.right_click_anchor_pos
+                        else:
+                            right_click_x, right_click_y = cursor_out.x, cursor_out.y
+                    if ev.pose == PoseName.THUMB_RING_PINCH:
+                        hs.right_click_anchor_pos = None
 
             # 7. Downstream Hold Controllers
             active_pose = hs.pose_sm.active_pose
@@ -922,9 +1037,13 @@ class HandCursorEngine:
                 click_x=click_x,
                 click_y=click_y,
                 is_right_clicking=is_right_clicking,
+                right_click_x=right_click_x,
+                right_click_y=right_click_y,
                 is_grabbing=hs.is_grabbing,
                 grab_just_started=grab_started,
                 grab_just_ended=grab_ended,
+                drag_x=drag_x,
+                drag_y=drag_y,
                 is_dictating=hs.is_dictating,
                 dictation_just_started=dictation_started,
                 dictation_just_ended=dictation_ended,

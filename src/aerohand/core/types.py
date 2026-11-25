@@ -169,9 +169,13 @@ class PoseOutput:
     click_x: Optional[float] = None
     click_y: Optional[float] = None
     is_right_clicking: bool = False
+    right_click_x: Optional[float] = None
+    right_click_y: Optional[float] = None
     is_grabbing: bool = False
     grab_just_started: bool = False
     grab_just_ended: bool = False
+    drag_x: Optional[float] = None
+    drag_y: Optional[float] = None
     is_dictating: bool = False
     dictation_just_started: bool = False
     dictation_just_ended: bool = False

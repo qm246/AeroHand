@@ -1007,10 +1007,20 @@ class AeroHandRuntime:
 
             if cp.is_right_clicking:
                 self.audio.play_click_up()
+                use_rc_anchor = (
+                    (click_ho is primary)
+                    and (cp.right_click_x is not None)
+                    and (cp.right_click_y is not None)
+                )
+                rc_x = (self._screen_ox + float(cp.right_click_x)) if use_rc_anchor else abs_x
+                rc_y = (self._screen_oy + float(cp.right_click_y)) if use_rc_anchor else abs_y
                 self._last_action_text = "Right Click"
                 self._practice["right_click"] = True
-                self._emit_click_pulse("right_click", abs_x, abs_y)
-                self.input_ctl.mouse_click(abs_x, abs_y, button="right", click_count=1)
+                self._emit_click_pulse("right_click", rc_x, rc_y)
+                self.input_ctl.mouse_click(rc_x, rc_y, button="right", click_count=1)
+                if use_rc_anchor and math.hypot(rc_x - abs_x, rc_y - abs_y) > 2.0:
+                    with self._lerp_lock:
+                        self._lerp.sync_current_to_anchor(rc_x, rc_y, abs_x, abs_y)
                 active_hint = "right_click"
 
             if cp.grab_just_started:
@@ -1020,10 +1030,20 @@ class AeroHandRuntime:
                 if self._last_frame_ms <= 0.0:
                     self._last_frame_ms = now_ms
                 self._mouse_button_held = True
+                use_drag_anchor = (
+                    (click_ho is primary)
+                    and (cp.drag_x is not None)
+                    and (cp.drag_y is not None)
+                )
+                dg_x = (self._screen_ox + float(cp.drag_x)) if use_drag_anchor else abs_x
+                dg_y = (self._screen_oy + float(cp.drag_y)) if use_drag_anchor else abs_y
                 self._last_action_text = "Drag Start"
                 self._practice["drag"] = True
-                self._emit_click_pulse("grab", abs_x, abs_y)
-                self.input_ctl.mouse_down(abs_x, abs_y, button="left")
+                self._emit_click_pulse("grab", dg_x, dg_y)
+                self.input_ctl.mouse_down(dg_x, dg_y, button="left")
+                if use_drag_anchor and math.hypot(dg_x - abs_x, dg_y - abs_y) > 2.0:
+                    with self._lerp_lock:
+                        self._lerp.sync_current_to_anchor(dg_x, dg_y, abs_x, abs_y)
             elif cp.grab_just_ended:
                 self.audio.play_click_up()
                 self._drag_started_ms = None

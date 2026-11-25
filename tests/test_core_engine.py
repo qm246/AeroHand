@@ -2393,3 +2393,161 @@ def test_lerp_reset_after_anchored_click():
     nx, ny, dx, _ = step
     assert 500.0 < nx < 520.0
     assert dx > 0.0
+
+
+def test_drag_start_uses_pre_pinch_anchor():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["drag_lookback_ms"] = 60.0
+    cfg["cursor"]["drag_dwell_lock_ms"] = 0.0
+    cfg["cursor"]["click_lookback_max_offset_px"] = 24.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _DragClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(
+                PoseName.THUMB_INDEX_MIDDLE_PINCH if self.p >= 0.75 else PoseName.IDLE, probs, "high"
+            )
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _DragClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 500.0, 500.0)
+    eng._hands["Right"].kinematics._skip_remaining = 0
+
+    h = _make_open_hand(forward_z=-0.25)
+    # Aim steadily at t=0..90ms
+    for ts in [0.0, 30.0, 60.0, 90.0]:
+        out = eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)[0]
+    pre_x, pre_y = out.cursor.x, out.cursor.y
+
+    # Close 3-finger drag pinch with ~15px fingertip drift and hold past 180ms hold threshold
+    shifted = [Landmark(p.x + 0.0035, p.y + 0.002, p.z) for p in h]
+    clf.p = 0.92
+    drag_start_out = None
+    for ts in [120.0, 150.0, 200.0, 260.0, 350.0]:
+        o = eng.process_frame([HandInput("Right", shifted, shifted)], ts, 1920.0, 1080.0)[0]
+        if o.pose.grab_just_started:
+            drag_start_out = o
+            break
+    assert drag_start_out is not None
+    assert drag_start_out.cursor.x > pre_x + 10.0  # live fingertip drifted
+    # Drag anchor MUST be the pre-pinch position, NOT the drifted live fingertip!
+    assert drag_start_out.pose.drag_x == pytest.approx(pre_x, abs=2.0)
+    assert drag_start_out.pose.drag_y == pytest.approx(pre_y, abs=2.0)
+
+
+def test_right_click_uses_anchor():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["drag_lookback_ms"] = 60.0
+    cfg["cursor"]["click_lookback_max_offset_px"] = 24.0
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _RingClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_RING_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(
+                PoseName.THUMB_RING_PINCH if self.p >= 0.75 else PoseName.IDLE, probs, "high"
+            )
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _RingClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 400.0, 300.0)
+    eng._hands["Right"].kinematics._skip_remaining = 0
+
+    h = _make_open_hand(forward_z=-0.25)
+    for ts in [0.0, 30.0, 60.0, 90.0]:
+        out = eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)[0]
+    pre_x, pre_y = out.cursor.x, out.cursor.y
+
+    # Ring pinch closes with slight drift (~10px < 15px still_right_click_motion_px), holds >180ms, then releases
+    shifted = [Landmark(p.x + 0.0022, p.y, p.z) for p in h]
+    clf.p = 0.92
+    for ts in [120.0, 150.0, 220.0, 360.0]:
+        eng.process_frame([HandInput("Right", shifted, shifted)], ts, 1920.0, 1080.0)
+
+    clf.p = 0.05
+    rc_out = None
+    for ts in [390.0, 420.0, 450.0, 480.0, 510.0, 540.0]:
+        o = eng.process_frame([HandInput("Right", shifted, shifted)], ts, 1920.0, 1080.0)[0]
+        if o.pose.is_right_clicking:
+            rc_out = o
+            break
+    assert rc_out is not None
+    assert rc_out.pose.right_click_x == pytest.approx(pre_x, abs=2.0)
+    assert rc_out.pose.right_click_y == pytest.approx(pre_y, abs=2.0)
+
+
+def test_drag_lock_released_on_grab_start():
+    from aerohand.ml.base import PinchPrediction
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["cursor"]["enable_filter"] = False
+    cfg["cursor"]["drag_dwell_lock_ms"] = 250.0  # intentionally longer than hold threshold to prove early release
+    cfg["pose_state_machine"]["pose_hold_threshold_ms"] = 80
+    cfg["palm_wheel"]["enabled"] = False
+
+    class _DragClf:
+        def __init__(self) -> None:
+            self.p = 0.0
+
+        def predict(self, landmarks_2d=None, world_landmarks=None, handedness="Right", timestamp_ms=0.0):
+            probs = idle_probabilities()
+            probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = self.p
+            probs[PoseName.IDLE] = max(0.0, 1.0 - self.p)
+            return PinchPrediction(
+                PoseName.THUMB_INDEX_MIDDLE_PINCH if self.p >= 0.75 else PoseName.IDLE, probs, "high"
+            )
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _DragClf()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 500.0, 500.0)
+    eng._hands["Right"].kinematics._skip_remaining = 0
+
+    h = _make_open_hand(forward_z=-0.25)
+    eng.process_frame([HandInput("Right", h, h)], 0.0, 1920.0, 1080.0)
+
+    # Arm drag dwell lock at t=30ms (would hold until 280ms if not cleared on grab_just_started!)
+    clf.p = 0.92
+    eng.process_frame([HandInput("Right", h, h)], 30.0, 1920.0, 1080.0)
+    assert eng._hands["Right"].drag_dwell_lock_pos is not None
+    eng.process_frame([HandInput("Right", h, h)], 60.0, 1920.0, 1080.0)  # pose_enter
+    o_start = eng.process_frame([HandInput("Right", h, h)], 150.0, 1920.0, 1080.0)[0]  # hold_start
+    assert o_start.pose.grab_just_started is True
+    assert eng._hands["Right"].drag_dwell_lock_pos is None
+
+    # Next frame at t=180ms (still < 280ms!): dragging hand MUST move cursor freely!
+    moved = [Landmark(p.x + 0.02, p.y, p.z) for p in h]
+    o_drag = eng.process_frame([HandInput("Right", moved, moved)], 180.0, 1920.0, 1080.0)[0]
+    assert o_drag.pose.is_grabbing is True
+    assert o_drag.cursor.delta_x > 20.0

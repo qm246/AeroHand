@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 POSE_TO_IDX: Dict[str, int] = {p.value: i for i, p in enumerate(ALL_POSE_NAMES)}
 MANIFEST_FILENAMES = frozenset({"manifest.json", "session_manifest.json", "sealed_manifest.json"})
+_SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def sha256_file(path: str | Path) -> str:
@@ -126,6 +128,34 @@ def find_sealed_manifests(
     return sorted(found)
 
 
+def read_sealed_manifest_hashes(manifest_path: str | Path) -> Set[str]:
+    """
+    Parse one `sealed_manifest.json` file and return its set of validated 64-hex SHA-256 digests (V053-05).
+    Raises `ValueError` (including the manifest path) if the file cannot be read/parsed or contains
+    zero valid SHA-256 hashes so the held-out guard can never fail open silently.
+    """
+    mp = Path(manifest_path)
+    try:
+        payload = json.loads(mp.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"REFUSED: Unable to read/parse sealed manifest {mp}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"REFUSED: Sealed manifest root must be a JSON object: {mp}")
+    files = payload.get("files")
+    if not isinstance(files, list):
+        raise ValueError(f"REFUSED: Sealed manifest missing 'files' list: {mp}")
+    hashes: Set[str] = set()
+    for entry in files:
+        if not isinstance(entry, dict):
+            continue
+        digest = str(entry.get("sha256") or "").strip().lower()
+        if _SHA256_HEX_RE.fullmatch(digest):
+            hashes.add(digest)
+    if not hashes:
+        raise ValueError(f"REFUSED: Sealed manifest contains zero valid SHA-256 entries: {mp}")
+    return hashes
+
+
 def load_sealed_hashes(
     data_root: str | Path = "data",
     *,
@@ -140,14 +170,7 @@ def load_sealed_hashes(
     )
     hashes: Set[str] = set()
     for mf in manifests:
-        try:
-            payload = json.loads(mf.read_text(encoding="utf-8"))
-        except Exception:
-            continue
-        for entry in payload.get("files") or []:
-            digest = str(entry.get("sha256") or "").strip().lower()
-            if len(digest) == 64:
-                hashes.add(digest)
+        hashes.update(read_sealed_manifest_hashes(mf))
     return hashes
 
 
@@ -159,9 +182,9 @@ def exclude_sealed_content(
     sealed_hashes: Optional[Set[str]] = None,
 ) -> Tuple[List[Path], List[Path]]:
     """
-    Filter out any recording whose content SHA-256 matches a sealed held-out manifest (V051-02 / V052-05a).
-    Searches `sealed_root`, `data_root`, and ancestor directories of `paths`, and emits a clear
-    warning when 0 manifests are discovered so the guard never silently becomes a no-op.
+    Filter out any recording whose content SHA-256 matches a sealed held-out manifest (V051-02 / V052-05a / V053-05).
+    Searches `sealed_root`, `data_root`, and ancestor directories of `paths`, raises `ValueError` on
+    any corrupt/empty manifest, and warns when 0 manifests are discovered.
     """
     if sealed_hashes is not None:
         hashes = sealed_hashes
@@ -180,14 +203,7 @@ def exclude_sealed_content(
             return list(paths), []
         hashes = set()
         for mf in manifests:
-            try:
-                payload = json.loads(mf.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            for entry in payload.get("files") or []:
-                digest = str(entry.get("sha256") or "").strip().lower()
-                if len(digest) == 64:
-                    hashes.add(digest)
+            hashes.update(read_sealed_manifest_hashes(mf))
     if not hashes:
         return list(paths), []
     kept: List[Path] = []

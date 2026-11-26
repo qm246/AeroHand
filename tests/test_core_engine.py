@@ -6388,3 +6388,41 @@ def test_async_swap_does_not_overwrite_veto_param_change_in_flight(monkeypatch):
     t1.join(timeout=5.0)
     assert isinstance(rt.classifier, GuardedClassifier)
     assert rt.classifier.veto_confirm_frames == 2
+
+
+# ==============================================================================
+# V053-05 (B5): Fail Loudly on Corrupt or Empty `sealed_manifest.json`
+# ==============================================================================
+
+
+def test_sealed_guard_raises_on_corrupt_or_empty_manifest(tmp_path: Path):
+    """V053-05 (B5): Corrupt JSON or zero valid SHA-256 hashes in sealed_manifest.json MUST raise with path."""
+    import json
+
+    from aerohand.ml.recording_io import exclude_sealed_content, load_sealed_hashes
+
+    # Case 1: Malformed JSON manifest
+    bad_dir = tmp_path / "case_corrupt" / "heldout_aerohand"
+    bad_dir.mkdir(parents=True)
+    bad_mf = bad_dir / "sealed_manifest.json"
+    bad_mf.write_text("{corrupt json", encoding="utf-8")
+    rec_fp = tmp_path / "case_corrupt" / "rec.json"
+    rec_fp.write_text('{"samples": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=str(bad_mf.name)):
+        load_sealed_hashes(data_root=tmp_path / "case_corrupt")
+    with pytest.raises(ValueError, match=str(bad_mf.name)):
+        exclude_sealed_content([rec_fp], data_root=tmp_path / "case_corrupt")
+
+    # Case 2: Valid JSON but zero valid 64-hex SHA-256 digests
+    empty_dir = tmp_path / "case_empty" / "heldout_aerohand"
+    empty_dir.mkdir(parents=True)
+    empty_mf = empty_dir / "sealed_manifest.json"
+    empty_mf.write_text(json.dumps({"files": [{"filename": "a.json", "sha256": "invalid"}]}), encoding="utf-8")
+    rec_fp2 = tmp_path / "case_empty" / "rec.json"
+    rec_fp2.write_text('{"samples": []}', encoding="utf-8")
+
+    with pytest.raises(ValueError, match=str(empty_mf.name)):
+        load_sealed_hashes(data_root=tmp_path / "case_empty")
+    with pytest.raises(ValueError, match=str(empty_mf.name)):
+        exclude_sealed_content([rec_fp2], data_root=tmp_path / "case_empty")

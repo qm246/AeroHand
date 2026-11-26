@@ -4057,3 +4057,605 @@ def test_ab_eval_negatives_overlap_with_train_rejected(tmp_path: Path):
     # Content-identical copy MUST raise ValueError
     with pytest.raises(ValueError, match="overlaps with training negatives"):
         train_mod.validate_disjoint_ab_negatives([f1], [f1_copy])
+
+
+
+def test_latency_guard_ignores_cold_first_inference(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
+
+    norm_fp = tmp_path / "norm_wu.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp = tmp_path / "wu.onnx"
+    model_fp.write_bytes(b"placeholder")
+
+    run_calls = {"n": 0}
+
+    class _WarmupOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            run_calls["n"] += 1
+            return [np.array([[2.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _WarmupOrt)
+
+    # _load() MUST execute 20 warm-up inferences before any live prediction
+    ONNXPinchClassifier(model_fp, norm_fp, sequence_length=5, warmup_runs=20)
+    assert run_calls["n"] == 20
+
+    # Even if first live inference is slow (25 ms cold spike) followed by 29 fast (1.0 ms) calls,
+    # p95 over 30 samples is <= 8.0 ms so GuardedClassifier MUST NOT fall back!
+    class _ColdSpikeClf:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def predict(self, *args, **kwargs):
+            self.n += 1
+            ms = 25.0 if self.n == 1 else 1.0
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high", ready=True, infer_ms=ms)
+
+        def reset(self, hand=None):
+            pass
+
+    guarded = GuardedClassifier(
+        _ColdSpikeClf(), Heuristic3DPinchClassifier(), mode="onnx", max_p95_ms=8.0, min_latency_samples=30
+    )
+    h = _make_open_hand()
+    for i in range(30):
+        guarded.predict(h, h, "Right", i * 33.0)
+    assert guarded.fell_back is False
+    assert guarded.telemetry()["onnx_p95_ms"] < 8.0
+
+
+def test_latency_guard_requires_30_real_samples():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _SlowClf:
+        def predict(self, *args, **kwargs):
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high", ready=True, infer_ms=12.0)
+
+        def reset(self, hand=None):
+            pass
+
+    guarded = GuardedClassifier(
+        _SlowClf(), Heuristic3DPinchClassifier(), mode="onnx", max_p95_ms=8.0, min_latency_samples=30
+    )
+    h = _make_open_hand()
+    # First 29 slow frames MUST NOT trigger premature fallback yet
+    for i in range(29):
+        guarded.predict(h, h, "Right", i * 33.0)
+    assert guarded.fell_back is False
+    # 30th slow frame pushes p95=12.0 > 8.0 -> triggers auto-fallback!
+    guarded.predict(h, h, "Right", 29 * 33.0)
+    assert guarded.fell_back is True
+    assert guarded.fallback_reason == "onnx_fallback_latency"
+
+
+def test_latency_guard_excludes_buffer_fill_frames():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _WarmingClf:
+        def __init__(self) -> None:
+            self.n = 0
+
+        def predict(self, *args, **kwargs):
+            self.n += 1
+            if self.n <= 4:
+                return PinchPrediction(
+                    PoseName.IDLE, idle_probabilities(), "low", ready=False, infer_ms=None, feature_ms=0.2
+                )
+            return PinchPrediction(
+                PoseName.IDLE, idle_probabilities(), "high", ready=True, infer_ms=1.5, feature_ms=0.3
+            )
+
+        def reset(self, hand=None):
+            pass
+
+    guarded = GuardedClassifier(_WarmingClf(), Heuristic3DPinchClassifier(), mode="onnx", max_p95_ms=8.0)
+    h = _make_open_hand()
+    for i in range(4):
+        guarded.predict(h, h, "Right", i * 33.0)
+    # 4 unready buffer-fill frames MUST contribute 0 latency samples!
+    assert guarded.telemetry()["onnx_latency_samples"] == 0
+    guarded.predict(h, h, "Right", 4 * 33.0)
+    assert guarded.telemetry()["onnx_latency_samples"] == 1
+    assert guarded.telemetry()["onnx_p95_ms"] == pytest.approx(1.5, abs=0.01)
+
+
+def test_rearm_clears_fallback_state():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _SlowThenFast:
+        def __init__(self) -> None:
+            self.ms = 15.0
+
+        def predict(self, *args, **kwargs):
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high", ready=True, infer_ms=self.ms)
+
+        def reset(self, hand=None):
+            pass
+
+    clf = _SlowThenFast()
+    guarded = GuardedClassifier(
+        clf, Heuristic3DPinchClassifier(), mode="onnx", max_p95_ms=8.0, min_latency_samples=10
+    )
+    h = _make_open_hand()
+    for i in range(10):
+        guarded.predict(h, h, "Right", i * 33.0)
+    assert guarded.fell_back is True
+
+    clf.ms = 1.2
+    guarded.rearm()
+    assert guarded.fell_back is False
+    assert guarded.fallback_reason is None
+    assert guarded.telemetry()["onnx_latency_samples"] == 0
+    guarded.predict(h, h, "Right", 500.0)
+    assert guarded.fell_back is False
+
+
+def test_veto_abstains_while_onnx_buffer_warming():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _AlwaysPinch:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high", ready=True)
+
+        def reset(self, hand=None):
+            pass
+
+    class _NotReadyOnnx:
+        def predict(self, *args, **kwargs):
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low", ready=False)
+
+        def reset(self, hand=None):
+            pass
+
+    guarded = GuardedClassifier(_NotReadyOnnx(), _AlwaysPinch(), mode="veto")
+    h = _make_open_hand()
+    for i in range(4):
+        pred = guarded.predict(h, h, "Right", i * 33.0)
+        assert pred.pose == PoseName.THUMB_MIDDLE_PINCH
+    tel = guarded.telemetry()
+    assert tel["veto_count"] == 0
+    assert tel["veto_abstain_not_ready"] == 4
+
+
+def test_veto_passes_heuristic_after_single_frame_dropout_reset(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
+
+    norm_fp = tmp_path / "norm_drop.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp = tmp_path / "drop.onnx"
+    model_fp.write_bytes(b"placeholder")
+
+    class _ApproveOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            # High logit for class 2 (THUMB_MIDDLE_PINCH)
+            return [np.array([[0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _ApproveOrt)
+
+    class _HeurClick:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    onnx = ONNXPinchClassifier(model_fp, norm_fp, sequence_length=5, warmup_runs=1)
+    guarded = GuardedClassifier(onnx, _HeurClick(), mode="veto")
+    h = _make_open_hand()
+    # Fill buffer, then simulate 1-frame MediaPipe dropout -> reset("Right")
+    for i in range(6):
+        guarded.predict(h, h, "Right", i * 33.0)
+    guarded.reset("Right")
+    # Immediately after dropout reset, the 4 warming frames MUST pass heuristic through (not veto!)
+    for i in range(4):
+        pred = guarded.predict(h, h, "Right", 300.0 + i * 33.0)
+        assert pred.pose == PoseName.THUMB_MIDDLE_PINCH
+    assert guarded.telemetry()["veto_count"] == 0
+    assert guarded.telemetry()["veto_abstain_not_ready"] >= 4
+
+
+def test_feature_dim_mismatch_counts_as_error_and_falls_back(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
+
+    # Normalizer claims invariant348 but wrong mean length (100 != 348)
+    norm_fp = tmp_path / "norm_bad.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * 100,
+                "scale": [1.0] * 100,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp = tmp_path / "bad.onnx"
+    model_fp.write_bytes(b"placeholder")
+
+    class _DummyOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            return [np.zeros((1, 7), dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _DummyOrt)
+    onnx = ONNXPinchClassifier(model_fp, norm_fp, sequence_length=5, warmup_runs=1)
+    guarded = GuardedClassifier(onnx, Heuristic3DPinchClassifier(), mode="veto", max_errors=3)
+    h = _make_open_hand()
+    for i in range(3):
+        guarded.predict(h, h, "Right", i * 33.0)
+    assert guarded.telemetry()["onnx_errors"] == 3
+    assert guarded.fell_back is True
+    assert guarded.fallback_reason == "onnx_fallback_errors"
+
+
+def test_veto_does_not_interrupt_active_hold():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _HeurDrag:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_INDEX_MIDDLE_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    class _FlipOnnx:
+        def __init__(self) -> None:
+            self.approve = True
+
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            if self.approve:
+                probs[PoseName.IDLE] = 0.10
+                probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = 0.90
+                return PinchPrediction(PoseName.THUMB_INDEX_MIDDLE_PINCH, probs, "high", ready=True)
+            return PinchPrediction(PoseName.IDLE, probs, "high", ready=True)
+
+        def reset(self, hand=None):
+            pass
+
+    onnx = _FlipOnnx()
+    guarded = GuardedClassifier(onnx, _HeurDrag(), mode="veto", veto_scope="entry", veto_entry_window_ms=300.0)
+    h = _make_open_hand()
+    # Entry frame approved at t=0
+    assert guarded.predict(h, h, "Right", 0.0).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+    # Mid-drag ONNX flickers to IDLE at t=100..600ms -> entry-only veto MUST NOT interrupt active drag!
+    onnx.approve = False
+    for ts in (100.0, 250.0, 400.0, 600.0):
+        assert guarded.predict(h, h, "Right", ts).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+    assert guarded.telemetry()["veto_count"] == 0
+
+
+def test_veto_count_counts_events_not_frames():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _HeurToggle:
+        def __init__(self) -> None:
+            self.active = True
+
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            if self.active:
+                probs[PoseName.IDLE] = 0.05
+                probs[PoseName.THUMB_INDEX_PINCH] = 0.95
+                return PinchPrediction(PoseName.THUMB_INDEX_PINCH, probs, "high")
+            return PinchPrediction(PoseName.IDLE, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    class _RejectOnnx:
+        def predict(self, *args, **kwargs):
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high", ready=True)
+
+        def reset(self, hand=None):
+            pass
+
+    heur = _HeurToggle()
+    guarded = GuardedClassifier(_RejectOnnx(), heur, mode="veto", veto_scope="entry")
+    h = _make_open_hand()
+    # 8 consecutive frames of ONE continuous vetoed pinch attempt -> veto_count == 1, veto_frames == 8
+    for i in range(8):
+        assert guarded.predict(h, h, "Right", i * 33.0).pose == PoseName.IDLE
+    tel = guarded.telemetry()
+    assert tel["veto_count"] == 1
+    assert tel["veto_frames"] == 8
+
+    # Release to IDLE then start a 2nd attempt within 1s -> veto_count == 2, veto_retried_within_1s == 1
+    heur.active = False
+    guarded.predict(h, h, "Right", 300.0)
+    heur.active = True
+    for i in range(3):
+        assert guarded.predict(h, h, "Right", 350.0 + i * 33.0).pose == PoseName.IDLE
+    tel2 = guarded.telemetry()
+    assert tel2["veto_count"] == 2
+    assert tel2["veto_retried_within_1s"] == 1
+
+
+def test_veto_error_passes_heuristic_through_by_default():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _HeurClick:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_MIDDLE_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    class _CrashOnnx:
+        def predict(self, *args, **kwargs):
+            raise RuntimeError("transient onnx error")
+
+        def reset(self, hand=None):
+            pass
+
+    releases: List[int] = []
+    guarded = GuardedClassifier(
+        _CrashOnnx(),
+        _HeurClick(),
+        mode="veto",
+        veto_on_error="pass_through",
+        on_error=lambda: releases.append(1),
+    )
+    h = _make_open_hand()
+    pred = guarded.predict(h, h, "Right", 0.0)
+    # Default veto_on_error="pass_through" MUST preserve heuristic click and NOT force release_all
+    assert pred.pose == PoseName.THUMB_MIDDLE_PINCH
+    assert releases == []
+    assert guarded.telemetry()["onnx_errors"] == 1
+
+
+def test_veto_scope_always_preserves_legacy_behavior():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _HeurDrag:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.05
+            probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = 0.95
+            return PinchPrediction(PoseName.THUMB_INDEX_MIDDLE_PINCH, probs, "high")
+
+        def reset(self, hand=None):
+            pass
+
+    class _FlipOnnx:
+        def __init__(self) -> None:
+            self.approve = True
+
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            if self.approve:
+                probs[PoseName.IDLE] = 0.10
+                probs[PoseName.THUMB_INDEX_MIDDLE_PINCH] = 0.90
+                return PinchPrediction(PoseName.THUMB_INDEX_MIDDLE_PINCH, probs, "high", ready=True)
+            return PinchPrediction(PoseName.IDLE, probs, "high", ready=True)
+
+        def reset(self, hand=None):
+            pass
+
+    onnx = _FlipOnnx()
+    guarded = GuardedClassifier(onnx, _HeurDrag(), mode="veto", veto_scope="always")
+    h = _make_open_hand()
+    assert guarded.predict(h, h, "Right", 0.0).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+    onnx.approve = False
+    # Under veto_scope="always", mid-hold rejection STILL vetoes immediately (legacy behavior)
+    assert guarded.predict(h, h, "Right", 500.0).pose == PoseName.IDLE
+
+
+def test_heuristic_config_update_keeps_state_and_counters():
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    class _StubOnnx:
+        def predict(self, *args, **kwargs):
+            probs = idle_probabilities()
+            probs[PoseName.IDLE] = 0.1
+            probs[PoseName.THUMB_PINKY_PINCH] = 0.9
+            return PinchPrediction(PoseName.THUMB_PINKY_PINCH, probs, "high", ready=True, infer_ms=1.0)
+
+        def reset(self, hand=None):
+            pass
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "shadow"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    heur = Heuristic3DPinchClassifier(cfg["classifier"]["heuristic_3d"])
+    guarded = GuardedClassifier(_StubOnnx(), heur, mode="shadow")
+    rt.classifier = guarded
+    rt.engine.set_classifier(guarded)
+
+    open_h = _make_open_hand()
+    guarded.predict(open_h, open_h, "Right", 0.0)
+    assert guarded.telemetry()["shadow_frames"] == 1
+    assert "Right" in heur._hands
+
+    # Tweaking heuristic_3d slider MUST update in-place without rebuilding or wiping shadow counters/state!
+    new_cfg = deep_merge(cfg, {"classifier": {"heuristic_3d": {"pinch_on_dist": 0.36}}})
+    rt._apply_live_settings_now(new_cfg)
+    assert rt.classifier is guarded
+    assert heur.pinch_on_dist == pytest.approx(0.36)
+    assert "Right" in heur._hands
+    assert guarded.telemetry()["shadow_frames"] == 1
+
+
+def test_set_classifier_swap_atomic_under_concurrent_predict():
+    import threading
+
+    cfg = load_config()
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["reacquire_skip_frames"] = 0
+    cfg["palm_wheel"]["enabled"] = False
+    eng = HandCursorEngine(cfg, classifier=Heuristic3DPinchClassifier())
+    h = _make_open_hand(forward_z=-0.25)
+    errors: List[Exception] = []
+    stop = threading.Event()
+
+    def _swapper() -> None:
+        try:
+            for _ in range(2000):
+                eng.set_classifier(Heuristic3DPinchClassifier())
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            stop.set()
+
+    def _predictor() -> None:
+        ts = 0.0
+        try:
+            while not stop.is_set() and ts < 2000 * 33.0:
+                eng.process_frame([HandInput("Right", h, h)], ts, 1920.0, 1080.0)
+                ts += 33.0
+        except Exception as exc:
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_swapper)
+    t2 = threading.Thread(target=_predictor)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+    assert not t1.is_alive() and not t2.is_alive()
+    assert errors == []
+
+
+def test_rebuild_preserves_cumulative_shadow_counters(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    norm_fp = tmp_path / "norm_cum.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+    model_fp1 = tmp_path / "m1.onnx"
+    model_fp2 = tmp_path / "m2.onnx"
+    model_fp1.write_bytes(b"m1")
+    model_fp2.write_bytes(b"m2")
+
+    class _DummyOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            return [np.array([[0.0, 5.0, 0.0, 0.0, 0.0, 0.0, 0.0]], dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _DummyOrt)
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "shadow"
+    cfg["classifier"]["onnx_model_path"] = str(model_fp1)
+    cfg["classifier"]["onnx_normalizer_path"] = str(norm_fp)
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    assert isinstance(rt.classifier, GuardedClassifier)
+
+    h = _make_open_hand()
+    for i in range(7):  # 4 warmup + 3 ready shadow frames
+        rt.classifier.predict(h, h, "Right", i * 33.0)
+    assert rt.classifier.telemetry()["shadow_frames"] == 3
+
+    # Trigger full model rebuild by switching onnx_model_path -> cumulative shadow_frames MUST survive!
+    cfg2 = deep_merge(cfg, {"classifier": {"onnx_model_path": str(model_fp2)}})
+    rt._apply_live_settings_now(cfg2)
+    assert isinstance(rt.classifier, GuardedClassifier)
+    assert rt.classifier.telemetry()["shadow_frames"] == 3

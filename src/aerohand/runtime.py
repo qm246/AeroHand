@@ -125,12 +125,16 @@ def build_classifier(
     config: Dict[str, Any],
     *,
     on_error: Optional[Callable[[], None]] = None,
+    preserved_counters: Optional[Dict[str, Any]] = None,
 ) -> PinchClassifier:
     cls_cfg = config.get("classifier") or {}
     mode = resolve_classifier_mode(cls_cfg)
     max_p95_ms = float(cls_cfg.get("max_onnx_p95_ms", 8.0))
     veto_min_prob = float(cls_cfg.get("veto_min_prob", 0.35))
     veto_idle_prob = float(cls_cfg.get("veto_idle_prob", 0.60))
+    veto_scope = str(cls_cfg.get("veto_scope", "entry"))
+    veto_entry_window_ms = float(cls_cfg.get("veto_entry_window_ms", 300.0))
+    veto_on_error = str(cls_cfg.get("veto_on_error", "pass_through"))
     heuristic = Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
 
     if mode in ("shadow", "veto", "onnx"):
@@ -151,15 +155,20 @@ def build_classifier(
                         sequence_length=int(cls_cfg.get("sequence_length", 5)),
                         feature_set=str(cls_cfg.get("feature_set", "auto")),
                     )
-                    return GuardedClassifier(
+                    guarded = GuardedClassifier(
                         onnx_clf,
                         heuristic,
                         mode=mode,
                         veto_min_prob=veto_min_prob,
                         veto_idle_prob=veto_idle_prob,
+                        veto_scope=veto_scope,
+                        veto_entry_window_ms=veto_entry_window_ms,
+                        veto_on_error=veto_on_error,
                         max_p95_ms=max_p95_ms,
                         on_error=on_error,
                     )
+                    guarded.import_counters(preserved_counters)
+                    return guarded
                 except Exception as exc:
                     logger.warning(f"[ML] Failed loading ONNX TCN ({exc}); falling back to heuristic_3d.")
             else:
@@ -366,23 +375,70 @@ class AeroHandRuntime:
     def _on_classifier_error(self) -> None:
         self._force_release_held_inputs("Classifier inference error")
 
+    def rearm_classifier(self) -> bool:
+        """Re-arm ONNX after a latency/error auto-fallback (V051-03)."""
+        if isinstance(self.classifier, GuardedClassifier):
+            self.classifier.rearm()
+            self._last_action_text = "Re-armed ONNX classifier"
+            return True
+        return False
+
+    def _export_classifier_counters(self) -> Dict[str, int]:
+        if isinstance(self.classifier, GuardedClassifier):
+            return self.classifier.export_counters()
+        return dict(getattr(self, "_cumulative_classifier_counters", {}))
+
+    def _swap_classifier_async(self, cfg_snapshot: Dict[str, Any]) -> None:
+        """Load ONNX classifier on a background thread and swap atomically without blocking UI (V051-06)."""
+        preserved = self._export_classifier_counters()
+        if preserved:
+            self._cumulative_classifier_counters = dict(preserved)
+        gen = getattr(self, "_classifier_swap_gen", 0) + 1
+        self._classifier_swap_gen = gen
+
+        def _worker() -> None:
+            new_clf = build_classifier(
+                cfg_snapshot,
+                on_error=self._on_classifier_error,
+                preserved_counters=preserved or getattr(self, "_cumulative_classifier_counters", None),
+            )
+            if getattr(self, "_classifier_swap_gen", gen) != gen:
+                return
+            self.classifier = new_clf
+            self.engine.set_classifier(new_clf)
+
+        t = threading.Thread(target=_worker, name="aerohand-clf-reload", daemon=True)
+        t.start()
+
     def classifier_telemetry(self) -> Dict[str, Any]:
         if isinstance(self.classifier, GuardedClassifier):
-            return self.classifier.telemetry()
+            tel = self.classifier.telemetry()
+            self._cumulative_classifier_counters = self.classifier.export_counters()
+            return tel
         cls_cfg = self.config.get("classifier") or {}
+        cum = getattr(self, "_cumulative_classifier_counters", {})
+        s_frames = int(cum.get("shadow_frames", 0))
+        s_dis = int(cum.get("shadow_disagreements", 0))
         return {
             "mode": "heuristic",
             "active_backend": type(self.classifier).__name__,
             "shadow_mode": False,
-            "shadow_frames": 0,
-            "shadow_disagreements": 0,
-            "shadow_disagreement_rate": 0.0,
-            "veto_count": 0,
-            "veto_retried_within_1s": 0,
+            "shadow_frames": s_frames,
+            "shadow_disagreements": s_dis,
+            "shadow_disagreement_rate": round(s_dis / float(s_frames), 4) if s_frames > 0 else 0.0,
+            "veto_count": int(cum.get("veto_count", 0)),
+            "veto_frames": int(cum.get("veto_frames", 0)),
+            "veto_retried_within_1s": int(cum.get("veto_retried_within_1s", 0)),
+            "veto_abstain_not_ready": int(cum.get("veto_abstain_not_ready", 0)),
+            "veto_scope": str(cls_cfg.get("veto_scope", "entry")),
+            "veto_entry_window_ms": float(cls_cfg.get("veto_entry_window_ms", 300.0)),
+            "veto_on_error": str(cls_cfg.get("veto_on_error", "pass_through")),
             "veto_min_prob": float(cls_cfg.get("veto_min_prob", 0.35)),
             "veto_idle_prob": float(cls_cfg.get("veto_idle_prob", 0.60)),
             "onnx_p95_ms": 0.0,
-            "onnx_errors": 0,
+            "feature_p95_ms": 0.0,
+            "onnx_latency_samples": 0,
+            "onnx_errors": int(cum.get("onnx_errors", 0)),
             "fell_back": False,
             "fallback_reason": None,
             "guard_active": True,
@@ -490,16 +546,68 @@ class AeroHandRuntime:
             self._restart_tracker_event.set()
 
         new_cls = effective.get("classifier") or {}
-        if (
-            resolve_classifier_mode(new_cls) != resolve_classifier_mode(old_cls)
-            or str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
-            or float(new_cls.get("veto_min_prob", 0.35)) != float(old_cls.get("veto_min_prob", 0.35))
+        new_mode = resolve_classifier_mode(new_cls)
+        old_mode = resolve_classifier_mode(old_cls)
+        model_paths_changed = (
+            str(new_cls.get("onnx_model_path", "")) != str(old_cls.get("onnx_model_path", ""))
+            or str(new_cls.get("onnx_normalizer_path", "")) != str(old_cls.get("onnx_normalizer_path", ""))
+            or int(new_cls.get("sequence_length", 5)) != int(old_cls.get("sequence_length", 5))
+            or str(new_cls.get("feature_set", "invariant348")) != str(old_cls.get("feature_set", "invariant348"))
+        )
+        heuristic_changed = (new_cls.get("heuristic_3d") or {}) != (old_cls.get("heuristic_3d") or {})
+        guard_params_changed = (
+            float(new_cls.get("veto_min_prob", 0.35)) != float(old_cls.get("veto_min_prob", 0.35))
             or float(new_cls.get("veto_idle_prob", 0.60)) != float(old_cls.get("veto_idle_prob", 0.60))
+            or str(new_cls.get("veto_scope", "entry")) != str(old_cls.get("veto_scope", "entry"))
+            or float(new_cls.get("veto_entry_window_ms", 300.0)) != float(old_cls.get("veto_entry_window_ms", 300.0))
+            or str(new_cls.get("veto_on_error", "pass_through")) != str(old_cls.get("veto_on_error", "pass_through"))
             or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
-            or (new_cls.get("heuristic_3d") or {}) != (old_cls.get("heuristic_3d") or {})
-        ):
-            self.classifier = build_classifier(effective, on_error=self._on_classifier_error)
-            self.engine.set_classifier(self.classifier)
+        )
+
+        # V051-06: Update heuristic/veto parameters in-place without wiping counters or reloading ONNX
+        if (not model_paths_changed) and (new_mode == old_mode):
+            if heuristic_changed:
+                if isinstance(self.classifier, GuardedClassifier):
+                    self.classifier.update_heuristic_config(new_cls.get("heuristic_3d"))
+                elif isinstance(self.classifier, Heuristic3DPinchClassifier):
+                    self.classifier.update_config(new_cls.get("heuristic_3d"))
+            if guard_params_changed and isinstance(self.classifier, GuardedClassifier):
+                self.classifier.update_veto_config(
+                    veto_min_prob=float(new_cls.get("veto_min_prob", 0.35)),
+                    veto_idle_prob=float(new_cls.get("veto_idle_prob", 0.60)),
+                    veto_scope=str(new_cls.get("veto_scope", "entry")),
+                    veto_entry_window_ms=float(new_cls.get("veto_entry_window_ms", 300.0)),
+                    veto_on_error=str(new_cls.get("veto_on_error", "pass_through")),
+                    max_p95_ms=float(new_cls.get("max_onnx_p95_ms", 8.0)),
+                )
+        elif (not model_paths_changed) and isinstance(self.classifier, GuardedClassifier):
+            # Mode toggle on an already-loaded GuardedClassifier: switch in-place (clears buffers, keeps counters!)
+            self.classifier.set_mode(new_mode)
+            if heuristic_changed:
+                self.classifier.update_heuristic_config(new_cls.get("heuristic_3d"))
+            if guard_params_changed:
+                self.classifier.update_veto_config(
+                    veto_min_prob=float(new_cls.get("veto_min_prob", 0.35)),
+                    veto_idle_prob=float(new_cls.get("veto_idle_prob", 0.60)),
+                    veto_scope=str(new_cls.get("veto_scope", "entry")),
+                    veto_entry_window_ms=float(new_cls.get("veto_entry_window_ms", 300.0)),
+                    veto_on_error=str(new_cls.get("veto_on_error", "pass_through")),
+                    max_p95_ms=float(new_cls.get("max_onnx_p95_ms", 8.0)),
+                )
+        else:
+            # Need to load/rebuild ONNX model (preserve cumulative counters; load off-thread if loop active)
+            if self._processing_thread_id is not None and new_mode in ("shadow", "veto", "onnx"):
+                self._swap_classifier_async(deepcopy(effective))
+            else:
+                preserved = self._export_classifier_counters()
+                if preserved:
+                    self._cumulative_classifier_counters = dict(preserved)
+                self.classifier = build_classifier(
+                    effective,
+                    on_error=self._on_classifier_error,
+                    preserved_counters=preserved or getattr(self, "_cumulative_classifier_counters", None),
+                )
+                self.engine.set_classifier(self.classifier)
 
     # ------------------------------------------------------------------
     # Data Collector Studio Controls (callable from WKWebView UI)

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
@@ -443,6 +444,7 @@ class HandCursorEngine:
         self.last_refusal_code: Optional[str] = None
         self.dwell_lock_activations: int = 0
         self.dwell_unlock_without_click: int = 0
+        self._classifier_lock = threading.Lock()
         self.update_config(config)
 
     def engine_telemetry(self) -> Dict[str, Any]:
@@ -571,19 +573,28 @@ class HandCursorEngine:
             hs.palm_wheel.update_config(pw_cfg)
 
     def _reset_classifier(self, hand: Optional[Handedness] = None) -> None:
-        if self.classifier is None:
+        with self._classifier_lock:
+            clf = self.classifier
+        if clf is None:
             return
         try:
-            self.classifier.reset(hand)  # type: ignore[call-arg]
+            clf.reset(hand)  # type: ignore[call-arg]
         except TypeError:
             if hand is None:
-                self.classifier.reset()
+                clf.reset()
 
     def set_classifier(self, classifier: Optional[PinchClassifier]) -> None:
-        """Hot-swap active classifier while clearing all temporal buffers cleanly."""
-        self._reset_classifier(None)
-        self.classifier = classifier
-        self._reset_classifier(None)
+        """Hot-swap active classifier atomically while clearing temporal buffers cleanly (V051-06)."""
+        with self._classifier_lock:
+            old_clf = self.classifier
+            self.classifier = classifier
+        for clf in (old_clf, classifier):
+            if clf is None:
+                continue
+            try:
+                clf.reset(None)  # type: ignore[call-arg]
+            except TypeError:
+                clf.reset()
 
     def reset(self) -> None:
         self.smoother.reset()
@@ -784,9 +795,11 @@ class HandCursorEngine:
                 or (self.latch_gate_while_pose_active and pose_active)
             )
             tm0 = time.perf_counter()
-            if self.classifier is not None and not pw_active and gate_allows:
+            with self._classifier_lock:
+                active_clf = self.classifier
+            if active_clf is not None and not pw_active and gate_allows:
                 try:
-                    pred = self.classifier.predict(
+                    pred = active_clf.predict(
                         landmarks_2d=lms,
                         world_landmarks=inp.world_landmarks,
                         handedness=hand,

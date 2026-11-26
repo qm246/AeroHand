@@ -2,11 +2,14 @@
 Self-Trained ONNX Causal TCN Classifier (Dual-Feature: 348-dim Invariant3D & 885-dim AirMouse).
 Adapted from Airpoint SDK `ONNXGestureClassifier.ts` (Apache-2.0) for Python `onnxruntime`.
 
-Upgrades:
+Upgrades (v0.5.1 — V051-03 / V051-04 / V051-05 / V051-06):
   - Per-hand independent 5-frame causal ring buffers (`Left` & `Right` never cross-contaminate).
   - Auto-detects `invariant348` vs `airmouse885` feature extractor from normalizer JSON metadata/length.
-  - Consistent Left-hand X mirroring for both feature sets.
-  - Fail-open to IDLE if model/normalizer is missing or mismatched.
+  - Warm-up (20 runs) in `_load()` so cold-start ORT allocation never trips the latency guard.
+  - Separates `feature_ms` from `infer_ms` (`session.run` only) and skips buffer-fill frames (`ready=False`).
+  - Raises `ValueError` on feature-dim mismatch so `GuardedClassifier` triggers error fallback instead of silent veto.
+  - Entry-only event-counted veto mode (`veto_scope="entry"`, `veto_entry_window_ms=300`, `veto_on_error="pass_through"`).
+  - Supports `rearm()`, in-place heuristic config updates, and cumulative counter export/import.
 """
 
 from __future__ import annotations
@@ -16,7 +19,7 @@ import logging
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Callable, Deque, Dict, Optional, Sequence
+from typing import Any, Callable, Deque, Dict, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -26,6 +29,23 @@ from aerohand.ml.features_3d import FEATURE_DIM_3D, extract_invariant_3d_feature
 from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
 
 logger = logging.getLogger(__name__)
+
+VALID_CLASSIFIER_MODES = ("heuristic", "shadow", "veto", "onnx")
+VALID_VETO_SCOPES = ("entry", "always")
+VALID_VETO_ON_ERROR = ("pass_through", "idle")
+
+
+def resolve_classifier_mode(cls_cfg: Optional[Dict[str, Any]]) -> str:
+    """Resolve effective classifier mode (`heuristic | shadow | veto | onnx`) with legacy compatibility."""
+    cfg = cls_cfg or {}
+    raw_mode = str(cfg.get("mode", "")).strip().lower()
+    if raw_mode in ("shadow", "veto", "onnx"):
+        return raw_mode
+    if bool(cfg.get("shadow_mode", False)):
+        return "shadow"
+    if str(cfg.get("backend", "heuristic_3d")).strip().lower() == "onnx_tcn":
+        return "onnx"
+    return "heuristic"
 
 
 class ONNXPinchClassifier:
@@ -37,11 +57,14 @@ class ONNXPinchClassifier:
         normalizer_path: str | Path,
         sequence_length: int = 5,
         feature_set: Optional[str] = None,
+        *,
+        warmup_runs: int = 20,
     ) -> None:
         self.model_path = Path(model_path)
         self.normalizer_path = Path(normalizer_path)
         self.sequence_length = max(1, int(sequence_length))
         self.feature_set: str = feature_set or "auto"
+        self._warmup_runs: int = max(0, int(warmup_runs))
         self._buffers: Dict[Handedness, Deque[np.ndarray]] = {
             "Left": deque(maxlen=self.sequence_length),
             "Right": deque(maxlen=self.sequence_length),
@@ -98,9 +121,17 @@ class ONNXPinchClassifier:
             str(self.model_path), sess_options=opts, providers=["CPUExecutionProvider"]
         )
         self._input_name = self._session.get_inputs()[0].name
+
+        # V051-03: Warm-up ORT session so cold-start allocation never trips the latency guard
+        if self._warmup_runs > 0:
+            dummy = np.zeros((1, self.sequence_length, int(self._mean.shape[0])), dtype=np.float32)
+            for _ in range(self._warmup_runs):
+                self._session.run(None, {self._input_name: dummy})
+
         logger.info(
             f"[ONNX] Loaded TCN model: {self.model_path.name} "
-            f"(feature_set={self.feature_set}, dim={self._mean.shape[0]}, seq={self.sequence_length})"
+            f"(feature_set={self.feature_set}, dim={self._mean.shape[0]}, seq={self.sequence_length}, "
+            f"warmup={self._warmup_runs})"
         )
 
     def reset(self, hand: Optional[Handedness] = None) -> None:
@@ -118,24 +149,39 @@ class ONNXPinchClassifier:
         timestamp_ms: float,
     ) -> PinchPrediction:
         if self._session is None:
-            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low", ready=False)
 
+        tf0 = time.perf_counter()
         if self.feature_set == "airmouse885":
             feat = extract_airmouse_885_features(landmarks_2d, world_landmarks, handedness=handedness)
         else:
             feat = extract_invariant_3d_features(landmarks_2d, world_landmarks, handedness=handedness)
+        feat_ms = (time.perf_counter() - tf0) * 1000.0
 
-        if feat is None or feat.shape[0] != self._mean.shape[0]:
-            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
+        if feat is None:
+            return PinchPrediction(
+                PoseName.IDLE, idle_probabilities(), "low", ready=False, feature_ms=feat_ms
+            )
+        if feat.shape[0] != self._mean.shape[0]:
+            raise ValueError(
+                f"ONNX feature_dim mismatch: extracted {feat.shape[0]} ({self.feature_set}), "
+                f"normalizer expects {self._mean.shape[0]}."
+            )
 
         norm_feat = (feat - self._mean) / self._scale
         buf = self._buffers[handedness]
         buf.append(norm_feat)
         if len(buf) < self.sequence_length:
-            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
+            return PinchPrediction(
+                PoseName.IDLE, idle_probabilities(), "low", ready=False, feature_ms=feat_ms
+            )
 
         seq = np.stack(list(buf), axis=0)[None, :, :]  # (1, seq_len, F)
-        logits = np.asarray(self._session.run(None, {self._input_name: seq})[0]).reshape(-1).astype(np.float64)
+        ti0 = time.perf_counter()
+        raw_out = self._session.run(None, {self._input_name: seq})[0]
+        infer_ms = (time.perf_counter() - ti0) * 1000.0
+
+        logits = np.asarray(raw_out).reshape(-1).astype(np.float64)
         logits = logits / self._temperature
         logits = logits - float(np.max(logits))
         exps = np.exp(logits)
@@ -149,39 +195,31 @@ class ONNXPinchClassifier:
         best_pose = max(probs.items(), key=lambda kv: kv[1])[0]
         best_p = probs[best_pose]
         conf = "high" if best_p > 0.8 else ("medium" if best_p > 0.6 else "low")
-        return PinchPrediction(pose=best_pose, probabilities=probs, confidence=conf)
-
-
-VALID_CLASSIFIER_MODES = ("heuristic", "shadow", "veto", "onnx")
-
-
-def resolve_classifier_mode(cls_cfg: Optional[Dict[str, Any]]) -> str:
-    """Resolve effective classifier mode (`heuristic | shadow | veto | onnx`) with legacy compatibility."""
-    cfg = cls_cfg or {}
-    raw_mode = str(cfg.get("mode", "")).strip().lower()
-    if raw_mode in ("shadow", "veto", "onnx"):
-        return raw_mode
-    if bool(cfg.get("shadow_mode", False)):
-        return "shadow"
-    if str(cfg.get("backend", "heuristic_3d")).strip().lower() == "onnx_tcn":
-        return "onnx"
-    return "heuristic"
+        return PinchPrediction(
+            pose=best_pose,
+            probabilities=probs,
+            confidence=conf,
+            ready=True,
+            infer_ms=infer_ms,
+            feature_ms=feat_ms,
+        )
 
 
 class GuardedClassifier:
     """
-    Production safety wrapper for ONNX TCN + Heuristic3D fallback (V040-04 / V050-04):
+    Production safety wrapper for ONNX TCN + Heuristic3D fallback (V040-04 / V050-04 / V051-03..06):
       - Modes:
           * `heuristic`: runs Heuristic3D only.
-          * `shadow`: runs ONNX alongside Heuristic3D and logs disagreement rates without acting.
-          * `veto`: Heuristic3D proposes; ONNX can ONLY veto non-idle poses (returns IDLE if
-            `onnx_prob[pose] < veto_min_prob` or `onnx_prob[idle] > veto_idle_prob`).
+          * `shadow`: runs ONNX alongside Heuristic3D and logs disagreement rates on ready frames only.
+          * `veto`: Heuristic3D proposes; ONNX can ONLY veto non-idle poses when `ready=True`.
+            Default `veto_scope="entry"` applies veto strictly within `veto_entry_window_ms` (300 ms)
+            of the heuristic rising edge so ongoing drags/scrolls/dictations are never interrupted.
             ONNX can NEVER create a new activation when Heuristic3D predicts IDLE.
           * `onnx`: full ONNX 1D-TCN predictions.
-      - Auto-fallback: switches back to Heuristic3D if ONNX inference p95 exceeds `max_p95_ms`
-        (default 8 ms) or if ONNX errors occur >= `max_errors` (3) times within `error_window_s` (10 s).
-      - Fail-open: any ONNX error returns `PoseName.IDLE` (or Heuristic3D in shadow) and invokes `on_error`.
-      - Buffer hygiene: clears per-hand 5-frame temporal buffers on `reset(hand)` AND on `set_mode()`.
+      - Latency guard: tracks ONLY real inference calls (`ready=True`, `infer_ms` around `session.run`),
+        requires >= `min_latency_samples` (30) real inferences, and uses `np.percentile(..., 95)`.
+      - Re-arm: `rearm()` clears fallback state & rolling windows cleanly.
+      - Buffer hygiene: clears per-hand 5-frame temporal buffers on `reset(hand)` AND `set_mode()`.
     """
 
     def __init__(
@@ -193,7 +231,11 @@ class GuardedClassifier:
         shadow_mode: bool = False,
         veto_min_prob: float = 0.35,
         veto_idle_prob: float = 0.60,
+        veto_scope: str = "entry",
+        veto_entry_window_ms: float = 300.0,
+        veto_on_error: str = "pass_through",
         max_p95_ms: float = 8.0,
+        min_latency_samples: int = 30,
         max_errors: int = 3,
         error_window_s: float = 10.0,
         on_error: Optional[Callable[[], None]] = None,
@@ -208,15 +250,24 @@ class GuardedClassifier:
             self._mode: str = norm_mode
         else:
             self._mode = "shadow" if bool(shadow_mode) else "onnx"
+
+        scope_norm = str(veto_scope or "entry").strip().lower()
+        self.veto_scope: str = scope_norm if scope_norm in VALID_VETO_SCOPES else "entry"
+        self.veto_entry_window_ms: float = max(0.0, float(veto_entry_window_ms))
+        err_pol = str(veto_on_error or "pass_through").strip().lower()
+        self.veto_on_error: str = err_pol if err_pol in VALID_VETO_ON_ERROR else "pass_through"
+
         self.veto_min_prob: float = max(0.05, min(0.95, float(veto_min_prob)))
         self.veto_idle_prob: float = max(0.05, min(0.95, float(veto_idle_prob)))
         self.max_p95_ms: float = max(0.5, float(max_p95_ms))
+        self.min_latency_samples: int = max(5, int(min_latency_samples))
         self.max_errors: int = max(1, int(max_errors))
         self.error_window_s: float = max(1.0, float(error_window_s))
         self._on_error = on_error
         self._clock_s: Callable[[], float] = clock_s or time.monotonic
 
-        self._latencies_ms: Deque[float] = deque(maxlen=64)
+        self._latencies_ms: Deque[float] = deque(maxlen=128)
+        self._feature_latencies_ms: Deque[float] = deque(maxlen=128)
         self._error_times: Deque[float] = deque()
         self._total_errors: int = 0
         self._fell_back: bool = False
@@ -224,8 +275,13 @@ class GuardedClassifier:
         self._shadow_frames: int = 0
         self._shadow_disagreements: int = 0
         self._veto_count: int = 0
+        self._veto_frames: int = 0
         self._veto_retried_within_1s: int = 0
-        self._last_veto_by_hand: Dict[Handedness, tuple[PoseName, float, bool]] = {}
+        self._veto_abstain_not_ready: int = 0
+        # Per-hand rising-edge event tracker: (pose, enter_ts_ms, accepted, event_vetoed)
+        self._heur_event_by_hand: Dict[Handedness, Tuple[PoseName, float, bool, bool]] = {}
+        # Per-hand last vetoed event for retry-within-1s detection: (pose, veto_ts_ms, released_to_idle)
+        self._last_veto_by_hand: Dict[Handedness, Tuple[PoseName, float, bool]] = {}
 
     @property
     def mode(self) -> str:
@@ -247,7 +303,75 @@ class GuardedClassifier:
         if norm != self._mode:
             self._mode = norm
             self._last_veto_by_hand.clear()
+            self._heur_event_by_hand.clear()
             self.reset(None)
+
+    def rearm(self) -> None:
+        """Re-arm ONNX after an auto-fallback event, clearing stale latency/error windows (V051-03)."""
+        self._fell_back = False
+        self._fallback_reason = None
+        self._latencies_ms.clear()
+        self._feature_latencies_ms.clear()
+        self._error_times.clear()
+        self.reset(None)
+
+    def update_veto_config(
+        self,
+        *,
+        veto_min_prob: Optional[float] = None,
+        veto_idle_prob: Optional[float] = None,
+        veto_scope: Optional[str] = None,
+        veto_entry_window_ms: Optional[float] = None,
+        veto_on_error: Optional[str] = None,
+        max_p95_ms: Optional[float] = None,
+    ) -> None:
+        """Update guard/veto settings in-place without rebuilding ONNX or resetting counters (V051-06)."""
+        if veto_min_prob is not None:
+            self.veto_min_prob = max(0.05, min(0.95, float(veto_min_prob)))
+        if veto_idle_prob is not None:
+            self.veto_idle_prob = max(0.05, min(0.95, float(veto_idle_prob)))
+        if veto_scope is not None:
+            s = str(veto_scope).strip().lower()
+            if s in VALID_VETO_SCOPES:
+                self.veto_scope = s
+        if veto_entry_window_ms is not None:
+            self.veto_entry_window_ms = max(0.0, float(veto_entry_window_ms))
+        if veto_on_error is not None:
+            p = str(veto_on_error).strip().lower()
+            if p in VALID_VETO_ON_ERROR:
+                self.veto_on_error = p
+        if max_p95_ms is not None:
+            self.max_p95_ms = max(0.5, float(max_p95_ms))
+
+    def update_heuristic_config(self, cfg: Optional[Dict[str, Any]]) -> None:
+        """Forward in-place heuristic threshold updates without losing state/counters (V051-06)."""
+        upd = getattr(self._fallback, "update_config", None)
+        if callable(upd):
+            upd(cfg)
+
+    def export_counters(self) -> Dict[str, int]:
+        """Export cumulative shadow/veto/error counters so rebuilds never wipe evidence (V051-06)."""
+        return {
+            "shadow_frames": self._shadow_frames,
+            "shadow_disagreements": self._shadow_disagreements,
+            "veto_count": self._veto_count,
+            "veto_frames": self._veto_frames,
+            "veto_retried_within_1s": self._veto_retried_within_1s,
+            "veto_abstain_not_ready": self._veto_abstain_not_ready,
+            "onnx_errors": self._total_errors,
+        }
+
+    def import_counters(self, counters: Optional[Dict[str, Any]]) -> None:
+        """Restore cumulative shadow/veto/error counters onto a freshly built guard (V051-06)."""
+        if not counters:
+            return
+        self._shadow_frames = int(counters.get("shadow_frames", self._shadow_frames))
+        self._shadow_disagreements = int(counters.get("shadow_disagreements", self._shadow_disagreements))
+        self._veto_count = int(counters.get("veto_count", self._veto_count))
+        self._veto_frames = int(counters.get("veto_frames", self._veto_frames))
+        self._veto_retried_within_1s = int(counters.get("veto_retried_within_1s", self._veto_retried_within_1s))
+        self._veto_abstain_not_ready = int(counters.get("veto_abstain_not_ready", self._veto_abstain_not_ready))
+        self._total_errors = int(counters.get("onnx_errors", self._total_errors))
 
     @property
     def fell_back(self) -> bool:
@@ -275,8 +399,10 @@ class GuardedClassifier:
     def reset(self, hand: Optional[Handedness] = None) -> None:
         if hand is None:
             self._last_veto_by_hand.clear()
+            self._heur_event_by_hand.clear()
         else:
             self._last_veto_by_hand.pop(hand, None)
+            self._heur_event_by_hand.pop(hand, None)
         for clf in (self._onnx, self._fallback):
             try:
                 clf.reset(hand)  # type: ignore[call-arg]
@@ -286,19 +412,22 @@ class GuardedClassifier:
     def _p95_ms(self) -> float:
         if not self._latencies_ms:
             return 0.0
-        arr = sorted(self._latencies_ms)
-        idx = min(len(arr) - 1, int(round(0.95 * (len(arr) - 1))))
-        return float(arr[idx])
+        return float(np.percentile(np.asarray(self._latencies_ms, dtype=np.float64), 95))
 
-    def _record_error(self, exc: Exception) -> None:
+    def _feature_p95_ms(self) -> float:
+        if not self._feature_latencies_ms:
+            return 0.0
+        return float(np.percentile(np.asarray(self._feature_latencies_ms, dtype=np.float64), 95))
+
+    def _record_error(self, exc: Exception, *, invoke_on_error: bool = True) -> None:
         now = self._clock_s()
         self._total_errors += 1
         self._error_times.append(now)
         cutoff = now - self.error_window_s
         while self._error_times and self._error_times[0] < cutoff:
             self._error_times.popleft()
-        logger.warning(f"[ML] ONNX classifier error ({exc}); fail-open to IDLE.")
-        if self._on_error is not None:
+        logger.warning(f"[ML] ONNX classifier error ({exc}).")
+        if invoke_on_error and self._on_error is not None:
             try:
                 self._on_error()
             except Exception:
@@ -312,15 +441,22 @@ class GuardedClassifier:
                 f"{len(self._error_times)} ONNX errors in {self.error_window_s:.0f}s."
             )
 
-    def _check_latency_guard(self, elapsed_ms: float) -> None:
+    def _record_and_check_latency(self, pred: PinchPrediction, wall_ms: float, *, enforce: bool = True) -> None:
+        if pred.feature_ms is not None:
+            self._feature_latencies_ms.append(max(0.0, float(pred.feature_ms)))
+        # V051-03: Exclude buffer-fill / unready frames from ONNX latency tracking
+        if not pred.ready:
+            return
+        elapsed_ms = max(0.0, float(pred.infer_ms)) if pred.infer_ms is not None else max(0.0, float(wall_ms))
         self._latencies_ms.append(elapsed_ms)
-        if len(self._latencies_ms) >= 10 and self._p95_ms() > self.max_p95_ms:
+        if enforce and len(self._latencies_ms) >= self.min_latency_samples and self._p95_ms() > self.max_p95_ms:
             self._fell_back = True
             self._fallback_reason = "onnx_fallback_latency"
             self.reset()
             logger.warning(
                 f"[ML] Auto-fallback to {type(self._fallback).__name__}: "
-                f"ONNX p95={self._p95_ms():.2f}ms > {self.max_p95_ms:.1f}ms."
+                f"ONNX p95={self._p95_ms():.2f}ms > {self.max_p95_ms:.1f}ms "
+                f"over {len(self._latencies_ms)} inferences."
             )
 
     def predict(
@@ -338,62 +474,89 @@ class GuardedClassifier:
             t0 = self._clock_s()
             try:
                 onnx_pred = self._onnx.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
-                dt_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
-                self._latencies_ms.append(dt_ms)
-                self._shadow_frames += 1
-                if onnx_pred.pose != heur_pred.pose:
-                    self._shadow_disagreements += 1
+                wall_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
+                self._record_and_check_latency(onnx_pred, wall_ms, enforce=False)
+                if onnx_pred.ready:
+                    self._shadow_frames += 1
+                    if onnx_pred.pose != heur_pred.pose:
+                        self._shadow_disagreements += 1
             except Exception as exc:
-                self._record_error(exc)
+                self._record_error(exc, invoke_on_error=False)
             return heur_pred
 
         if self._mode == "veto":
             heur_pred = self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
-            # Keep ONNX 5-frame causal ring buffer warm on every frame, guarded by latency & error bounds
             t0 = self._clock_s()
             onnx_pred: Optional[PinchPrediction] = None
             try:
                 onnx_pred = self._onnx.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
-                dt_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
-                self._check_latency_guard(dt_ms)
+                wall_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
+                self._record_and_check_latency(onnx_pred, wall_ms, enforce=True)
             except Exception as exc:
-                self._record_error(exc)
+                pass_through = self.veto_on_error == "pass_through"
+                self._record_error(exc, invoke_on_error=(not pass_through))
+                if pass_through:
+                    return heur_pred
                 return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
 
-            # CRITICAL V050-04 INVARIANT: ONNX can NEVER create an activation when Heuristic predicts IDLE!
+            # CRITICAL INVARIANT: ONNX can NEVER create an activation when Heuristic predicts IDLE!
             if heur_pred.pose == PoseName.IDLE:
+                self._heur_event_by_hand.pop(handedness, None)
                 prev_v = self._last_veto_by_hand.get(handedness)
                 if prev_v is not None and not prev_v[2]:
-                    # Mark that user released to IDLE after a veto (enables retry-within-1s miss proxy)
                     self._last_veto_by_hand[handedness] = (prev_v[0], prev_v[1], True)
                 return heur_pred
 
-            # Track miss proxy: user released after veto and retried the same pose within 1000 ms
-            prev_v = self._last_veto_by_hand.get(handedness)
-            if prev_v is not None and prev_v[2]:
-                if prev_v[0] == heur_pred.pose and 0.0 <= (timestamp_ms - prev_v[1]) <= 1000.0:
-                    self._veto_retried_within_1s += 1
-                self._last_veto_by_hand.pop(handedness, None)
+            # Track heuristic rising-edge event per hand (V051-05)
+            cur_ev = self._heur_event_by_hand.get(handedness)
+            if cur_ev is None or cur_ev[0] != heur_pred.pose:
+                # Rising edge of a new heuristic pose attempt
+                prev_v = self._last_veto_by_hand.get(handedness)
+                if prev_v is not None and prev_v[2]:
+                    if prev_v[0] == heur_pred.pose and 0.0 <= (timestamp_ms - prev_v[1]) <= 1000.0:
+                        self._veto_retried_within_1s += 1
+                    self._last_veto_by_hand.pop(handedness, None)
+                cur_ev = (heur_pred.pose, float(timestamp_ms), False, False)
+                self._heur_event_by_hand[handedness] = cur_ev
+
+            ev_pose, enter_ts_ms, accepted, event_vetoed = cur_ev
 
             if self._fell_back or onnx_pred is None:
                 return heur_pred
 
+            # V051-04: ONNX warming up / not ready -> abstain cleanly (never silently veto!)
+            if not onnx_pred.ready:
+                self._veto_abstain_not_ready += 1
+                return heur_pred
+
+            # V051-05: In entry scope, once accepted (or past entry window un-vetoed), never interrupt active hold
+            if self.veto_scope == "entry":
+                if accepted or ((timestamp_ms - enter_ts_ms) > self.veto_entry_window_ms and not event_vetoed):
+                    self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, True, False)
+                    return heur_pred
+
             p_proposed = float(onnx_pred.probabilities.get(heur_pred.pose, 0.0))
             p_idle = float(onnx_pred.probabilities.get(PoseName.IDLE, 0.0))
             if p_proposed < self.veto_min_prob or p_idle > self.veto_idle_prob:
-                self._veto_count += 1
-                self._last_veto_by_hand[handedness] = (heur_pred.pose, float(timestamp_ms), False)
+                self._veto_frames += 1
+                if not event_vetoed:
+                    self._veto_count += 1
+                    self._last_veto_by_hand[handedness] = (heur_pred.pose, float(timestamp_ms), False)
+                self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, False, True)
                 return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
+
+            # Approved by ONNX -> mark accepted so active hold stays uninterrupted in entry scope
+            self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, True, False)
             return heur_pred
 
         t0 = self._clock_s()
         try:
             pred = self._onnx.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
-            dt_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
-            self._check_latency_guard(dt_ms)
+            wall_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
+            self._record_and_check_latency(pred, wall_ms, enforce=True)
             return pred
         except Exception as exc:
-            self._record_error(exc)
+            self._record_error(exc, invoke_on_error=True)
             return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")
 
     def telemetry(self) -> Dict[str, Any]:
@@ -406,10 +569,17 @@ class GuardedClassifier:
             "shadow_disagreements": self._shadow_disagreements,
             "shadow_disagreement_rate": round(rate, 4),
             "veto_count": self._veto_count,
+            "veto_frames": self._veto_frames,
             "veto_retried_within_1s": self._veto_retried_within_1s,
+            "veto_abstain_not_ready": self._veto_abstain_not_ready,
+            "veto_scope": self.veto_scope,
+            "veto_entry_window_ms": self.veto_entry_window_ms,
+            "veto_on_error": self.veto_on_error,
             "veto_min_prob": self.veto_min_prob,
             "veto_idle_prob": self.veto_idle_prob,
             "onnx_p95_ms": round(self._p95_ms(), 2),
+            "feature_p95_ms": round(self._feature_p95_ms(), 2),
+            "onnx_latency_samples": len(self._latencies_ms),
             "onnx_errors": self._total_errors,
             "fell_back": self._fell_back,
             "fallback_reason": self._fallback_reason,

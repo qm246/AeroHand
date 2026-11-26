@@ -199,7 +199,8 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "mode_shadow": "Shadow Mode (Chạy song song ONNX, chưa tác động)",
             "mode_veto": "Veto-Only (ONNX chỉ được chặn kích hoạt nhầm)",
             "mode_onnx": "ONNX 1D-TCN (Toàn phần — có auto-fallback)",
-            "veto_status": "Veto Mode: đã chặn {vetos} lần • thử lại ≤1s: {retries} • ONNX p95={p95} ms",
+            "veto_status": "Veto Mode: đã chặn {vetos} lượt • thử lại ≤1s: {retries} • ONNX p95={p95} ms",
+            "rearm_btn": "↻ Bật lại ONNX",
         },
     },
     "en": {
@@ -395,6 +396,7 @@ TRANSLATIONS: Dict[str, Dict[str, Any]] = {
             "mode_veto": "Veto-Only (ONNX may only veto false activations)",
             "mode_onnx": "ONNX 1D-TCN (Full control + auto-fallback)",
             "veto_status": "Veto Mode: {vetos} vetoed • retried ≤1s: {retries} • ONNX p95={p95} ms",
+            "rearm_btn": "↻ Re-arm ONNX",
         },
     },
 }

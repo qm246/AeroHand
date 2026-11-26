@@ -97,6 +97,11 @@ class Heuristic3DPinchClassifier:
     """Rotation-invariant 3D distance estimator with data-driven intent gates."""
 
     def __init__(self, cfg: Optional[Dict[str, Any]] = None) -> None:
+        self._hands: Dict[Handedness, _PerHandIntentState] = {}
+        self.update_config(cfg)
+
+    def update_config(self, cfg: Optional[Dict[str, Any]]) -> None:
+        """Update thresholds and intent-gate parameters in-place without clearing hand state (V051-06)."""
         c = cfg or {}
         self.pinch_on_dist: float = float(c.get("pinch_on_dist", 0.34))
         self.pinch_off_dist: float = float(c.get("pinch_off_dist", 0.62))
@@ -124,7 +129,6 @@ class Heuristic3DPinchClassifier:
 
         self._state_gap_reset_ms: float = float(c.get("state_gap_reset_ms", 250.0))
         self._latch_score_threshold: float = float(c.get("latch_score_threshold", 0.85))
-        self._hands: Dict[Handedness, _PerHandIntentState] = {}
 
     def reset(self, hand: Optional[Handedness] = None) -> None:
         if hand is None:

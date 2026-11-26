@@ -575,7 +575,10 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
               <option value="onnx">ONNX 1D-TCN (Toàn phần — có auto-fallback)</option>
             </select>
           </div>
-          <div id="ml-guard-status" style="font-size:11.5px;color:var(--teal);margin-top:6px"></div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:6px;flex-wrap:wrap">
+            <div id="ml-guard-status" style="font-size:11.5px;color:var(--teal)"></div>
+            <button class="btn sm" id="btn-onnx-rearm" style="display:none" onclick="post('classifier_rearm')">↻ Bật lại ONNX</button>
+          </div>
           <div class="row">
             <div class="row-label"><strong>MediaPipe Delegate</strong><span>CPU XNNPACK (0 rò rỉ RAM, ổn định 24/7 trên macOS)</span></div>
             <select id="cfg-trk-del" onchange="setKey('tracker.delegate', this.value)">
@@ -1294,8 +1297,14 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     if (CURRENT_TAB === "ml") {
       const ct = snap.classifier_telemetry || {};
       const guardEl = document.getElementById("ml-guard-status");
+      const rearmBtn = document.getElementById("btn-onnx-rearm");
+      const clsI18nLive = i18n.classifier || {};
+      if (rearmBtn) {
+        rearmBtn.style.display = ct.fell_back ? "inline-flex" : "none";
+        rearmBtn.textContent = clsI18nLive.rearm_btn || (isVi ? "↻ Bật lại ONNX" : "↻ Re-arm ONNX");
+      }
       if (guardEl) {
-        const clsI18n = i18n.classifier || {};
+        const clsI18n = clsI18nLive;
         if (ct.fell_back && ct.fallback_reason) {
           guardEl.style.color = "var(--amber)";
           guardEl.textContent = "⚠ " + ((i18n.warnings && i18n.warnings[ct.fallback_reason]) || ct.fallback_reason);

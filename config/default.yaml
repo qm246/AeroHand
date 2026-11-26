@@ -118,6 +118,9 @@ classifier:
   shadow_mode: false                   # Legacy alias for mode="shadow"
   veto_min_prob: 0.35                  # In veto mode: veto if ONNX prob(proposed_pose) < 0.35
   veto_idle_prob: 0.60                 # In veto mode: veto if ONNX prob(idle) > 0.60
+  veto_scope: "entry"                  # "entry" (only first veto_entry_window_ms) | "always"
+  veto_entry_window_ms: 300.0          # Window (ms) after heuristic rising edge where ONNX may veto
+  veto_on_error: "pass_through"        # "pass_through" (preserve heuristic on ONNX error) | "idle"
   max_onnx_p95_ms: 8.0                 # Auto-fallback to heuristic if ONNX p95 latency > 8ms
   heuristic_3d:
     pinch_on_dist: 0.34

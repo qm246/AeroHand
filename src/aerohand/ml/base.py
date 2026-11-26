@@ -15,6 +15,9 @@ class PinchPrediction:
     pose: PoseName
     probabilities: PoseProbabilities
     confidence: ConfidenceLevel
+    ready: bool = True
+    infer_ms: Optional[float] = None
+    feature_ms: Optional[float] = None
 
 
 class PinchClassifier(Protocol):

@@ -1017,6 +1017,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "collector_clear":
             if self.runtime is not None:
                 self.runtime.collector_clear()
+        elif act == "classifier_rearm":
+            if self.runtime is not None:
+                self.runtime.rearm_classifier()
         elif act == "mark_not_intended":
             self.markNotIntended_(None)
         elif act == "reset_practice":

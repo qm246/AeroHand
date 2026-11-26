@@ -1,4 +1,4 @@
-# Kiến Trúc Hệ Thống AeroHand (v0.5.0)
+# Kiến Trúc Hệ Thống AeroHand (v0.5.1)
 
 ## 1. Mục tiêu thiết kế
 Kết hợp **thuật toán công thái học & trải nghiệm UX hoàn chỉnh** của `andrewslabmd/airpoint-sdk` (Apache-2.0) với **nền tảng an toàn macOS bản địa, tiêu thụ tài nguyên thấp và kỷ luật đánh giá ML** từ `GestureCtl` trong một ứng dụng macOS gọn nhẹ chạy hoàn toàn bằng Python + PyObjC + `WKWebView` bản địa (không cần Electron/Node).

@@ -8,7 +8,7 @@
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache--2.0-teal.svg)](LICENSE)
 [![Platform: macOS Apple Silicon](https://img.shields.io/badge/macOS-Apple%20Silicon-blue.svg)](#cài-đặt--chạy-nhanh-macos-apple-silicon)
-[![Version: v0.5.0](https://img.shields.io/badge/Version-0.5.0-emerald.svg)](#)
+[![Version: v0.5.1](https://img.shields.io/badge/Version-0.5.1-emerald.svg)](#)
 
 </div>
 
@@ -22,7 +22,7 @@
 
 ---
 
-## Tính năng nổi bật (v0.5.0)
+## Tính năng nổi bật (v0.5.1)
 
 - **Giao diện macOS Dark Glass bản địa (`WKWebView` + Menu Bar)**: 8 tab chuyên biệt (*Tổng quan*, *Cử chỉ*, *Con trỏ & Cuộn*, *Palm Wheel*, *Camera & HUD*, *Giọng nói & API*, *Dữ liệu ML*, *Hướng dẫn tương tác* kèm **Wizard hiệu chỉnh cá nhân 7 bước** có bước **Chụm lỏng 1–2 cm**), dòng trạng thái trực tiếp **"Vì sao không kích hoạt?"**, **hỗ trợ song ngữ Tiếng Việt (mặc định) ↔ English** đổi tức thì, tải nhẹ 5 Hz khi ẩn cửa sổ và lưu cấu hình có debounce 500 ms.
 - **4 lớp Overlay nổi đa màn hình tự phục hồi (`ScreenGeometry` + `WKNavigationDelegate` reload)**:

@@ -1,4 +1,4 @@
-# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.0)
+# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.1)
 
 Tài liệu này quy định quy trình thu thập dữ liệu, huấn luyện Causal 1D-TCN, đánh giá A/B giữa hai tập đặc trưng (`invariant348` và `airmouse885`), kiểm thử hồi quy ngoại tuyến (`replay_eval.py`) và triển khai an toàn qua Shadow Mode.
 
@@ -168,3 +168,25 @@ Phân tích JSONL sự kiện kích hoạt nhầm trên bộ âm tính đời th
 | Recall dương tính `clicks_pinch_cadence_near_250s` | 94,4% khung / 53/53 lượt | **94,4% khung / 53/53 lượt (100,0%)** | Không giảm |
 
 > **Lưu ý thống kê**: Phơi nhiễm `D-dev` chỉ đạt `0,1237 giờ` `hand_present_idle` (cận trên 95% với 4 sự kiện là `74,0 FT/giờ`). Các cổng hình học chỉ giảm tải bước đầu; để chứng minh ≤ 2 FT/giờ (UCB 95%) cần huấn luyện TCN trên bộ dữ liệu đa lớp và đánh giá 1 lần trên tập held-out đóng niêm phong ≥ 1,5 giờ (`V050-02`–`V050-04`).
+
+---
+
+## 7. Gia cố An toàn, Provenance & Kiểm chứng `v0.5.1` (`V051-01` → `V051-12`)
+
+Bản vá `v0.5.1` khóa toàn bộ các lỗ hổng rò rỉ dữ liệu, chuẩn hóa độc lập FPS/khoảng cách và kiểm chứng recall 5 lớp tổng hợp trước khi thu thập bộ dữ liệu 21.000 khung:
+
+- **Chống rò rỉ & Khóa Provenance (`V051-01`, `V051-02`, `V051-10`, `V051-11`)**:
+  - Thống nhất `collector.subject: "minh"` và chặn bỏ sót dữ liệu ngầm khi `--primary-subject` không khớp `session_meta.subject`.
+  - `seal_heldout.py` mặc định **di chuyển** (`move=True`, `--copy` tùy chọn), cấm `--force` sau khi đã chạm (`touched > 0`), giới hạn `max_touches=3`, và kiểm tra `model_hash` đúng 24 ký tự hex.
+  - `train_tcn.py`, `replay_eval.py` và `domain_check.py` lọc loại mọi tệp có mã băm SHA-256 trùng với `sealed_manifest.json` (kể cả khi đã sao chép/đổi tên) và cấm `--ab-eval-negatives` trùng với tập âm tính huấn luyện.
+  - `train_tcn.py` ghi đầy đủ `model_sha256`, `normalizer_sha256`, `model_hash`, `git_commit`, `seed`, `data_files_sha256_list`, `torch_version`; tách `dev_test` độc lập khi có ≥ 4 nhóm; chia phân tầng theo lớp khi chỉ có 1 nhóm; chuẩn hóa nhiễu tăng cường theo `palm_width`; kiểm parity ONNX trên tới 256 mẫu; chỉ ghi đè `models/metrics.json` khi truyền `--set-latest`.
+  - `check_onnx_promotion.py` hỗ trợ `--stage veto` (chưa yêu cầu tình nguyện viên `subject-held-out`) và `--stage onnx` (đầy đủ 5 cổng), bắt buộc khớp `model_hash` / `model_sha256` xuyên suốt mọi tệp, kèm bảng Garwood 95% (`UCB <= 2.0/h`: `k=0 -> 1.50h`, `k=1 -> 2.37h`, `k=2 -> 3.15h`).
+- **Ổn định Runtime ONNX & Veto-Only (`V051-03` → `V051-06`)**:
+  - Warm-up 20 lần nạp ONNX, tách `feature_ms` vs `infer_ms` (`session.run`), yêu cầu `>= 30` mẫu thật trước khi kích hoạt Latency Guard, bổ sung nút **"Kích hoạt lại ONNX"** (`rearm()`).
+  - Bỏ qua sạch các khung `ready=False` lúc nạp đệm 5 khung; phạm vi phủ quyết mặc định `veto_scope: "entry"` (`veto_entry_window_ms: 300 ms`) không cắt ngang thao tác đang giữ; đếm `veto_count` theo sự kiện kèm `veto_frames`; đổi ngưỡng live không hủy trạng thái/bộ đếm và nạp ONNX ở luồng nền có khóa hoán đổi nguyên tử `_classifier_lock`.
+- **Cổng Ý định bất biến FPS/khoảng cách & Giải mã `gate_debug` (`V051-07`, `V051-08`)**:
+  - Chuyển vận tốc cổ tay sang chuẩn hóa theo bề rộng lòng bàn tay (`max_wrist_speed_pw: 1.50`), EMA theo thời gian (`motion_ema_tau_ms: 32.0`) và suy giảm cửa sổ tiếp cận theo thời gian (`approach_decay_tau_ms: 400.0`).
+  - `last_debug` xuất thẳng `gate_debug` vào `--ft-jsonl`: xác nhận nguyên nhân 4 sự kiện còn lại trên `D-dev` (2 `scroll_stroke`, 2 `dictation_start`) đều đã **chốt `latched`** ở khung chậm trước đó (còn `wrist_speed = 0.2549` ở `replay_eval` là vận tốc thô chưa lọc One-Euro so với `eff_speed_img = 0.0903` sau Stage-1 smoother mà classifier nhận).
+- **Kiểm chứng Recall 5 lớp tổng hợp & Sửa Fist Guard (`V051-09`)**:
+  - Trước sửa: 3/9 bài test tổng hợp trong `tests/test_heuristic_recall_synth.py` **thất bại** do fist guard cũ (`curled_count >= 3 and min(d_idx, d_mid) > pinch_on_dist`) chặn `thumb_pinky_pinch`, `thumb_pinky_base` và xóa nhầm `st.latched`, đồng thời khi `s_pinky == s_pbase == 1.0` hai điểm bị hòa nhau kéo về `idle`.
+  - Sau sửa (bỏ qua fist guard khi đang `latched` hoặc có bất kỳ pose chuẩn nào chụm chặt, loại trừ ngón đang chụm khỏi `curled_count`, phân giải hòa `s_pinky`/`s_pbase` theo khoảng cách 3D): **9/9 bài test tổng hợp đạt**, `D-dev` giữ nguyên **4 FT (`32,3/h`, UCB `74,0/h`)**, `T-dev` giảm **19 → 17 FT (`100,6/h`, UCB `150,9/h`)**.

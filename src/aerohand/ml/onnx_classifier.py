@@ -579,8 +579,12 @@ class GuardedClassifier:
             self._shadow_events += 1
         cur_ev.last_ts_ms = float(timestamp_ms)
 
-        # Unready ONNX frame: abstain cleanly (neither increment nor reset approve_streak)
+        # V053-03 (B3): Mirror consistent warm-up abstain rule in shadow mode
         if not onnx_pred.ready:
+            if not cur_ev.saw_ready:
+                cur_ev.ever_accepted = True
+                if self.veto_scope == "entry":
+                    cur_ev.accepted = True
             return
 
         cur_ev.saw_ready = True
@@ -675,10 +679,21 @@ class GuardedClassifier:
             if self._fell_back or onnx_pred is None:
                 return heur_pred
 
-            # V051-04 / V052-01: ONNX warming up / not ready -> abstain cleanly without changing streak
+            # V051-04 / V052-01 / V053-03 (B3): Consistent abstain when ONNX is not ready:
+            #   - Never seen a ready frame in this event -> pass heuristic through & mark accepted (entry scope)
+            #     so subsequent ready frames do not dip to IDLE and split a click/hold.
+            #   - Already accepted -> pass heuristic through.
+            #   - Already saw ready frame(s), not yet accepted -> keep returning IDLE without changing streak.
             if not onnx_pred.ready:
                 self._veto_abstain_not_ready += 1
-                return heur_pred
+                if not cur_ev.saw_ready:
+                    cur_ev.ever_accepted = True
+                    if self.veto_scope == "entry":
+                        cur_ev.accepted = True
+                    return heur_pred
+                if cur_ev.accepted:
+                    return heur_pred
+                return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
 
             cur_ev.saw_ready = True
 

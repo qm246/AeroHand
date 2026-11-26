@@ -5405,7 +5405,7 @@ def test_veto_unready_frames_do_not_reset_streak():
     p = PoseName.THUMB_MIDDLE_PINCH
     heur = _ScriptedClf([(p, 0.95, 0.05, True)])
     # Frame 0: ready approve (streak=1 -> IDLE)
-    # Frame 1: unready (abstain -> heur pass-through, streak stays 1, NOT 2 and NOT 0)
+    # Frame 1: unready mid-pending -> V053-03 returns IDLE (no spurious pose flash), streak stays 1
     # Frame 2: ready approve (streak=2 -> IDLE, proves unready did not increment streak)
     # Frame 3: ready approve (streak=3 -> accepted -> p, proves unready did not reset streak)
     onnx = _ScriptedClf(
@@ -5419,7 +5419,7 @@ def test_veto_unready_frames_do_not_reset_streak():
     guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=3)
     h = _make_open_hand()
     outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(4)]
-    assert outs == [PoseName.IDLE, p, PoseName.IDLE, p]
+    assert outs == [PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, p]
     tel = guarded.telemetry()
     assert tel["veto_abstain_not_ready"] == 1
     assert tel["veto_count"] == 0
@@ -6225,3 +6225,47 @@ def test_swallowed_and_pending_counters_exported_and_in_heuristic_telemetry():
         "shadow_would_pending_frames",
     ):
         assert k in htel
+
+
+# ==============================================================================
+# V053-03 (B3): Consistent Warm-Up Abstain (No Mid-Event Drop to IDLE)
+# ==============================================================================
+
+
+def test_veto_abstain_on_warmup_does_not_split_event_into_idle():
+    """V053-03 (B3): 4 unready warm-up frames followed by ready approvals must NOT dip to IDLE mid-event."""
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    onnx = _ScriptedClf(
+        [
+            (PoseName.IDLE, 0.0, 1.0, False),
+            (PoseName.IDLE, 0.0, 1.0, False),
+            (PoseName.IDLE, 0.0, 1.0, False),
+            (PoseName.IDLE, 0.0, 1.0, False),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_scope="entry", veto_confirm_frames=3)
+    outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(7)]
+    # Once abstained on warm-up frames, event stays continuously `p` (never splits into p -> IDLE -> p)
+    assert outs == [p] * 7, f"Event split into IDLE mid-warmup: {outs}"
+    assert guarded.telemetry()["veto_abstain_not_ready"] == 4
+    assert guarded.telemetry()["veto_count"] == 0
+
+    # Also verify already-accepted event encountering an unready frame stays `p` (never drops to IDLE)
+    onnx2 = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 1.0, False),
+        ]
+    )
+    g2 = GuardedClassifier(onnx2, _ScriptedClf([(p, 0.95, 0.05, True)]), mode="veto", veto_confirm_frames=3)
+    outs2 = [g2.predict(h, h, "Right", i * 33.0).pose for i in range(4)]
+    assert outs2 == [PoseName.IDLE, PoseName.IDLE, p, p]

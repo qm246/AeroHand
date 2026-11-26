@@ -283,6 +283,9 @@ class AeroHandRuntime:
         self._bg_thread: Optional[threading.Thread] = None
         self._processing_thread_id: Optional[int] = None
         self._config_lock = threading.Lock()
+        self._classifier_swap_lock = threading.Lock()
+        self._classifier_swap_gen: int = 0
+        self._classifier_swap_thread: Optional[threading.Thread] = None
         self._pending_cfg: Optional[Tuple[Dict[str, Any], bool]] = None
         self._snapshot_lock = threading.Lock()
         self._snapshot = RuntimeSnapshot(dry_run=self.dry_run)
@@ -391,42 +394,54 @@ class AeroHandRuntime:
             return self.classifier.export_counters()
         return dict(getattr(self, "_cumulative_classifier_counters", {}))
 
-    def _swap_classifier_async(self, cfg_snapshot: Dict[str, Any]) -> None:
-        """Load ONNX classifier on a background thread and swap atomically without blocking UI (V051-06)."""
-        preserved = self._export_classifier_counters()
-        if preserved:
-            self._cumulative_classifier_counters = dict(preserved)
-        gen = getattr(self, "_classifier_swap_gen", 0) + 1
-        self._classifier_swap_gen = gen
+    def _swap_classifier_async(self, cfg_snapshot: Dict[str, Any]) -> threading.Thread:
+        """
+        Load ONNX classifier on a background thread and swap atomically under locks (V051-06 / V052-05c).
+        Exports live counters from the old classifier RIGHT BEFORE swapping so events accumulated
+        during background model load & warm-up are never lost, and discards stale generations.
+        """
+        with self._classifier_swap_lock:
+            self._classifier_swap_gen += 1
+            gen = self._classifier_swap_gen
 
         def _worker() -> None:
             new_clf = build_classifier(
                 cfg_snapshot,
                 on_error=self._on_classifier_error,
-                preserved_counters=preserved or getattr(self, "_cumulative_classifier_counters", None),
             )
-            if getattr(self, "_classifier_swap_gen", gen) != gen:
-                return
-            self.classifier = new_clf
-            self.engine.set_classifier(new_clf)
+            with self._classifier_swap_lock, self.engine._classifier_lock:
+                if self._classifier_swap_gen != gen:
+                    return
+                latest = self._export_classifier_counters()
+                if latest:
+                    self._cumulative_classifier_counters = dict(latest)
+                if isinstance(new_clf, GuardedClassifier):
+                    new_clf.import_counters(latest or getattr(self, "_cumulative_classifier_counters", None))
+                self.classifier = new_clf
+                self.engine.set_classifier(new_clf)
 
         t = threading.Thread(target=_worker, name="aerohand-clf-reload", daemon=True)
+        self._classifier_swap_thread = t
         t.start()
+        return t
 
     def classifier_telemetry(self) -> Dict[str, Any]:
-        if isinstance(self.classifier, GuardedClassifier):
-            tel = self.classifier.telemetry()
-            self._cumulative_classifier_counters = self.classifier.export_counters()
-            return tel
-        cls_cfg = self.config.get("classifier") or {}
-        cum = getattr(self, "_cumulative_classifier_counters", {})
+        with self._classifier_swap_lock:
+            clf = self.classifier
+            if isinstance(clf, GuardedClassifier):
+                tel = clf.telemetry()
+                self._cumulative_classifier_counters = clf.export_counters()
+                return tel
+            cls_cfg = self.config.get("classifier") or {}
+            cum = dict(getattr(self, "_cumulative_classifier_counters", {}))
+            backend_name = type(clf).__name__
         s_frames = int(cum.get("shadow_frames", 0))
         s_dis = int(cum.get("shadow_disagreements", 0))
         s_ev = int(cum.get("shadow_events", 0))
         s_wv_ev = int(cum.get("shadow_would_veto_events", 0))
         return {
             "mode": "heuristic",
-            "active_backend": type(self.classifier).__name__,
+            "active_backend": backend_name,
             "shadow_mode": False,
             "shadow_frames": s_frames,
             "shadow_disagreements": s_dis,
@@ -615,15 +630,17 @@ class AeroHandRuntime:
             if self._processing_thread_id is not None and new_mode in ("shadow", "veto", "onnx"):
                 self._swap_classifier_async(deepcopy(effective))
             else:
-                preserved = self._export_classifier_counters()
-                if preserved:
-                    self._cumulative_classifier_counters = dict(preserved)
-                self.classifier = build_classifier(
-                    effective,
-                    on_error=self._on_classifier_error,
-                    preserved_counters=preserved or getattr(self, "_cumulative_classifier_counters", None),
-                )
-                self.engine.set_classifier(self.classifier)
+                with self._classifier_swap_lock, self.engine._classifier_lock:
+                    self._classifier_swap_gen += 1
+                    preserved = self._export_classifier_counters()
+                    if preserved:
+                        self._cumulative_classifier_counters = dict(preserved)
+                    self.classifier = build_classifier(
+                        effective,
+                        on_error=self._on_classifier_error,
+                        preserved_counters=preserved or getattr(self, "_cumulative_classifier_counters", None),
+                    )
+                    self.engine.set_classifier(self.classifier)
 
     # ------------------------------------------------------------------
     # Data Collector Studio Controls (callable from WKWebView UI)

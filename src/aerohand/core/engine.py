@@ -444,7 +444,7 @@ class HandCursorEngine:
         self.last_refusal_code: Optional[str] = None
         self.dwell_lock_activations: int = 0
         self.dwell_unlock_without_click: int = 0
-        self._classifier_lock = threading.Lock()
+        self._classifier_lock = threading.RLock()
         self.update_config(config)
 
     def engine_telemetry(self) -> Dict[str, Any]:

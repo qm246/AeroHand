@@ -38,13 +38,108 @@ def sha256_file(path: str | Path) -> str:
     return h.hexdigest()
 
 
-def load_sealed_hashes(data_root: str | Path = "data") -> Set[str]:
-    """Collect all file SHA-256 digests referenced in any `sealed_manifest.json` under `data_root`."""
-    root = Path(data_root)
-    if not root.exists():
-        return set()
+def _repo_root_hint() -> Path:
+    return Path(__file__).resolve().parents[3]
+
+
+def find_sealed_manifests(
+    *,
+    data_root: str | Path = "data",
+    input_paths: Sequence[Path] = (),
+    sealed_root: Optional[str | Path] = None,
+    max_parent_levels: int = 4,
+) -> List[Path]:
+    """
+    Discover `sealed_manifest.json` files across:
+      1. Explicit `sealed_root` (if provided, recursive).
+      2. `data_root` (recursive; falls back to `<repo_root>/data` if default relative `"data"` is absent).
+      3. Ancestor directories of `input_paths` (walking up to repo root or `max_parent_levels`),
+         checking direct `sealed_manifest.json` and 1-level child / `data/*` directories so
+         running scripts from outside the repo root or against external dirs never silently misses manifests.
+    """
+    found: Set[Path] = set()
+    repo_root = _repo_root_hint()
+
+    def _scan_tree(root_dir: Path) -> None:
+        if not root_dir.exists():
+            return
+        if root_dir.is_file() and root_dir.name == "sealed_manifest.json":
+            found.add(root_dir.resolve())
+            return
+        if root_dir.is_dir():
+            for mf in sorted(root_dir.rglob("sealed_manifest.json")):
+                if mf.is_file():
+                    found.add(mf.resolve())
+
+    if sealed_root is not None and str(sealed_root).strip():
+        _scan_tree(Path(sealed_root))
+
+    dr = Path(data_root)
+    if dr.exists():
+        _scan_tree(dr)
+    elif str(data_root) == "data":
+        repo_data = repo_root / "data"
+        if repo_data.exists():
+            _scan_tree(repo_data)
+
+    home_resolved = Path.home().resolve()
+    stop_ancestors = {Path("/").resolve(), home_resolved, Path("/tmp").resolve(), Path("/var").resolve()}
+    try:
+        stop_ancestors.add(Path("/private/var").resolve())
+        stop_ancestors.add(Path("/private/tmp").resolve())
+    except OSError:
+        pass
+
+    visited_anc: Set[Path] = set()
+    for raw_fp in input_paths:
+        try:
+            cur = Path(raw_fp).resolve()
+        except OSError:
+            continue
+        anc = cur if cur.is_dir() else cur.parent
+        inside_repo = repo_root in anc.parents or anc == repo_root
+        steps = 0
+        while anc not in stop_ancestors and anc != anc.parent:
+            if anc not in visited_anc:
+                visited_anc.add(anc)
+                direct_mf = anc / "sealed_manifest.json"
+                if direct_mf.is_file():
+                    found.add(direct_mf.resolve())
+                if anc.name == "data":
+                    _scan_tree(anc)
+                else:
+                    for mf in anc.glob("*/sealed_manifest.json"):
+                        if mf.is_file():
+                            found.add(mf.resolve())
+                    for mf in anc.glob("data/*/sealed_manifest.json"):
+                        if mf.is_file():
+                            found.add(mf.resolve())
+            if inside_repo and anc == repo_root:
+                break
+            if not inside_repo and ((anc / ".git").exists() or (anc / "pyproject.toml").is_file()):
+                break
+            steps += 1
+            if not inside_repo and steps >= max_parent_levels:
+                break
+            anc = anc.parent
+
+    return sorted(found)
+
+
+def load_sealed_hashes(
+    data_root: str | Path = "data",
+    *,
+    input_paths: Sequence[Path] = (),
+    sealed_root: Optional[str | Path] = None,
+) -> Set[str]:
+    """Collect all file SHA-256 digests referenced in discovered `sealed_manifest.json` files."""
+    manifests = find_sealed_manifests(
+        data_root=data_root,
+        input_paths=input_paths,
+        sealed_root=sealed_root,
+    )
     hashes: Set[str] = set()
-    for mf in sorted(root.rglob("sealed_manifest.json")):
+    for mf in manifests:
         try:
             payload = json.loads(mf.read_text(encoding="utf-8"))
         except Exception:
@@ -60,13 +155,39 @@ def exclude_sealed_content(
     paths: Sequence[Path],
     *,
     data_root: str | Path = "data",
+    sealed_root: Optional[str | Path] = None,
     sealed_hashes: Optional[Set[str]] = None,
 ) -> Tuple[List[Path], List[Path]]:
     """
-    Filter out any recording whose content SHA-256 matches a sealed held-out manifest (V051-02).
-    Prevents train <-> held-out leakage even if a file was copied or renamed.
+    Filter out any recording whose content SHA-256 matches a sealed held-out manifest (V051-02 / V052-05a).
+    Searches `sealed_root`, `data_root`, and ancestor directories of `paths`, and emits a clear
+    warning when 0 manifests are discovered so the guard never silently becomes a no-op.
     """
-    hashes = sealed_hashes if sealed_hashes is not None else load_sealed_hashes(data_root)
+    if sealed_hashes is not None:
+        hashes = sealed_hashes
+    else:
+        manifests = find_sealed_manifests(
+            data_root=data_root,
+            input_paths=paths,
+            sealed_root=sealed_root,
+        )
+        if not manifests:
+            logger.warning(
+                f"[HELD-OUT GUARD] Found 0 sealed_manifest.json files "
+                f"(data_root={data_root!r}, sealed_root={sealed_root!r}); "
+                "SHA-256 sealed-content exclusion is inactive until a held-out set is sealed."
+            )
+            return list(paths), []
+        hashes = set()
+        for mf in manifests:
+            try:
+                payload = json.loads(mf.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            for entry in payload.get("files") or []:
+                digest = str(entry.get("sha256") or "").strip().lower()
+                if len(digest) == 64:
+                    hashes.add(digest)
     if not hashes:
         return list(paths), []
     kept: List[Path] = []

@@ -43,7 +43,6 @@ from aerohand.ml.recording_io import (
     collect_json_paths,
     exclude_sealed_content,
     load_recording_frames,
-    load_sealed_hashes,
     sha256_file,
 )
 
@@ -1139,14 +1138,14 @@ def collect_training_files(
     inputs: Sequence[str | Path],
     *,
     data_root: str | Path = "data",
+    sealed_root: Optional[str | Path] = None,
 ) -> Tuple[List[Path], List[Path]]:
-    """Collect training JSON files while excluding any file whose SHA-256 is in a sealed held-out manifest (V051-02)."""
+    """Collect training JSON files while excluding any file whose SHA-256 is in a sealed held-out manifest (V051-02 / V052-05a)."""
     paths_in = [Path(s) for s in inputs if s]
     for sp in paths_in:
         assert_not_heldout(sp)
     raw_files = collect_json_paths([sp for sp in paths_in if sp.exists()])
-    sealed_hashes = load_sealed_hashes(data_root)
-    return exclude_sealed_content(raw_files, data_root=data_root, sealed_hashes=sealed_hashes)
+    return exclude_sealed_content(raw_files, data_root=data_root, sealed_root=sealed_root)
 
 
 def validate_disjoint_ab_negatives(
@@ -1325,8 +1324,9 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             return (((1.0 - pt) ** self.gamma) * ce).mean()
 
     data_root = getattr(args, "data_root", "data") or "data"
+    sealed_root = getattr(args, "sealed_root", None)
     raw_sessions = args.sessions if isinstance(args.sessions, (list, tuple)) else [args.sessions]
-    files, excl_s = collect_training_files(raw_sessions, data_root=data_root)
+    files, excl_s = collect_training_files(raw_sessions, data_root=data_root, sealed_root=sealed_root)
     if excl_s:
         print(f"[WARN] Excluded {len(excl_s)} session file(s) whose SHA-256 matches sealed_manifest.json.")
     if not files:
@@ -1349,7 +1349,7 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(args.negatives_dir, (list, tuple))
             else [args.negatives_dir]
         )
-        neg_files, excl_n = collect_training_files(raw_negs, data_root=data_root)
+        neg_files, excl_n = collect_training_files(raw_negs, data_root=data_root, sealed_root=sealed_root)
         if excl_n:
             print(f"[WARN] Excluded {len(excl_n)} negative file(s) whose SHA-256 matches sealed_manifest.json.")
         input_files.extend(neg_files)
@@ -1645,8 +1645,9 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
         seeds = list(AB_DEFAULT_SEEDS)
 
     data_root = getattr(args, "data_root", "data") or "data"
+    sealed_root = getattr(args, "sealed_root", None)
     eval_neg_paths = (
-        collect_training_files(args.ab_eval_negatives, data_root=data_root)[0]
+        collect_training_files(args.ab_eval_negatives, data_root=data_root, sealed_root=sealed_root)[0]
         if getattr(args, "ab_eval_negatives", None)
         else []
     )
@@ -1656,7 +1657,7 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(args.negatives_dir, (list, tuple))
             else [args.negatives_dir]
         )
-        train_neg_files, _ = collect_training_files(raw_negs, data_root=data_root)
+        train_neg_files, _ = collect_training_files(raw_negs, data_root=data_root, sealed_root=sealed_root)
         validate_disjoint_ab_negatives(train_neg_files, eval_neg_paths)
     replay_mod = None
     if eval_neg_paths:
@@ -1736,6 +1737,12 @@ def main() -> None:
         type=str,
         default="data",
         help="Root data directory scanned for sealed_manifest.json SHA-256 exclusion (default 'data')",
+    )
+    p.add_argument(
+        "--sealed-root",
+        type=str,
+        default=None,
+        help="Explicit directory scanned for sealed_manifest.json SHA-256 exclusion (overrides/augments --data-root)",
     )
     p.add_argument("--loss", choices=["ce", "focal", "ls"], default="focal")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Enable landmark augmentation (default on)")

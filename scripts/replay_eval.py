@@ -38,7 +38,7 @@ from aerohand.core.types import ALL_POSE_NAMES, HandInput
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import ONNXPinchClassifier
-from aerohand.ml.provenance import compute_onnx_model_hash
+from aerohand.ml.provenance import compute_heuristic_source_sha256, compute_onnx_model_hash
 from aerohand.ml.recording_io import (
     POSE_TO_IDX,
     assert_not_heldout,
@@ -568,26 +568,28 @@ def compute_eval_model_hash(
     model_path: Optional[str | Path] = None,
     normalizer_path: Optional[str | Path] = None,
     heuristic_source_bytes: Optional[bytes] = None,
+    palm_frame_source_bytes: Optional[bytes] = None,
 ) -> str:
     """
-    Compute a deterministic 24-hex SHA-256 fingerprint identifying the evaluated model/config (V051-02).
-    For `heuristic_3d`, hashes BOTH `cfg["classifier"]` AND the `heuristic_3d.py` source file so
-    code edits produce a distinct hash even when YAML thresholds are unchanged.
+    Compute a deterministic 24-hex SHA-256 fingerprint identifying the evaluated model/config (V051-02 / V052-05b).
+    For `heuristic_3d`, hashes ONLY `cfg["classifier"]["heuristic_3d"]`, `cfg["smoothing"]`,
+    `heuristic_3d.py` source, and `palm_frame.py` source (ignoring unrelated `veto_*` / `mode` settings).
     """
     if backend_name == "onnx_tcn" and model_path and normalizer_path:
         return compute_onnx_model_hash(model_path, normalizer_path)
     h = hashlib.sha256()
     h.update(str(backend_name).encode("utf-8"))
-    cls_blob = json.dumps(cfg.get("classifier") or {}, sort_keys=True, ensure_ascii=False)
-    h.update(cls_blob.encode("utf-8"))
-    if heuristic_source_bytes is not None:
-        h.update(heuristic_source_bytes)
-    else:
-        import inspect
-
-        src_file = inspect.getsourcefile(Heuristic3DPinchClassifier)
-        if src_file and Path(src_file).is_file():
-            h.update(Path(src_file).read_bytes())
+    h_payload = {
+        "heuristic_3d": (cfg.get("classifier") or {}).get("heuristic_3d") or {},
+        "smoothing": cfg.get("smoothing") or {},
+    }
+    h.update(json.dumps(h_payload, sort_keys=True, ensure_ascii=False).encode("utf-8"))
+    h.update(
+        compute_heuristic_source_sha256(
+            heuristic_source_bytes=heuristic_source_bytes,
+            palm_frame_source_bytes=palm_frame_source_bytes,
+        ).encode("utf-8")
+    )
     return h.hexdigest()[:24]
 
 
@@ -717,6 +719,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     )
     parser.add_argument("--max-f1-regression", type=float, default=0.01, help="Fail if macro-F1 drops more than this vs baseline")
     parser.add_argument("--ft-jsonl", type=str, default=None, help="Optional JSONL path to write per-event false-trigger diagnostics")
+    parser.add_argument(
+        "--sealed-root",
+        type=str,
+        default=None,
+        help="Optional directory scanned for sealed_manifest.json SHA-256 exclusion",
+    )
     parser.add_argument("--out", type=str, default=None, help="Optional path to write JSON evaluation report")
     args = parser.parse_args(argv)
 
@@ -744,8 +752,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ft_jsonl_path=args.ft_jsonl,
         )
     else:
-        session_paths, excl_s = exclude_sealed_content(_collect_json_paths(args.sessions))
-        negative_paths, excl_n = exclude_sealed_content(_collect_json_paths(args.negatives))
+        session_paths, excl_s = exclude_sealed_content(
+            _collect_json_paths(args.sessions), sealed_root=args.sealed_root
+        )
+        negative_paths, excl_n = exclude_sealed_content(
+            _collect_json_paths(args.negatives), sealed_root=args.sealed_root
+        )
         if excl_s or excl_n:
             print(
                 f"[WARN] Excluded {len(excl_s) + len(excl_n)} file(s) matching sealed_manifest.json SHA-256.",

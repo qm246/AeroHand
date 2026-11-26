@@ -135,10 +135,16 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(description="Two-sample KS domain check: GestureCtl vs AeroHand (V041-02).")
     parser.add_argument("--converted", nargs="+", required=True, help="Converted GestureCtl JSON files or dirs")
     parser.add_argument("--aerohand", nargs="+", required=True, help="Fresh AeroHand session JSON files or dirs")
+    parser.add_argument(
+        "--sealed-root",
+        type=str,
+        default=None,
+        help="Optional directory scanned for sealed_manifest.json SHA-256 exclusion",
+    )
     args = parser.parse_args(argv)
 
-    conv_paths, _ = exclude_sealed_content(collect_json_paths(args.converted))
-    aero_paths, _ = exclude_sealed_content(collect_json_paths(args.aerohand))
+    conv_paths, _ = exclude_sealed_content(collect_json_paths(args.converted), sealed_root=args.sealed_root)
+    aero_paths, _ = exclude_sealed_content(collect_json_paths(args.aerohand), sealed_root=args.sealed_root)
     report = compare_domains(conv_paths, aero_paths)
     print(json.dumps(report, indent=2))
 

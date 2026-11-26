@@ -5842,3 +5842,221 @@ def test_gate_debug_logging_does_not_change_predictions():
             assert pa.probabilities[k] == pytest.approx(pb.probabilities[k])
     # Verify latch_entry stayed purely observational and matches expected deterministic behavior
     assert clf_a.predict(h_open, h_open, "Right", 500.0).pose == PoseName.IDLE
+
+
+# ==============================================================================
+# V052-05: Hygiene (Sealed-Hash Discovery, Tighter Heuristic Hash, Atomic Async Swap)
+# ==============================================================================
+
+
+def test_exclude_sealed_warns_when_no_manifest_found(tmp_path: Path, caplog):
+    from aerohand.ml.recording_io import exclude_sealed_content
+
+    sess_dir = tmp_path / "isolated_exp" / "sessions"
+    sess_dir.mkdir(parents=True)
+    rec_fp = sess_dir / "rec1.json"
+    rec_fp.write_text('{"samples": []}', encoding="utf-8")
+
+    with caplog.at_level("WARNING", logger="aerohand.ml.recording_io"):
+        kept, excluded = exclude_sealed_content([rec_fp], data_root=tmp_path / "nonexistent_data")
+    assert kept == [rec_fp]
+    assert excluded == []
+    assert any("Found 0 sealed_manifest.json" in rec.message for rec in caplog.records)
+
+
+def test_exclude_sealed_finds_manifest_from_input_parent(tmp_path: Path, monkeypatch):
+    import json
+
+    from aerohand.ml.recording_io import exclude_sealed_content, sha256_file
+
+    # Place sessions and heldout_aerohand under an external parent dir and run from an unrelated CWD
+    exp_root = tmp_path / "external_corpus"
+    sess_dir = exp_root / "sessions" / "day1"
+    ho_dir = exp_root / "heldout_aerohand"
+    other_cwd = tmp_path / "somewhere_else"
+    sess_dir.mkdir(parents=True)
+    ho_dir.mkdir(parents=True)
+    other_cwd.mkdir(parents=True)
+
+    leaked = sess_dir / "leaked_copy.json"
+    clean = sess_dir / "clean_train.json"
+    leaked.write_text('{"samples": [{"id": "sealed_secret"}]}', encoding="utf-8")
+    clean.write_text('{"samples": [{"id": "train_only"}]}', encoding="utf-8")
+
+    (ho_dir / "sealed_manifest.json").write_text(
+        json.dumps({"files": [{"filename": "orig.json", "sha256": sha256_file(leaked)}]}),
+        encoding="utf-8",
+    )
+
+    monkeypatch.chdir(other_cwd)
+    kept, excluded = exclude_sealed_content([leaked, clean], data_root="data")
+    assert kept == [clean]
+    assert excluded == [leaked]
+
+
+def test_exclude_sealed_cli_sealed_root_override(tmp_path: Path):
+    import json
+
+    from aerohand.ml.recording_io import sha256_file
+
+    train_mod = _load_train_tcn_module("train_v052_05_sroot")
+    sess_dir = tmp_path / "train_pool"
+    custom_sealed = tmp_path / "unrelated_vault" / "heldout_aerohand"
+    sess_dir.mkdir(parents=True)
+    custom_sealed.mkdir(parents=True)
+
+    leaked = sess_dir / "dup.json"
+    keep = sess_dir / "keep.json"
+    leaked.write_text('{"samples": [{"secret": 1}]}', encoding="utf-8")
+    keep.write_text('{"samples": [{"secret": 2}]}', encoding="utf-8")
+
+    (custom_sealed / "sealed_manifest.json").write_text(
+        json.dumps({"files": [{"filename": "sealed.json", "sha256": sha256_file(leaked)}]}),
+        encoding="utf-8",
+    )
+
+    kept, excluded = train_mod.collect_training_files(
+        [sess_dir],
+        data_root=tmp_path / "empty_data",
+        sealed_root=custom_sealed,
+    )
+    assert kept == [keep]
+    assert excluded == [leaked]
+
+
+def test_heuristic_hash_ignores_veto_config():
+    replay_mod = _load_replay_eval_module("replay_v052_05_hhash_veto")
+    cfg1 = load_config()
+    cfg2 = deep_merge(
+        cfg1,
+        {
+            "classifier": {
+                "mode": "veto",
+                "veto_min_prob": 0.48,
+                "veto_idle_prob": 0.52,
+                "veto_confirm_frames": 2,
+                "veto_entry_window_ms": 450.0,
+            }
+        },
+    )
+    h1 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg1)
+    h2 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg2)
+    assert len(h1) == 24
+    assert h1 == h2
+
+
+def test_heuristic_hash_changes_with_palm_frame_source():
+    replay_mod = _load_replay_eval_module("replay_v052_05_hhash_pf")
+    cfg = load_config()
+    h1 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg, palm_frame_source_bytes=b"palm_v1")
+    h2 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg, palm_frame_source_bytes=b"palm_v2")
+    assert len(h1) == 24 and len(h2) == 24
+    assert h1 != h2
+
+
+def test_heuristic_hash_changes_with_heuristic_threshold():
+    replay_mod = _load_replay_eval_module("replay_v052_05_hhash_thr")
+    cfg1 = load_config()
+    cfg2 = deep_merge(cfg1, {"classifier": {"heuristic_3d": {"pinch_on_dist": 0.36}}})
+    cfg3 = deep_merge(cfg1, {"smoothing": {"landmark_beta": 60.0}})
+    h1 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg1)
+    h2 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg2)
+    h3 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg3)
+    assert h1 != h2
+    assert h1 != h3
+
+
+def test_swap_classifier_async_merges_counters_at_swap_time(monkeypatch):
+    import threading
+
+    import aerohand.runtime as rt_mod
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "shadow"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+
+    old_onnx = _ScriptedClf([(PoseName.THUMB_MIDDLE_PINCH, 0.9, 0.1, True)])
+    old_guarded = GuardedClassifier(old_onnx, Heuristic3DPinchClassifier(), mode="shadow")
+    rt.classifier = old_guarded
+    rt.engine.set_classifier(old_guarded)
+
+    h = _make_open_hand()
+    # 2 shadow frames BEFORE async swap begins
+    old_guarded.predict(h, h, "Right", 0.0)
+    old_guarded.predict(h, h, "Right", 33.0)
+    assert old_guarded.telemetry()["shadow_frames"] == 2
+
+    started_ev = threading.Event()
+    release_ev = threading.Event()
+    new_guarded = GuardedClassifier(
+        _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+        Heuristic3DPinchClassifier(),
+        mode="shadow",
+    )
+
+    def _slow_build(_cfg, *, on_error=None, preserved_counters=None):
+        started_ev.set()
+        assert release_ev.wait(timeout=5.0)
+        return new_guarded
+
+    monkeypatch.setattr(rt_mod, "build_classifier", _slow_build)
+
+    t = rt._swap_classifier_async(cfg)
+    assert started_ev.wait(timeout=5.0)
+
+    # Accumulate 5 MORE shadow frames on the old classifier WHILE background build is running!
+    for i in range(5):
+        old_guarded.predict(h, h, "Right", 100.0 + i * 33.0)
+    assert old_guarded.telemetry()["shadow_frames"] == 7
+
+    release_ev.set()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+    assert rt.classifier is new_guarded
+    # All 7 shadow frames (2 before + 5 during load) MUST be preserved with zero loss!
+    assert rt.classifier.telemetry()["shadow_frames"] == 7
+
+
+def test_swap_classifier_async_stale_generation_discarded(monkeypatch):
+    import threading
+
+    import aerohand.runtime as rt_mod
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=True)
+
+    ev1_started = threading.Event()
+    ev1_release = threading.Event()
+    clf1 = GuardedClassifier(_ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]), Heuristic3DPinchClassifier(), mode="veto")
+    clf2 = GuardedClassifier(_ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]), Heuristic3DPinchClassifier(), mode="veto")
+    call_n = {"n": 0}
+
+    def _build(_cfg, *, on_error=None, preserved_counters=None):
+        call_n["n"] += 1
+        idx = call_n["n"]
+        if idx == 1:
+            ev1_started.set()
+            assert ev1_release.wait(timeout=5.0)
+            return clf1
+        return clf2
+
+    monkeypatch.setattr(rt_mod, "build_classifier", _build)
+
+    t1 = rt._swap_classifier_async(cfg)
+    assert ev1_started.wait(timeout=5.0)
+    # Trigger a newer swap #2 while swap #1 is still blocked -> swap #2 completes first
+    t2 = rt._swap_classifier_async(cfg)
+    t2.join(timeout=5.0)
+    assert rt.classifier is clf2
+
+    # Now let stale swap #1 finish -> MUST be discarded, leaving clf2 installed!
+    ev1_release.set()
+    t1.join(timeout=5.0)
+    assert rt.classifier is clf2
+    assert rt.engine.classifier is clf2

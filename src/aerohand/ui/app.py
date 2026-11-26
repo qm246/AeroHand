@@ -571,6 +571,12 @@ class AeroHandAppDelegate(AppKit.NSObject):
             if self._event_matches_spec(event, str(hk_cfg.get("mark_not_intended", "cmd+shift+n"))):
                 self.markNotIntended_(None)
                 return True
+            if self._event_matches_spec(
+                event, str(hk_cfg.get("mark_deliberate_gesture", "cmd+ctrl+opt+m"))
+            ):
+                if self.runtime is not None and self.runtime.passive_recorder is not None:
+                    self.runtime.mark_deliberate_gesture()
+                return True
         except Exception:
             pass
         return False

@@ -22,8 +22,10 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import select
 import subprocess
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -35,7 +37,9 @@ from aerohand.config import load_config
 from aerohand.platform.control_api import read_api_token
 from aerohand.runtime import AeroHandRuntime
 
-_API_COMMANDS = frozenset({"status", "tracking", "settings", "vitals", "see", "recenter", "open", "run"})
+_API_COMMANDS = frozenset(
+    {"status", "tracking", "settings", "vitals", "see", "recenter", "open", "run", "passive-mark"}
+)
 
 
 def _parse_cli_value(raw: str) -> Any:
@@ -109,6 +113,18 @@ def _run_standalone(argv: list[str]) -> None:
         default=None,
         help="Enable interactive PinchDataCollector and save JSON sessions to this directory",
     )
+    parser.add_argument(
+        "--passive-record",
+        type=str,
+        default=None,
+        help="Enable chunked dry-run passive idle recorder saving schema-v2 chunks to DIR (V060-06)",
+    )
+    parser.add_argument(
+        "--passive-max-daily-mb",
+        type=float,
+        default=256.0,
+        help="Daily disk cap (MB) for --passive-record chunks (default: 256)",
+    )
     parser.add_argument("--no-audio", action="store_true", help="Disable click sound effects")
     parser.add_argument("--no-typing-guard", action="store_true", help="Disable Typing Guard (debug only)")
     parser.add_argument("--verbose", action="store_true", help="Enable DEBUG logging")
@@ -125,14 +141,73 @@ def _run_standalone(argv: list[str]) -> None:
     if args.no_typing_guard:
         cfg.setdefault("typing_guard", {})["enabled"] = False
 
+    eff_dry_run = bool(args.dry_run or args.passive_record)
     rt = AeroHandRuntime(
         cfg,
-        dry_run=args.dry_run,
+        dry_run=eff_dry_run,
         preview=args.preview,
         camera_index=args.camera,
         collect_dir=args.collect_dir,
+        passive_record_dir=args.passive_record,
+        passive_max_daily_mb=args.passive_max_daily_mb,
     )
-    rt.run()
+
+    tty_stop = threading.Event()
+    tty_thread: Optional[threading.Thread] = None
+    if args.passive_record:
+        print(
+            "[PASSIVE] Forced DRY-RUN (zero HID output). Press 'm' here (or run `aerohand passive-mark`) "
+            "ONLY after a DELIBERATE gesture (+/-1.5s excluded from idle exposure; NEVER for false triggers).",
+            flush=True,
+        )
+        if sys.stdin.isatty():
+            def _watch_tty_keys() -> None:
+                try:
+                    import termios
+                    import tty
+                except ImportError:
+                    return
+                fd = sys.stdin.fileno()
+                old_settings = termios.tcgetattr(fd)
+                try:
+                    tty.setcbreak(fd)
+                    while not tty_stop.is_set():
+                        ready, _, _ = select.select([sys.stdin], [], [], 0.2)
+                        if ready:
+                            ch = sys.stdin.read(1)
+                            if ch.lower() == "m":
+                                res = rt.mark_deliberate_gesture()
+                                if res.get("ok"):
+                                    print(
+                                        f"[PASSIVE] Marked deliberate gesture #{res['marks_count']} "
+                                        f"(t={res['timestamp_ms']}ms, +/-1.5s excluded)",
+                                        flush=True,
+                                    )
+                except Exception:
+                    return
+                finally:
+                    try:
+                        termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+                    except Exception:
+                        pass
+
+            tty_thread = threading.Thread(target=_watch_tty_keys, name="AeroHandPassiveTTY", daemon=True)
+            tty_thread.start()
+
+    try:
+        rt.run()
+    finally:
+        tty_stop.set()
+        if tty_thread is not None and tty_thread.is_alive():
+            tty_thread.join(timeout=0.5)
+        if rt.passive_recorder is not None:
+            st = rt.passive_recorder.status()
+            print(
+                f"[PASSIVE] Summary: chunks={st['chunks_written']} | "
+                f"hand_present_idle_hours={st['hand_present_idle_hours']:.4f}h | "
+                f"deliberate_marks={st['deliberate_marks_count']} | out={st['out_dir']}",
+                flush=True,
+            )
 
 
 def main(argv: Optional[list[str]] = None) -> None:
@@ -183,6 +258,11 @@ def main(argv: Optional[list[str]] = None) -> None:
     sub.add_parser("vitals", parents=[common], help="Show CPU, RAM, and pipeline timing telemetry")
     sub.add_parser("see", parents=[common], help="Capture a screenshot of the current screen")
     sub.add_parser("recenter", parents=[common], help="Recenter cursor to screen center")
+    sub.add_parser(
+        "passive-mark",
+        parents=[common],
+        help="Mark a deliberate gesture during --passive-record (+/-1.5s excluded from idle exposure)",
+    )
     sub.add_parser("open", parents=[common], help="Open or surface AeroHand.app")
     sub.add_parser("run", help="Run standalone tracker in terminal")
 
@@ -255,6 +335,15 @@ def main(argv: Optional[list[str]] = None) -> None:
     elif ns.cmd == "recenter":
         data = _api_request("/api/recenter", method="POST", port=api_port)
         print(json.dumps(data) if ns.json else "OK Cursor recentered")
+    elif ns.cmd == "passive-mark":
+        data = _api_request("/api/passive/mark", method="POST", port=api_port)
+        if ns.json:
+            print(json.dumps(data, ensure_ascii=False))
+        else:
+            print(
+                f"OK Marked deliberate gesture #{data.get('marks_count', 0)} "
+                f"(t={data.get('timestamp_ms', 0)}ms, +/-1.5s excluded)"
+            )
     elif ns.cmd == "open":
         desktop_app = Path.home() / "Desktop" / "AeroHand.app"
         apps_app = Path("/Applications/AeroHand.app")

@@ -7178,3 +7178,120 @@ def test_eval_event_recall_wilson_ci_paired_gate_and_sealed_refusal(tmp_path: Pa
     ho_fp.write_text(json.dumps({"recording_kind": "cued_events", "cue_events": [], "samples": []}), encoding="utf-8")
     with pytest.raises(ValueError, match="Held-out"):
         recall_mod.evaluate_event_recall([ho_fp], config=cfg)
+
+
+# ==============================================================================
+# V060-06: `--passive-record` Chunked Dry-Run Dogfood Idle Recorder & Mark API
+# ==============================================================================
+
+
+def test_passive_idle_recorder_chunks_segments_daily_cap_and_deliberate_marks(tmp_path: Path):
+    import json
+
+    from aerohand.ml.collector import PassiveIdleRecorder
+    from aerohand.ml.recording_io import load_recording_frames
+
+    replay_mod = _load_replay_eval_module("replay_eval_v060_06_passive")
+    h_open = _make_open_hand(forward_z=-0.25)
+
+    out_dir = tmp_path / "passive"
+    rec = PassiveIdleRecorder(
+        out_dir,
+        default_subject="minh",
+        chunk_max_frames=10,
+        max_daily_mb=10.0,
+        mark_half_window_ms=1500.0,
+    )
+    # Feed 25 frames with a 300ms gap (>100ms -> segment_id increments) + 1 deliberate mark at t=5000ms
+    timestamps = [i * 33 for i in range(10)] + [1000 + i * 33 for i in range(10)] + [5000 + i * 33 for i in range(5)]
+    for ts in timestamps:
+        rec.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=ts)], ts)
+    mark_res = rec.mark_deliberate_gesture(5000)
+    assert mark_res["ok"] is True
+    assert mark_res["marks_count"] == 1
+    summary = rec.close()
+
+    # Chunked flushing: 25 frames / chunk_max_frames=10 -> 3 chunk files written, RAM buffer empty
+    assert summary["chunks_written"] == 3
+    assert len(rec._buf) == 0
+    chunk_files = sorted(out_dir.glob("*.json"))
+    assert len(chunk_files) == 3
+
+    # Verify schema v2, kind, segment_id bump across gap, and deliberate mark saved in chunk 3
+    c1 = json.loads(chunk_files[0].read_text(encoding="utf-8"))
+    c2 = json.loads(chunk_files[1].read_text(encoding="utf-8"))
+    c3 = json.loads(chunk_files[2].read_text(encoding="utf-8"))
+    assert c1["schema"] == "aerohand_pinch_v2"
+    assert c1["session_meta"]["kind"] == "passive_idle_claim"
+    assert c1["session_meta"]["subject"] == "minh"
+    assert c2["samples"][0]["segment_id"] > c1["samples"][-1]["segment_id"]
+    assert 5000 in c3["deliberate_marks_ms"]
+    assert c3["deliberate_marks_count"] == 1
+
+    # Loader + replay_eval preserve deliberate_marks_ms and report deliberate_marks_count
+    _frs, meta3 = load_recording_frames(chunk_files[2])
+    assert meta3["deliberate_marks_ms"] == [5000]
+    rep = replay_mod.evaluate_recordings(
+        negative_paths=chunk_files,
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert rep["false_triggers"]["deliberate_marks_count"] == 1
+    # Chunk 3 frames (t=5000..5132) are within +/-1.5s of mark=5000 -> excluded from idle exposure!
+    assert rep["false_triggers"]["hand_present_idle_hours"] < (len(timestamps) * 33.0 / 3_600_000.0)
+
+    # Daily cap enforcement: tiny cap (0.0001 MB ~ 100 bytes) prevents writing further chunks after limit
+    cap_dir = tmp_path / "passive_capped"
+    capped = PassiveIdleRecorder(cap_dir, default_subject="minh", chunk_max_frames=5, max_daily_mb=0.0001)
+    for i in range(15):
+        capped.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    cap_sum = capped.close()
+    assert cap_sum["cap_reached"] is True
+    assert len(list(cap_dir.glob("*.json"))) <= 1
+
+
+def test_passive_record_runtime_forces_dry_run_and_api_mark_endpoint(tmp_path: Path):
+    import json
+    import urllib.request
+
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["api"]["enabled"] = True
+    cfg["api"]["port"] = 0  # Ephemeral localhost port
+    assert cfg["hotkeys"]["mark_deliberate_gesture"] == "cmd+ctrl+opt+m"
+
+    rt = AeroHandRuntime(
+        cfg,
+        dry_run=False,  # MUST be overridden to True by passive_record_dir!
+        passive_record_dir=tmp_path / "passive_rt",
+    )
+    assert rt.dry_run is True
+    assert rt.input_ctl.dry_run is True
+    # Attempting to switch to Live HID while passive recording is active MUST be refused!
+    rt.set_dry_run(False)
+    assert rt.dry_run is True
+    assert rt.input_ctl.dry_run is True
+
+    # Start Local Control API and hit POST /api/passive/mark
+    rt._last_camera_ts_ms = 2400
+    rt._start_api_if_enabled()
+    try:
+        assert rt._api_server is not None
+        port = rt._api_server.bound_port
+        tok = rt._api_server.token
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/passive/mark",
+            data=b"{}",
+            headers={"Content-Type": "application/json", "X-AeroHand-Token": tok},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+            body = json.loads(resp.read().decode("utf-8"))
+        assert body["ok"] is True
+        assert body["timestamp_ms"] == 2400
+        assert body["marks_count"] == 1
+    finally:
+        rt.stop()

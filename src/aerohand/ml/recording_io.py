@@ -556,6 +556,21 @@ def load_recording_frames(
         if isinstance(raw, dict) and isinstance(raw.get("cue_events"), list)
         else []
     )
+    raw_marks = (
+        raw.get("deliberate_marks_ms")
+        if isinstance(raw, dict) and isinstance(raw.get("deliberate_marks_ms"), list)
+        else session_meta.get("deliberate_marks_ms")
+    )
+    deliberate_marks_ms = (
+        [int(round(float(m))) for m in raw_marks if isinstance(m, (int, float))]
+        if isinstance(raw_marks, list)
+        else []
+    )
+    mark_half_window_ms = float(
+        (raw.get("mark_half_window_ms") if isinstance(raw, dict) else None)
+        or session_meta.get("mark_half_window_ms")
+        or 1500.0
+    )
     meta = {
         "file": fp.name,
         "path": str(fp),
@@ -563,6 +578,8 @@ def load_recording_frames(
         "source": source,
         "recording_kind": recording_kind or None,
         "cue_events": cue_events,
+        "deliberate_marks_ms": deliberate_marks_ms,
+        "mark_half_window_ms": mark_half_window_ms,
         "session_meta": session_meta,
         "wall_clock_ms": wall_clock_ms,
         "raw_frame_count": len(raw_timestamps),

@@ -1246,4 +1246,288 @@ class FrameRingBuffer:
         return out_fp
 
 
+class PassiveIdleRecorder:
+    """
+    Chunked, low-RAM dry-run passive idle recorder for dogfooding exposure accumulation (V060-06).
+
+    - Writes bounded schema-v2 JSON chunks to `out_dir` (never buffers an entire multi-hour session in RAM).
+    - Increments `segment_id` whenever a same-hand timestamp gap exceeds `max_gap_ms` (default 100 ms).
+    - Enforces a per-day disk cap (`max_daily_mb`, default 256 MB) across today's passive chunks.
+    - Tracks `deliberate_marks_ms` (ONLY for deliberate gestures, NEVER false triggers) and excludes
+      `+/- mark_half_window_ms` (default +/- 1.5 s) from accumulated `hand_present_idle_hours`.
+    """
+
+    def __init__(
+        self,
+        out_dir: str | Path,
+        *,
+        session_meta: Optional[Dict[str, Any]] = None,
+        default_subject: str = DEFAULT_COLLECTOR_SUBJECT,
+        chunk_max_frames: int = 1800,
+        max_daily_mb: float = 256.0,
+        mark_half_window_ms: float = 1500.0,
+        max_gap_ms: float = 100.0,
+    ) -> None:
+        self.out_dir: Path = Path(out_dir)
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+        self._default_subject: str = str(default_subject or "").strip() or DEFAULT_COLLECTOR_SUBJECT
+        self.chunk_max_frames: int = max(5, int(chunk_max_frames))
+        self.max_daily_bytes: int = max(1, int(round(float(max_daily_mb) * 1024.0 * 1024.0)))
+        self.mark_half_window_ms: float = max(100.0, float(mark_half_window_ms))
+        self.max_gap_ms: float = max(10.0, float(max_gap_ms))
+
+        self._session_meta: Dict[str, Any] = {
+            "kind": "passive_idle_claim",
+            "subject": self._default_subject,
+            "hand": "Both",
+            "wrist_angle": "0",
+            "distance": "mid",
+            "lighting": "bright",
+            "camera": "default",
+            "scenario": "passive_dogfood_idle",
+        }
+        if session_meta:
+            for k, v in session_meta.items():
+                if v is not None:
+                    self._session_meta[str(k)] = v
+        self._session_meta["kind"] = "passive_idle_claim"
+        self._session_meta["subject"] = (
+            str(self._session_meta.get("subject") or "").strip() or self._default_subject
+        )
+        self._session_meta["condition_id"] = compute_condition_id(self._session_meta)
+
+        self._lock = threading.Lock()
+        self._session_stamp: str = time.strftime("%Y%m%d_%H%M%S")
+        self._day_str: str = time.strftime("%Y%m%d")
+        self._chunk_index: int = 0
+        self._chunks_written: int = 0
+        self._written_files: List[Path] = []
+        self._buf: List[Dict[str, Any]] = []
+        self._chunk_marks_ms: List[int] = []
+        self._all_marks_ms: List[int] = []
+        self._last_ts_by_hand: Dict[str, int] = {}
+        self._seg_id_by_hand: Dict[str, int] = {}
+        self._next_seg_id: int = 0
+        self._total_samples_recorded: int = 0
+        self._accum_idle_ms: float = 0.0
+        self._cap_reached: bool = False
+        self._closed: bool = False
+
+    def _current_daily_bytes(self, day_str: str) -> int:
+        total = 0
+        if not self.out_dir.is_dir():
+            return 0
+        for fp in self.out_dir.glob(f"aerohand_passive_*_{day_str}_*.json"):
+            try:
+                total += fp.stat().st_size
+            except OSError:
+                continue
+        return total
+
+    @staticmethod
+    def _compute_chunk_idle_ms(
+        samples: Sequence[Dict[str, Any]],
+        marks_ms: Sequence[int],
+        half_window_ms: float,
+    ) -> float:
+        idle_ms = 0.0
+        prev_present_ts: Optional[float] = None
+        for s in samples:
+            ts = float(s.get("timestamp_ms", 0))
+            if s.get("hand_present") is False or len(s.get("landmarks_2d") or []) < 63:
+                prev_present_ts = None
+                continue
+            excluded = any(abs(ts - float(m)) <= half_window_ms for m in marks_ms)
+            if prev_present_ts is not None:
+                dt = ts - prev_present_ts
+                if 0.0 < dt <= 500.0 and not excluded:
+                    idle_ms += dt
+            elif not excluded:
+                idle_ms += 33.33
+            prev_present_ts = ts
+        return idle_ms
+
+    def add_frame(self, hands: Sequence[Any], timestamp_ms: int) -> None:
+        """Append one camera frame's landmarks (or hand-absent marker) and flush when chunk is full."""
+        with self._lock:
+            if self._closed or self._cap_reached:
+                return
+            ts = int(timestamp_ms)
+            added = 0
+            for h_inp in hands:
+                lms2d = getattr(h_inp, "landmarks", None)
+                if lms2d is None or len(lms2d) < 21:
+                    continue
+                lms3d = getattr(h_inp, "world_landmarks", None)
+                flat_2d = [c for lm in lms2d[:21] for c in (lm.x, lm.y, lm.z)]
+                flat_3d = (
+                    [c for lm in lms3d[:21] for c in (lm.x, lm.y, lm.z)]
+                    if (lms3d is not None and len(lms3d) >= 21)
+                    else []
+                )
+                handed: Handedness = "Left" if str(getattr(h_inp, "handedness", "Right")) == "Left" else "Right"
+                if handed not in self._seg_id_by_hand:
+                    self._seg_id_by_hand[handed] = self._next_seg_id
+                    self._next_seg_id += 1
+                elif handed in self._last_ts_by_hand and (
+                    (ts - self._last_ts_by_hand[handed]) > self.max_gap_ms
+                    or ts < self._last_ts_by_hand[handed]
+                ):
+                    self._seg_id_by_hand[handed] = self._next_seg_id
+                    self._next_seg_id += 1
+                self._last_ts_by_hand[handed] = ts
+
+                self._buf.append(
+                    {
+                        "timestamp_ms": ts,
+                        "hand_present": True,
+                        "label": 0,
+                        "label_name": PoseName.IDLE.value,
+                        "handedness": handed,
+                        "hand_id": handed,
+                        "confidence": round(float(getattr(h_inp, "confidence", 1.0)), 4),
+                        "segment_id": self._seg_id_by_hand[handed],
+                        "landmarks_2d": flat_2d,
+                        "world_landmarks": flat_3d,
+                    }
+                )
+                added += 1
+
+            if added == 0:
+                self._buf.append(
+                    {
+                        "timestamp_ms": ts,
+                        "hand_present": False,
+                        "label": 0,
+                        "label_name": PoseName.IDLE.value,
+                        "handedness": "Right",
+                        "hand_id": "Right",
+                        "confidence": 0.0,
+                        "segment_id": -1,
+                        "landmarks_2d": [],
+                        "world_landmarks": [],
+                    }
+                )
+
+            if len(self._buf) >= self.chunk_max_frames:
+                self._flush_locked()
+
+    def mark_deliberate_gesture(self, timestamp_ms: int, *, note: str = "") -> Dict[str, Any]:
+        """Mark a deliberate gesture timestamp (+/- 1.5s excluded from idle exposure; NEVER for false triggers)."""
+        with self._lock:
+            ts = int(timestamp_ms)
+            self._chunk_marks_ms.append(ts)
+            self._all_marks_ms.append(ts)
+            return {
+                "ok": True,
+                "timestamp_ms": ts,
+                "marks_count": len(self._all_marks_ms),
+                "half_window_ms": self.mark_half_window_ms,
+                "note": str(note or ""),
+            }
+
+    def _flush_locked(self) -> Optional[Path]:
+        if not self._buf:
+            return None
+        today = time.strftime("%Y%m%d")
+        if today != self._day_str:
+            self._day_str = today
+            self._cap_reached = False
+        used_bytes = self._current_daily_bytes(today)
+        if used_bytes >= self.max_daily_bytes:
+            self._cap_reached = True
+            self._buf.clear()
+            self._chunk_marks_ms.clear()
+            logger.warning(
+                f"[PASSIVE] Daily disk cap reached ({used_bytes / (1024 * 1024):.1f} MB >= "
+                f"{self.max_daily_bytes / (1024 * 1024):.1f} MB); pausing passive chunk writes until tomorrow."
+            )
+            return None
+
+        self._chunk_index += 1
+        samples = list(self._buf)
+        chunk_marks = list(self._chunk_marks_ms)
+        self._buf.clear()
+        self._chunk_marks_ms.clear()
+
+        chunk_idle_ms = self._compute_chunk_idle_ms(samples, chunk_marks, self.mark_half_window_ms)
+        self._accum_idle_ms += chunk_idle_ms
+        self._total_samples_recorded += len(samples)
+
+        meta = dict(self._session_meta)
+        meta["chunk_index"] = self._chunk_index
+        meta["deliberate_marks_count"] = len(chunk_marks)
+        meta["deliberate_marks_ms"] = chunk_marks
+        meta["mark_half_window_ms"] = self.mark_half_window_ms
+        meta["hand_present_idle_hours"] = round(chunk_idle_ms / 3_600_000.0, 6)
+
+        subj = _slugify(meta["subject"], self._default_subject)
+        out_fp = self.out_dir / f"aerohand_passive_{subj}_{self._session_stamp}_chunk{self._chunk_index:04d}.json"
+        payload = {
+            "schema": "aerohand_pinch_v2",
+            "schema_version": 2,
+            "recording_kind": "passive_idle_claim",
+            "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "session_meta": meta,
+            "deliberate_marks_ms": chunk_marks,
+            "deliberate_marks_count": len(chunk_marks),
+            "mark_half_window_ms": self.mark_half_window_ms,
+            "total_samples": len(samples),
+            "samples": samples,
+        }
+        raw_bytes = json.dumps(payload).encode("utf-8")
+        if (used_bytes + len(raw_bytes)) > self.max_daily_bytes and self._chunks_written > 0:
+            self._cap_reached = True
+            logger.warning(
+                f"[PASSIVE] Writing chunk #{self._chunk_index} would exceed daily cap "
+                f"({self.max_daily_bytes / (1024 * 1024):.1f} MB); stopping passive writes."
+            )
+            return None
+        tmp_fp = out_fp.with_suffix(".json.tmp")
+        tmp_fp.write_bytes(raw_bytes)
+        tmp_fp.replace(out_fp)
+        self._chunks_written += 1
+        self._written_files.append(out_fp)
+        if (used_bytes + len(raw_bytes)) >= self.max_daily_bytes:
+            self._cap_reached = True
+        return out_fp
+
+    def flush(self) -> Optional[Path]:
+        with self._lock:
+            return self._flush_locked()
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            pending_idle_ms = self._compute_chunk_idle_ms(
+                self._buf, self._chunk_marks_ms, self.mark_half_window_ms
+            )
+            return {
+                "active": not self._closed,
+                "out_dir": str(self.out_dir),
+                "chunks_written": self._chunks_written,
+                "buffered_samples": len(self._buf),
+                "total_samples_written": self._total_samples_recorded,
+                "deliberate_marks_count": len(self._all_marks_ms),
+                "hand_present_idle_hours": round((self._accum_idle_ms + pending_idle_ms) / 3_600_000.0, 6),
+                "cap_reached": self._cap_reached,
+                "max_daily_mb": round(self.max_daily_bytes / (1024.0 * 1024.0), 3),
+            }
+
+    def close(self) -> Dict[str, Any]:
+        with self._lock:
+            if not self._closed:
+                self._flush_locked()
+                self._closed = True
+            return {
+                "out_dir": str(self.out_dir),
+                "chunks_written": self._chunks_written,
+                "files": [str(p) for p in self._written_files],
+                "total_samples_written": self._total_samples_recorded,
+                "deliberate_marks_count": len(self._all_marks_ms),
+                "deliberate_marks_ms": list(self._all_marks_ms),
+                "hand_present_idle_hours": round(self._accum_idle_ms / 3_600_000.0, 6),
+                "cap_reached": self._cap_reached,
+            }
+
+
 PoseCollector = PinchDataCollector

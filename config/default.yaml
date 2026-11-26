@@ -375,6 +375,7 @@ hotkeys:
   recenter: "cmd+shift+r"
   toggle_hud: "cmd+shift+h"
   mark_not_intended: "cmd+shift+n"     # Save +/- 1.5s landmarks clip as hard-negative `idle`
+  mark_deliberate_gesture: "cmd+ctrl+opt+m"  # Passive dogfood ONLY: mark deliberate gesture (+/-1.5s excluded)
 
 system:
   launch_at_login: false

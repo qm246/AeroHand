@@ -42,6 +42,7 @@ from aerohand.core.types import ALL_POSE_NAMES, HandOutput, PoseName
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.collector import (
     FrameRingBuffer,
+    PassiveIdleRecorder,
     PinchDataCollector,
     QualityGateError,
     clean_recording_samples,
@@ -192,6 +193,8 @@ class AeroHandRuntime:
         preview: bool = False,
         camera_index: Optional[int] = None,
         collect_dir: Optional[str | Path] = None,
+        passive_record_dir: Optional[str | Path] = None,
+        passive_max_daily_mb: float = 256.0,
         render_hud_frames: bool = False,
         on_show_window: Optional[Callable[[], None]] = None,
         on_toggle_camera_hud: Optional[Callable[[], None]] = None,
@@ -202,7 +205,9 @@ class AeroHandRuntime:
     ) -> None:
         self.base_config: Dict[str, Any] = deepcopy(config)
         self.config: Dict[str, Any] = deepcopy(config)
-        self.dry_run = bool(dry_run)
+        self._passive_record_dir: Optional[Path] = Path(passive_record_dir) if passive_record_dir else None
+        # V060-06: Passive idle recording permanently forces dry_run=True (zero HID emission)
+        self.dry_run = True if self._passive_record_dir is not None else bool(dry_run)
         self.preview = bool(preview or (collect_dir is not None))
         self.render_hud_frames = bool(render_hud_frames or self.preview)
         self.collect_dir = Path(collect_dir) if collect_dir else (repo_root() / "data" / "sessions")
@@ -272,6 +277,16 @@ class AeroHandRuntime:
             step_duration_s=float(col_cfg.get("step_duration_s", 5.0)),
             quality_gate_mode=str(col_cfg.get("quality_gate_mode", "clean")),
             default_subject=self.collector_subject,
+        )
+        self.passive_recorder: Optional[PassiveIdleRecorder] = (
+            PassiveIdleRecorder(
+                self._passive_record_dir,
+                session_meta=self.collector.session_meta,
+                default_subject=self.collector_subject,
+                max_daily_mb=float(passive_max_daily_mb),
+            )
+            if self._passive_record_dir is not None
+            else None
         )
         self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
@@ -349,8 +364,8 @@ class AeroHandRuntime:
 
     def set_dry_run(self, dry_run: bool) -> None:
         target = bool(dry_run)
-        if not target and self.collector.is_cued_active:
-            logger.warning("[COLLECT] Refusing live HID output while cued_events recording is active.")
+        if not target and (self.collector.is_cued_active or self.passive_recorder is not None):
+            logger.warning("[COLLECT] Refusing live HID output while cued or passive recording is active.")
             return
         if target:
             with self._lerp_lock:
@@ -829,6 +844,18 @@ class AeroHandRuntime:
         self._refresh_saved_sessions_cache()
         return self.collector_status()
 
+    def mark_deliberate_gesture(self, timestamp_ms: Optional[int] = None, *, note: str = "") -> Dict[str, Any]:
+        """Mark a deliberate gesture during `--passive-record` (+/-1.5s excluded from idle exposure; NEVER for FT)."""
+        if self.passive_recorder is None:
+            return {"ok": False, "error": "Passive recording is not active."}
+        ts = int(timestamp_ms) if timestamp_ms is not None else int(self._last_camera_ts_ms)
+        res = self.passive_recorder.mark_deliberate_gesture(ts, note=note)
+        self._last_action_text = f"Marked deliberate gesture (#{res['marks_count']})"
+        logger.info(
+            f"[PASSIVE] Marked deliberate gesture #{res['marks_count']} at t={ts}ms (+/-1.5s excluded)."
+        )
+        return res
+
     def mark_last_trigger_not_intended(self, out_dir: Optional[str | Path] = None) -> Dict[str, Any]:
         """Save +/- 1.5s of landmark ring buffer around the last false trigger as an `idle` hard-negative."""
         if self.dictation.is_recording:
@@ -962,6 +989,15 @@ class AeroHandRuntime:
             except Exception:
                 pass
         self._restore_cued_dry_run()
+        if self.passive_recorder is not None:
+            try:
+                summary = self.passive_recorder.close()
+                logger.info(
+                    f"[PASSIVE] Closed recorder: chunks={summary['chunks_written']} "
+                    f"idle_h={summary['hand_present_idle_hours']:.4f}h marks={summary['deliberate_marks_count']}"
+                )
+            except Exception:
+                pass
         if self._api_server is not None:
             self._api_server.stop()
             self._api_server = None
@@ -1023,6 +1059,7 @@ class AeroHandRuntime:
             trigger_recenter=self.trigger_recenter,
             set_dry_run=self.set_dry_run,
             show_window=self._on_show_window,
+            mark_deliberate_gesture=self.mark_deliberate_gesture,
         )
         self._api_server.start()
 
@@ -1628,7 +1665,12 @@ class AeroHandRuntime:
                         self.apply_live_settings(merged, from_profile=True)
 
                 is_idle = self.idle_throttle_enabled and ((now_wall - last_hand_wall) >= self.idle_timeout_s)
-                if is_idle and not self.collector.is_recording and not self.collector.is_cued_active:
+                if (
+                    is_idle
+                    and not self.collector.is_recording
+                    and not self.collector.is_cued_active
+                    and self.passive_recorder is None
+                ):
                     time.sleep(max(0.01, 1.0 / max(1.0, self.idle_fps) - 0.015))
 
                 cf = camera.read(timeout_s=0.04)
@@ -1692,6 +1734,8 @@ class AeroHandRuntime:
                     )
                 primary = self._select_primary_hand(outputs)
                 self._record_collector_frame(hands, primary, cf.timestamp_ms)
+                if self.passive_recorder is not None:
+                    self.passive_recorder.add_frame(hands, int(cf.timestamp_ms))
                 if self.calibration.state == "running":
                     cal_hand = next(
                         (h for h in hands if primary is not None and h.handedness == primary.hand),
@@ -1903,6 +1947,16 @@ class AeroHandRuntime:
                 except Exception:
                     pass
             self._restore_cued_dry_run()
+            if self.passive_recorder is not None:
+                try:
+                    summary = self.passive_recorder.close()
+                    logger.info(
+                        f"[PASSIVE] Saved {summary['chunks_written']} chunk(s) to {summary['out_dir']} | "
+                        f"hand_present_idle_hours={summary['hand_present_idle_hours']:.4f}h | "
+                        f"deliberate_marks={summary['deliberate_marks_count']}"
+                    )
+                except Exception:
+                    pass
             if lerp_thread is not None and lerp_thread.is_alive():
                 lerp_thread.join(timeout=0.5)
             self.dictation.close()

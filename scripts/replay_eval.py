@@ -322,6 +322,7 @@ def evaluate_recordings(
     idle_duration_ms = 0.0
     total_duration_ms = 0.0
     wall_clock_ms = 0.0
+    deliberate_marks_total = 0
     evaluated_files: List[str] = []
 
     sess_filtered, _ = exclude_cued_events(session_paths)
@@ -376,9 +377,15 @@ def evaluate_recordings(
         prev_wrist_by_hand: Dict[str, Tuple[float, float, float]] = {}
         prev_rot_by_hand: Dict[str, Tuple[float, float, float, float]] = {}
         last_latch_entry_by_hand: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
+        file_marks_ms = [float(m) for m in (rec_meta.get("deliberate_marks_ms") or [])]
+        mark_half_win = float(rec_meta.get("mark_half_window_ms", 1500.0))
+        deliberate_marks_total += len(file_marks_ms)
 
         for fr in frames:
             ts = float(fr["timestamp_ms"])
+            in_deliberate_mark = bool(file_marks_ms) and any(
+                abs(ts - m) <= mark_half_win for m in file_marks_ms
+            )
             if not fr["hand_present"] or not fr["landmarks_2d"]:
                 eng.process_frame([], ts, width, height)
                 prev_present_ts = None
@@ -393,7 +400,7 @@ def evaluate_recordings(
                 dt = ts - prev_present_ts
                 if 0.0 < dt <= 500.0:
                     total_duration_ms += dt
-                    if fr["is_idle_gt"]:
+                    if fr["is_idle_gt"] and not in_deliberate_mark:
                         idle_duration_ms += dt
                         sc["idle_duration_ms"] += dt
                 else:
@@ -402,7 +409,7 @@ def evaluate_recordings(
                     prev_rot_by_hand.clear()
             else:
                 total_duration_ms += 33.33
-                if fr["is_idle_gt"]:
+                if fr["is_idle_gt"] and not in_deliberate_mark:
                     idle_duration_ms += 33.33
                     sc["idle_duration_ms"] += 33.33
             prev_present_ts = ts
@@ -455,7 +462,7 @@ def evaluate_recordings(
                 )
 
             fired: List[str] = []
-            if fr["is_idle_gt"]:
+            if fr["is_idle_gt"] and not in_deliberate_mark:
                 p = ho.pose
                 if p.is_clicking:
                     fired.append("left_click")
@@ -632,6 +639,7 @@ def evaluate_recordings(
         },
         "per_scenario": per_scenario,
         "ft_events_count": len(ft_events),
+        "deliberate_marks_count": deliberate_marks_total,
     }
 
     if anchor_offsets_px:

@@ -261,6 +261,7 @@ class LocalControlAPIServer:
         trigger_recenter: Callable[[], None],
         set_dry_run: Optional[Callable[[bool], None]] = None,
         show_window: Optional[Callable[[], None]] = None,
+        mark_deliberate_gesture: Optional[Callable[[], Dict[str, Any]]] = None,
         token: Optional[str] = None,
         token_path: Optional[Path] = None,
     ) -> None:
@@ -277,6 +278,7 @@ class LocalControlAPIServer:
         self._recenter = trigger_recenter
         self._set_dry_run = set_dry_run
         self._show_window = show_window
+        self._mark_deliberate_gesture = mark_deliberate_gesture
         self._token: str = token if token is not None else secrets.token_hex(32)
         self._token_path: Path = Path(token_path) if token_path is not None else api_token_path()
         self._server: Optional[ThreadingHTTPServer] = None
@@ -408,6 +410,13 @@ class LocalControlAPIServer:
                         self._send_json(200, {"ok": True})
                     elif path == "/api/screenshot":
                         self._send_json(200, capture_screenshot_png())
+                    elif path == "/api/passive/mark":
+                        if parent._mark_deliberate_gesture is None:
+                            self._send_json(409, {"ok": False, "error": "Passive recording is not active."})
+                        else:
+                            res = parent._mark_deliberate_gesture()
+                            status_code = 200 if res.get("ok") else 409
+                            self._send_json(status_code, res)
                     else:
                         self._send_json(404, {"error": f"Not found: {path}"})
                 except _PayloadTooLargeError as exc:

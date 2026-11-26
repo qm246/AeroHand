@@ -19,6 +19,7 @@ if _TESTS_DIR not in sys.path:
 
 from synth_hand import (  # noqa: E402
     apply_finger_curl,
+    make_airpoint_ergonomic_sequence,
     make_base_open_hand,
     make_fist_thumb_on_index_sequence,
     make_ok_sign_pinch_sequence,
@@ -293,3 +294,65 @@ def test_synth_slow_fist_thumb_on_index_does_not_arm_dictation():
     assert _run_engine_dictation_armed(cfg, seq) is False, (
         "Slow fist closure with thumb on curled index tip should NOT arm dictation!"
     )
+
+
+@pytest.mark.parametrize(
+    "pose",
+    [
+        PoseName.THUMB_MIDDLE_PINCH,
+        PoseName.THUMB_RING_PINCH,
+        PoseName.THUMB_PINKY_PINCH,
+        PoseName.THUMB_PINKY_BASE,
+        PoseName.THUMB_INDEX_PINCH,
+        PoseName.THUMB_INDEX_MIDDLE_PINCH,
+    ],
+)
+def test_airpoint_ergonomic_shaft_and_palm_tuck_recall(pose):
+    """All 6 Airpoint ergonomic postures (curled-finger shaft press & relaxed thumb-in-palm) fire cleanly."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    seq = make_airpoint_ergonomic_sequence(pose, open_frames=6, close_frames=6, hold_frames=6, fps=30.0)
+    tail = _run_seq_and_collect_hold_poses(clf, seq)
+    assert all(p.pose == pose for p in tail), (
+        f"Airpoint ergonomic {pose.value} failed: {[p.pose for p in tail]}, dbg={clf.last_debug.get('Right')}"
+    )
+    if pose != PoseName.THUMB_INDEX_MIDDLE_PINCH:
+        assert pose.value in clf.last_debug["Right"]["used_shaft"]
+
+
+def test_airpoint_ergonomic_static_shaft_contact_stays_idle():
+    """Static resting thumb on curled finger shaft or inner palm without prior separation stays IDLE."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    for pose in (
+        PoseName.THUMB_MIDDLE_PINCH,
+        PoseName.THUMB_RING_PINCH,
+        PoseName.THUMB_PINKY_PINCH,
+        PoseName.THUMB_PINKY_BASE,
+        PoseName.THUMB_INDEX_PINCH,
+    ):
+        clf = Heuristic3DPinchClassifier(cfg)
+        seq = make_airpoint_ergonomic_sequence(pose, open_frames=3, close_frames=4, hold_frames=6, start_closed=True)
+        for ts_ms, lms in seq:
+            pred = clf.predict(lms, lms, "Right", ts_ms)
+            assert pred.pose == PoseName.IDLE, (
+                f"Static Airpoint {pose.value} leaked through shaft approach gate! dbg={clf.last_debug.get('Right')}"
+            )
+
+
+def test_airpoint_relaxed_palm_tuck_does_not_require_reaching_pinky_mcp():
+    """4 slightly curved fingers + thumb folded into inner palm fires THUMB_PINKY_BASE even far from PINKY_MCP."""
+    from aerohand.core.palm_frame import PINKY_MCP, THUMB_TIP, compute_palm_frame
+
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    seq = make_airpoint_ergonomic_sequence(PoseName.THUMB_PINKY_BASE, open_frames=6, close_frames=6, hold_frames=6)
+    tail = _run_seq_and_collect_hold_poses(clf, seq)
+    assert all(p.pose == PoseName.THUMB_PINKY_BASE for p in tail)
+    # Confirm thumb truly did NOT have to reach PINKY_MCP (> pinky_base_on_dist = 0.42)
+    pf = compute_palm_frame(seq[-1][1], anchor="palm_center", is_left_hand=False, scale_metric="palm_width")
+    assert pf is not None
+    assert pf.dist(THUMB_TIP, PINKY_MCP) > cfg["pinky_base_on_dist"]
+    # Confirm disabling Airpoint shaft press cleanly restores legacy behavior
+    legacy_clf = Heuristic3DPinchClassifier(dict(cfg, enable_airpoint_shaft_press=False))
+    legacy_tail = _run_seq_and_collect_hold_poses(legacy_clf, seq)
+    assert all(p.pose == PoseName.IDLE for p in legacy_tail)

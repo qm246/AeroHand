@@ -34,13 +34,23 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 
 from aerohand.core.palm_frame import (
+    INDEX_DIP,
     INDEX_MCP,
+    INDEX_PIP,
     INDEX_TIP,
+    MIDDLE_DIP,
+    MIDDLE_MCP,
+    MIDDLE_PIP,
     MIDDLE_TIP,
+    PINKY_DIP,
     PINKY_MCP,
+    PINKY_PIP,
     PINKY_TIP,
+    RING_DIP,
+    RING_PIP,
     RING_TIP,
     THUMB_TIP,
+    WRIST,
     compute_finger_extension_ratios,
     compute_palm_frame,
 )
@@ -73,6 +83,16 @@ def _smooth_closeness(dist: float, on_dist: float, off_dist: float) -> float:
     return t * t * (3.0 - 2.0 * t)
 
 
+def _point_to_segment_dist(p: np.ndarray, a: np.ndarray, b: np.ndarray) -> float:
+    """3D Euclidean distance from point `p` to closed line segment `a`–`b`."""
+    ab = b - a
+    denom = float(np.dot(ab, ab))
+    if denom < 1e-12:
+        return float(np.linalg.norm(p - a))
+    t = max(0.0, min(1.0, float(np.dot(p - a, ab) / denom)))
+    return float(np.linalg.norm(p - (a + t * ab)))
+
+
 class _PerHandIntentState:
     __slots__ = (
         "last_ts_ms",
@@ -83,6 +103,8 @@ class _PerHandIntentState:
         "ang_ema",
         "last_open_ms",
         "last_open_dist",
+        "last_shaft_open_ms",
+        "last_shaft_open_dist",
         "latched",
         "latch_info",
     )
@@ -96,6 +118,8 @@ class _PerHandIntentState:
         self.ang_ema: float = 0.0
         self.last_open_ms: Dict[PoseName, float] = {}
         self.last_open_dist: Dict[PoseName, float] = {}
+        self.last_shaft_open_ms: Dict[PoseName, float] = {}
+        self.last_shaft_open_dist: Dict[PoseName, float] = {}
         self.latched: Set[PoseName] = set()
         self.latch_info: Dict[PoseName, Dict[str, Any]] = {}
 
@@ -144,6 +168,18 @@ class Heuristic3DPinchClassifier:
         self.grip_loose_ratio: float = max(0.7, float(c.get("grip_loose_ratio", 1.05)))
         self.fist_guard_requires_index_curled: bool = bool(c.get("fist_guard_requires_index_curled", True))
         self.fist_guard_protect_latch_ms: float = max(0.0, float(c.get("fist_guard_protect_latch_ms", 500.0)))
+
+        # Airpoint ergonomic curled-finger shaft press & relaxed thumb-in-palm tuck
+        self.enable_airpoint_shaft_press: bool = bool(c.get("enable_airpoint_shaft_press", True))
+        self.shaft_on_dist: float = float(c.get("shaft_on_dist", 0.26))
+        self.shaft_off_dist: float = float(c.get("shaft_off_dist", 0.46))
+        self.shaft_open_dist: float = float(c.get("shaft_open_dist", 0.52))
+        self.index_shaft_on_dist: float = float(c.get("index_shaft_on_dist", 0.24))
+        self.index_shaft_off_dist: float = float(c.get("index_shaft_off_dist", 0.42))
+        self.index_shaft_open_dist: float = float(c.get("index_shaft_open_dist", 0.60))
+        self.palm_tuck_on_dist: float = float(c.get("palm_tuck_on_dist", 0.44))
+        self.palm_tuck_off_dist: float = float(c.get("palm_tuck_off_dist", 0.66))
+        self.palm_tuck_open_dist: float = float(c.get("palm_tuck_open_dist", 0.72))
 
         self._state_gap_reset_ms: float = float(c.get("state_gap_reset_ms", 250.0))
         self._latch_score_threshold: float = float(c.get("latch_score_threshold", 0.85))
@@ -225,28 +261,139 @@ class Heuristic3DPinchClassifier:
         eff_ang = max(wrist_ang, st.ang_ema)
 
         # 3D normalized distances from thumb tip (LM4) in palm-width units (LM5-LM17 = 1.0)
-        d_idx = pf.dist(THUMB_TIP, INDEX_TIP)
-        d_mid = pf.dist(THUMB_TIP, MIDDLE_TIP)
-        d_ring = pf.dist(THUMB_TIP, RING_TIP)
-        d_pinky = pf.dist(THUMB_TIP, PINKY_TIP)
-        d_pbase = pf.dist(THUMB_TIP, PINKY_MCP)
-        d_idx_mid_tips = pf.dist(INDEX_TIP, MIDDLE_TIP)
-        d_dual = max(d_idx, d_mid)
+        c = pf.coords_normalized
+        thumb = c[THUMB_TIP]
+        exts = compute_finger_extension_ratios(pf)
+        idx_ext = exts.get("index", 2.0)
+        mid_ext = exts.get("middle", 2.0)
+        ring_ext = exts.get("ring", 2.0)
+        pinky_ext = exts.get("pinky", 2.0)
+        idx_dist_to_palm = float(np.linalg.norm(c[INDEX_TIP]))
 
-        pose_dists: Dict[PoseName, Tuple[float, float, float]] = {
-            PoseName.THUMB_INDEX_PINCH: (d_idx, self.pinch_on_dist, self.pinch_off_dist),
-            PoseName.THUMB_MIDDLE_PINCH: (d_mid, self.pinch_on_dist, self.pinch_off_dist),
-            PoseName.THUMB_RING_PINCH: (d_ring, self.pinch_on_dist, self.pinch_off_dist),
-            PoseName.THUMB_PINKY_PINCH: (d_pinky, self.pinch_on_dist, self.pinch_off_dist),
-            PoseName.THUMB_PINKY_BASE: (d_pbase, self.pinky_base_on_dist, self.pinky_base_off_dist),
+        d_idx_tip = pf.dist(THUMB_TIP, INDEX_TIP)
+        d_mid_tip = pf.dist(THUMB_TIP, MIDDLE_TIP)
+        d_ring_tip = pf.dist(THUMB_TIP, RING_TIP)
+        d_pinky_tip = pf.dist(THUMB_TIP, PINKY_TIP)
+        d_pbase_mcp = pf.dist(THUMB_TIP, PINKY_MCP)
+        d_idx_mid_tips = pf.dist(INDEX_TIP, MIDDLE_TIP)
+        d_dual = max(d_idx_tip, d_mid_tip)
+
+        tip_specs: Dict[PoseName, Tuple[float, float, float]] = {
+            PoseName.THUMB_INDEX_PINCH: (d_idx_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_MIDDLE_PINCH: (d_mid_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_RING_PINCH: (d_ring_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_PINKY_PINCH: (d_pinky_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_PINKY_BASE: (d_pbase_mcp, self.pinky_base_on_dist, self.pinky_base_off_dist),
             PoseName.THUMB_INDEX_MIDDLE_PINCH: (d_dual, self.dual_pinch_on_dist, self.dual_pinch_off_dist),
         }
+
+        # Airpoint ergonomic curled-finger shaft presses (1/2/3 extended fingers) + relaxed
+        # thumb-in-palm tuck (4 slightly extended/curved fingers -> spaces_nav).
+        # Shaft open history is tracked independently from tip-to-tip distances so switching
+        # metrics never synthesizes a false approach event.
+        shaft_eligible: Dict[PoseName, bool] = {}
+        shaft_specs: Dict[PoseName, Tuple[float, float, float, float]] = {}
+        if self.enable_airpoint_shaft_press:
+            d_idx_seg = min(
+                _point_to_segment_dist(thumb, c[INDEX_PIP], c[INDEX_DIP]),
+                _point_to_segment_dist(thumb, c[INDEX_DIP], c[INDEX_TIP]),
+            )
+            d_mid_seg = min(
+                _point_to_segment_dist(thumb, c[MIDDLE_PIP], c[MIDDLE_DIP]),
+                _point_to_segment_dist(thumb, c[MIDDLE_DIP], c[MIDDLE_TIP]),
+            )
+            d_ring_seg = min(
+                _point_to_segment_dist(thumb, c[RING_PIP], c[RING_DIP]),
+                _point_to_segment_dist(thumb, c[RING_DIP], c[RING_TIP]),
+            )
+            d_pinky_seg = min(
+                _point_to_segment_dist(thumb, c[PINKY_PIP], c[PINKY_DIP]),
+                _point_to_segment_dist(thumb, c[PINKY_DIP], c[PINKY_TIP]),
+            )
+            palm_tuck_a = 0.65 * c[MIDDLE_MCP] + 0.35 * c[WRIST]
+            palm_tuck_b = 0.85 * c[PINKY_MCP] + 0.15 * c[WRIST]
+            d_tuck_raw = _point_to_segment_dist(thumb, palm_tuck_a, palm_tuck_b)
+
+            # Strict Airpoint curled-vs-extended progression: ALL non-extended fingers must
+            # actually be curled toward the palm (ext < 1.15 AND tip dist_to_palm < 1.05),
+            # rejecting open/phone-wrap grips where fingers stay stretched out.
+            mid_dp = float(np.linalg.norm(c[MIDDLE_TIP]))
+            ring_dp = float(np.linalg.norm(c[RING_TIP]))
+            pinky_dp = float(np.linalg.norm(c[PINKY_TIP]))
+            mid_curled = (mid_ext < 1.15) and (mid_dp < 1.05)
+            ring_curled = (ring_ext < 1.12) and (ring_dp < 1.05)
+            pinky_curled = (pinky_ext < 1.18) and (pinky_dp < 1.05)
+
+            shaft_eligible = {
+                PoseName.THUMB_INDEX_PINCH: (
+                    self.index_shaft_on_dist > 0.0
+                    and idx_dist_to_palm >= 0.85
+                    and idx_ext >= 1.15
+                    and mid_curled
+                    and ring_curled
+                    and pinky_curled
+                ),
+                PoseName.THUMB_MIDDLE_PINCH: (
+                    idx_ext >= self.index_ext_min and mid_curled and ring_curled and pinky_curled
+                ),
+                PoseName.THUMB_RING_PINCH: (
+                    idx_ext >= self.index_ext_min and mid_ext >= 1.35 and ring_curled and pinky_curled
+                ),
+                PoseName.THUMB_PINKY_PINCH: (
+                    idx_ext >= self.index_ext_min
+                    and mid_ext >= 1.35
+                    and ring_ext >= 1.35
+                    and pinky_curled
+                ),
+                PoseName.THUMB_PINKY_BASE: (
+                    idx_ext >= 1.20
+                    and mid_ext >= 1.20
+                    and ring_ext >= 1.20
+                    and pinky_ext >= 1.15
+                    and d_tuck_raw < d_pinky_seg
+                ),
+            }
+            shaft_specs = {
+                PoseName.THUMB_INDEX_PINCH: (
+                    d_idx_seg,
+                    self.index_shaft_on_dist,
+                    self.index_shaft_off_dist,
+                    self.index_shaft_open_dist,
+                ),
+                PoseName.THUMB_MIDDLE_PINCH: (
+                    d_mid_seg,
+                    self.shaft_on_dist,
+                    self.shaft_off_dist,
+                    self.shaft_open_dist,
+                ),
+                PoseName.THUMB_RING_PINCH: (
+                    d_ring_seg,
+                    self.shaft_on_dist,
+                    self.shaft_off_dist,
+                    self.shaft_open_dist,
+                ),
+                PoseName.THUMB_PINKY_PINCH: (
+                    d_pinky_seg,
+                    self.shaft_on_dist,
+                    self.shaft_off_dist,
+                    self.shaft_open_dist,
+                ),
+                PoseName.THUMB_PINKY_BASE: (
+                    d_tuck_raw,
+                    self.palm_tuck_on_dist,
+                    self.palm_tuck_off_dist,
+                    self.palm_tuck_open_dist,
+                ),
+            }
+
         # Snapshot prior open timestamps & distances BEFORE updating with current frame so
         # a static finger hover can never satisfy its own approach gate without real closure.
         prev_open_ms = dict(st.last_open_ms)
         prev_open_dist = dict(st.last_open_dist)
+        prev_shaft_open_ms = dict(st.last_shaft_open_ms)
+        prev_shaft_open_dist = dict(st.last_shaft_open_dist)
         decay_factor = math.exp(-dt_s / self.approach_decay_tau_s) if dt_s > 0.0 else 1.0
-        for pose_key, (dist_val, on_d, off_d) in pose_dists.items():
+        for pose_key, (dist_val, on_d, _off_d) in tip_specs.items():
             if dist_val >= (on_d + self.approach_open_margin):
                 prev_t = st.last_open_ms.get(pose_key)
                 prev_d = st.last_open_dist.get(pose_key, 0.0)
@@ -258,47 +405,116 @@ class Heuristic3DPinchClassifier:
                         dist_val, decay_factor * prev_d + (1.0 - decay_factor) * dist_val
                     )
                 st.last_open_ms[pose_key] = timestamp_ms
-            if dist_val >= off_d:
+
+        for pose_key, (s_val, _s_on, _s_off, s_open) in shaft_specs.items():
+            if s_val >= s_open:
+                prev_t = st.last_shaft_open_ms.get(pose_key)
+                prev_d = st.last_shaft_open_dist.get(pose_key, 0.0)
+                if prev_t is None or (timestamp_ms - prev_t) > self.approach_window_ms or s_val >= prev_d:
+                    st.last_shaft_open_dist[pose_key] = s_val
+                else:
+                    st.last_shaft_open_dist[pose_key] = max(
+                        s_val, decay_factor * prev_d + (1.0 - decay_factor) * s_val
+                    )
+                st.last_shaft_open_ms[pose_key] = timestamp_ms
+
+        for pose_key, (dist_val, _on_d, off_d) in tip_specs.items():
+            tip_off = dist_val >= off_d
+            if pose_key in shaft_specs and shaft_eligible.get(pose_key, False):
+                s_val, _s_on, s_off, _s_open = shaft_specs[pose_key]
+                shaft_off = s_val >= s_off
+            else:
+                shaft_off = True
+            if tip_off and shaft_off:
                 st.latched.discard(pose_key)
                 st.latch_info.pop(pose_key, None)
 
+        # Raw scores in [0, 1]: best of classic tip-to-tip contact and eligible Airpoint shaft/tuck
+        raw_tip_scores: Dict[PoseName, float] = {
+            PoseName.THUMB_INDEX_PINCH: _smooth_closeness(d_idx_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_MIDDLE_PINCH: _smooth_closeness(d_mid_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_RING_PINCH: _smooth_closeness(d_ring_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_PINKY_PINCH: _smooth_closeness(d_pinky_tip, self.pinch_on_dist, self.pinch_off_dist),
+            PoseName.THUMB_PINKY_BASE: _smooth_closeness(d_pbase_mcp, self.pinky_base_on_dist, self.pinky_base_off_dist),
+            PoseName.THUMB_INDEX_MIDDLE_PINCH: _smooth_closeness(
+                d_dual, self.dual_pinch_on_dist, self.dual_pinch_off_dist
+            ),
+        }
+        raw_shaft_scores: Dict[PoseName, float] = {}
+        for pose_key, (s_val, s_on, s_off, _s_open) in shaft_specs.items():
+            if shaft_eligible.get(pose_key, False) and s_on > 0.0:
+                raw_shaft_scores[pose_key] = _smooth_closeness(s_val, s_on, s_off)
+            else:
+                raw_shaft_scores[pose_key] = 0.0
+
+        used_shaft: Set[PoseName] = set()
+        scores: Dict[PoseName, float] = {}
+        eff_dist_on: Dict[PoseName, Tuple[float, float]] = {}
+        for pose_key, t_sc in raw_tip_scores.items():
+            s_sc = raw_shaft_scores.get(pose_key, 0.0)
+            # Prefer shaft mode when shaft score strictly beats tip score, OR when both saturate
+            # on a curled non-index finger (enforcing the wider shaft anti-jitter open threshold).
+            prefer_shaft = (s_sc > t_sc) or (
+                s_sc > 0.0
+                and s_sc >= t_sc
+                and pose_key in _NON_INDEX_POSTURE_POSES
+            )
+            if prefer_shaft:
+                scores[pose_key] = s_sc
+                used_shaft.add(pose_key)
+                s_val, s_on, _s_off, _s_open = shaft_specs[pose_key]
+                eff_dist_on[pose_key] = (s_val, s_on)
+            else:
+                scores[pose_key] = t_sc
+                t_val, t_on, _t_off = tip_specs[pose_key]
+                eff_dist_on[pose_key] = (t_val, t_on)
+
+        # Dual pinch (Drag): both index AND middle close to thumb, and tips close together
+        if d_idx_mid_tips > 0.55:
+            scores[PoseName.THUMB_INDEX_MIDDLE_PINCH] *= 0.25
+
+        # Disambiguate dual pinch vs single index/middle pinch
+        s_dual = scores[PoseName.THUMB_INDEX_MIDDLE_PINCH]
+        if s_dual >= 0.50:
+            scores[PoseName.THUMB_INDEX_PINCH] *= max(0.0, 1.0 - s_dual)
+            scores[PoseName.THUMB_MIDDLE_PINCH] *= max(0.0, 1.0 - s_dual)
+
         # Check whether any canonical pinch pose is currently in tight contact (V051-09)
-        any_tight_pinch = (
-            d_idx <= self.pinch_on_dist
-            or d_mid <= self.pinch_on_dist
-            or d_ring <= self.pinch_on_dist
-            or d_pinky <= self.pinch_on_dist
-            or d_pbase <= self.pinky_base_on_dist
+        any_tight_pinch = any(
+            d_v <= on_v
+            for pk, (d_v, on_v) in eff_dist_on.items()
+            if pk != PoseName.THUMB_INDEX_MIDDLE_PINCH
         )
         active_tip_idx: Optional[int] = None
         if any_tight_pinch:
-            best_tip, best_d = min(
+            tip_candidates = (
+                (INDEX_TIP, PoseName.THUMB_INDEX_PINCH),
+                (MIDDLE_TIP, PoseName.THUMB_MIDDLE_PINCH),
+                (RING_TIP, PoseName.THUMB_RING_PINCH),
+                (PINKY_TIP, PoseName.THUMB_PINKY_PINCH),
+            )
+            best_tip, best_ratio = min(
                 (
-                    (INDEX_TIP, d_idx),
-                    (MIDDLE_TIP, d_mid),
-                    (RING_TIP, d_ring),
-                    (PINKY_TIP, d_pinky),
+                    (ti, eff_dist_on[pk][0] / max(1e-6, eff_dist_on[pk][1]))
+                    for ti, pk in tip_candidates
                 ),
                 key=lambda kv: kv[1],
             )
-            if best_d <= self.pinch_on_dist:
+            if best_ratio <= 1.0:
                 active_tip_idx = best_tip
 
         # Fist / grip guard: count how many non-pinching fingertips are tightly or half curled toward palm center
         curled_count = 0
         all_curled_count = 0
         half_curled_count = 0
-        idx_dist_to_palm = float(np.linalg.norm(pf.coords_normalized[INDEX_TIP]))
         for tip_idx in (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP):
-            dist_to_palm = idx_dist_to_palm if tip_idx == INDEX_TIP else float(np.linalg.norm(pf.coords_normalized[tip_idx]))
+            dist_to_palm = idx_dist_to_palm if tip_idx == INDEX_TIP else float(np.linalg.norm(c[tip_idx]))
             if dist_to_palm < 0.72:
                 all_curled_count += 1
                 if tip_idx != active_tip_idx:
                     curled_count += 1
             if dist_to_palm < 1.05:
                 half_curled_count += 1
-
-        idx_ext = compute_finger_extension_ratios(pf).get("index", 2.0)
 
         # If >= 3 non-pinching fingers are curled tightly into a fist/grip (holding phone/cup),
         # suppress loose pinch — never cancelling an already-latched hold. When all 4 non-thumb
@@ -339,6 +555,8 @@ class Heuristic3DPinchClassifier:
                 "palm_width_2d": round(palm_width_2d, 5),
                 "open_dist": {k.value: round(v, 4) for k, v in prev_open_dist.items()},
                 "idx_ext": round(idx_ext, 4),
+                "finger_ext": {k: round(v, 3) for k, v in exts.items()},
+                "used_shaft": sorted(p.value for p in used_shaft),
                 "curled_count": curled_count,
                 "half_curled_count": half_curled_count,
                 "raw_top_pose": PoseName.IDLE.value,
@@ -346,40 +564,18 @@ class Heuristic3DPinchClassifier:
             }
             return PinchPrediction(pose=PoseName.IDLE, probabilities=idle_probabilities(), confidence="high")
 
-        # Raw scores in [0, 1]
-        s_idx = _smooth_closeness(d_idx, self.pinch_on_dist, self.pinch_off_dist)
-        s_mid = _smooth_closeness(d_mid, self.pinch_on_dist, self.pinch_off_dist)
-        s_ring = _smooth_closeness(d_ring, self.pinch_on_dist, self.pinch_off_dist)
-        s_pinky = _smooth_closeness(d_pinky, self.pinch_on_dist, self.pinch_off_dist)
-        s_pbase = _smooth_closeness(d_pbase, self.pinky_base_on_dist, self.pinky_base_off_dist)
-
-        # Dual pinch (Drag): both index AND middle close to thumb, and tips close together
-        s_dual = _smooth_closeness(d_dual, self.dual_pinch_on_dist, self.dual_pinch_off_dist)
-        if d_idx_mid_tips > 0.55:
-            s_dual *= 0.25
-
-        # Disambiguate dual pinch vs single index/middle pinch
-        if s_dual >= 0.50:
-            s_idx *= max(0.0, 1.0 - s_dual)
-            s_mid *= max(0.0, 1.0 - s_dual)
-
-        # Prevent pinky tip pinch from being confused with pinky base slide
-        # Use raw 3D distance as tie-breaker when both saturate at 1.0 (short curved pinky).
-        if s_pinky > s_pbase or (s_pinky >= 0.5 and s_pbase >= 0.5 and d_pinky < d_pbase):
-            s_pbase *= 0.4
+        # Prevent pinky tip/shaft pinch from being confused with pinky base / palm tuck slide.
+        # Use effective 3D distance as tie-breaker when both saturate at 1.0 (short curved pinky).
+        s_pinky = scores[PoseName.THUMB_PINKY_PINCH]
+        s_pbase = scores[PoseName.THUMB_PINKY_BASE]
+        d_pinky_eff = eff_dist_on[PoseName.THUMB_PINKY_PINCH][0]
+        d_pbase_eff = eff_dist_on[PoseName.THUMB_PINKY_BASE][0]
+        if s_pinky > s_pbase or (s_pinky >= 0.5 and s_pbase >= 0.5 and d_pinky_eff < d_pbase_eff):
+            scores[PoseName.THUMB_PINKY_BASE] *= 0.4
         elif (
-            s_pbase > s_pinky or (s_pinky >= 0.5 and s_pbase >= 0.5 and d_pbase < d_pinky)
-        ) and d_pinky > self.pinch_off_dist:
-            s_pinky *= 0.3
-
-        scores: Dict[PoseName, float] = {
-            PoseName.THUMB_INDEX_PINCH: s_idx,
-            PoseName.THUMB_MIDDLE_PINCH: s_mid,
-            PoseName.THUMB_RING_PINCH: s_ring,
-            PoseName.THUMB_PINKY_PINCH: s_pinky,
-            PoseName.THUMB_PINKY_BASE: s_pbase,
-            PoseName.THUMB_INDEX_MIDDLE_PINCH: s_dual,
-        }
+            s_pbase > s_pinky or (s_pinky >= 0.5 and s_pbase >= 0.5 and d_pbase_eff < d_pinky_eff)
+        ) and d_pinky_tip > self.pinch_off_dist:
+            scores[PoseName.THUMB_PINKY_PINCH] *= 0.3
 
         raw_top_pose, raw_top_score = max(scores.items(), key=lambda kv: kv[1])
         blocked_by: Dict[str, List[str]] = {}
@@ -400,17 +596,30 @@ class Heuristic3DPinchClassifier:
             for pose_key, raw_sc in list(scores.items()):
                 if raw_sc <= 0.0 or pose_key in st.latched:
                     continue
-                dist_val, on_d, _ = pose_dists[pose_key]
+                dist_val, on_d = eff_dist_on[pose_key]
                 reasons: List[str] = []
                 if self.enable_approach_gate:
-                    last_open = prev_open_ms.get(pose_key)
-                    open_dist = prev_open_dist.get(pose_key, 0.0)
-                    if (
-                        last_open is None
-                        or (timestamp_ms - last_open) > self.approach_window_ms
-                        or (open_dist - dist_val) < self.approach_open_margin
-                    ):
-                        reasons.append("approach")
+                    if pose_key in used_shaft:
+                        _sv, s_on, _s_off, s_open = shaft_specs[pose_key]
+                        last_open = prev_shaft_open_ms.get(pose_key)
+                        open_dist = prev_shaft_open_dist.get(pose_key, 0.0)
+                        req_delta = max(self.approach_open_margin, s_open - s_on)
+                        if (
+                            last_open is None
+                            or (timestamp_ms - last_open) > self.approach_window_ms
+                            or open_dist < s_open
+                            or (open_dist - dist_val) < req_delta
+                        ):
+                            reasons.append("approach")
+                    else:
+                        last_open = prev_open_ms.get(pose_key)
+                        open_dist = prev_open_dist.get(pose_key, 0.0)
+                        if (
+                            last_open is None
+                            or (timestamp_ms - last_open) > self.approach_window_ms
+                            or (open_dist - dist_val) < self.approach_open_margin
+                        ):
+                            reasons.append("approach")
                 if self.enable_motion_gate:
                     if eff_speed_pw > self.max_wrist_speed_pw or eff_ang > self.max_wrist_ang_speed_deg_s:
                         reasons.append("motion")
@@ -431,9 +640,17 @@ class Heuristic3DPinchClassifier:
                         "since_ms": round(float(timestamp_ms), 2),
                         "dist": round(float(dist_val), 4),
                         "raw_sc": round(float(raw_sc), 4),
+                        "used_shaft": pose_key in used_shaft,
                         "eff_speed_pw": round(float(eff_speed_pw), 4),
                         "eff_ang_deg_s": round(float(eff_ang), 2),
-                        "open_dist": round(float(prev_open_dist.get(pose_key, 0.0)), 4),
+                        "open_dist": round(
+                            float(
+                                prev_shaft_open_dist.get(pose_key, 0.0)
+                                if pose_key in used_shaft
+                                else prev_open_dist.get(pose_key, 0.0)
+                            ),
+                            4,
+                        ),
                         "idx_ext": round(float(idx_ext), 4),
                         "half_curled_count": int(half_curled_count),
                     }
@@ -460,6 +677,8 @@ class Heuristic3DPinchClassifier:
             "palm_width_2d": round(palm_width_2d, 5),
             "open_dist": {k.value: round(v, 4) for k, v in prev_open_dist.items()},
             "idx_ext": round(idx_ext, 4),
+            "finger_ext": {k: round(v, 3) for k, v in exts.items()},
+            "used_shaft": sorted(p.value for p in used_shaft),
             "curled_count": curled_count,
             "half_curled_count": half_curled_count,
             "raw_top_pose": raw_top_pose.value if raw_top_score > 0.0 else PoseName.IDLE.value,

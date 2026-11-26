@@ -149,6 +149,16 @@ classifier:
     grip_loose_ratio: 1.05
     fist_guard_requires_index_curled: true  # Block fist with thumb touching curled index tip (dist_to_palm < 0.72)
     fist_guard_protect_latch_ms: 500.0      # Keep long-held latches (>= 500 ms) alive even if all 4 fingers curl
+    enable_airpoint_shaft_press: true       # Support Airpoint curled-finger shaft presses (1-3 ext) + relaxed palm-tuck (4 ext)
+    shaft_on_dist: 0.26                     # Thumb-to-curled-finger PIP-DIP-TIP shaft contact threshold
+    shaft_off_dist: 0.46                    # Release threshold for curled-finger shaft press
+    shaft_open_dist: 0.52                   # Required prior open separation before shaft press (anti-jitter)
+    index_shaft_on_dist: 0.24               # Thumb-to-index-side PIP-DIP-TIP contact threshold (dictation)
+    index_shaft_off_dist: 0.42
+    index_shaft_open_dist: 0.60
+    palm_tuck_on_dist: 0.44                 # Relaxed thumb-in-palm distance (4 fingers slightly extended/curved -> spaces_nav)
+    palm_tuck_off_dist: 0.66
+    palm_tuck_open_dist: 0.72
 
 collector:
   subject: "minh"                      # Default collector subject ID (matches converted corpus & primary_subject)

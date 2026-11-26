@@ -14,15 +14,24 @@ from __future__ import annotations
 from typing import Dict, List, Sequence, Tuple
 
 from aerohand.core.palm_frame import (
+    INDEX_DIP,
     INDEX_MCP,
+    INDEX_PIP,
     INDEX_TIP,
+    MIDDLE_DIP,
     MIDDLE_MCP,
+    MIDDLE_PIP,
     MIDDLE_TIP,
+    PINKY_DIP,
     PINKY_MCP,
+    PINKY_PIP,
     PINKY_TIP,
+    RING_DIP,
     RING_MCP,
+    RING_PIP,
     RING_TIP,
     THUMB_TIP,
+    WRIST,
 )
 from aerohand.core.types import Landmark, PoseName
 
@@ -328,6 +337,92 @@ def make_ok_sign_pinch_sequence(
         lms[THUMB_TIP] = _lerp_lm(base[THUMB_TIP], meet, t_val * 0.96)
         out.append((ts_ms, lms))
         frame_idx += 1
+
+    for _ in range(open_frames):
+        _emit(0.0)
+    for k in range(1, max(1, close_frames) + 1):
+        _emit(k / float(max(1, close_frames)))
+    for _ in range(hold_frames):
+        _emit(1.0)
+    return out
+
+
+def make_airpoint_ergonomic_sequence(
+    target_pose: PoseName,
+    *,
+    open_frames: int = 5,
+    close_frames: int = 6,
+    hold_frames: int = 10,
+    fps: float = 30.0,
+    scale: float = 1.0,
+    start_closed: bool = False,
+) -> List[Tuple[float, List[Landmark]]]:
+    """
+    Generate a realistic Airpoint curled-finger shaft-press or relaxed thumb-in-palm sequence:
+      - `THUMB_MIDDLE_PINCH`: 1 ext (index), middle/ring/pinky curled; thumb presses middle PIP–DIP shaft.
+      - `THUMB_RING_PINCH`: 2 ext (index+middle), ring/pinky curled; thumb presses ring PIP–DIP shaft.
+      - `THUMB_PINKY_PINCH`: 3 ext (index+middle+ring), pinky curled; thumb presses pinky PIP–DIP shaft.
+      - `THUMB_PINKY_BASE`: 4 slightly curved/extended; thumb folds comfortably into inner palm (NOT touching pinky MCP).
+      - `THUMB_INDEX_PINCH`: index extended/slightly curved, others curled; thumb presses index PIP–DIP side.
+      - `THUMB_INDEX_MIDDLE_PINCH`: ring+pinky curled; thumb+index+middle tips pinch together.
+    """
+    base = make_base_open_hand(scale=scale)
+    dt_ms = 1000.0 / float(fps)
+    out: List[Tuple[float, List[Landmark]]] = []
+    frame_idx = 0
+
+    def _build(t_val: float) -> List[Landmark]:
+        lms = list(base)
+        # Position open thumb slightly further laterally so shaft separation >= 0.65 when open
+        open_thumb = Landmark(
+            x=lms[THUMB_TIP].x - 0.03 * scale,
+            y=lms[THUMB_TIP].y,
+            z=lms[THUMB_TIP].z - 0.02 * scale,
+        )
+        lms[THUMB_TIP] = open_thumb
+
+        if target_pose == PoseName.THUMB_MIDDLE_PINCH:
+            lms = apply_finger_curl(lms, ("middle", "ring", "pinky"), curl_amount=0.82)
+            shaft_pt = _lerp_lm(lms[MIDDLE_PIP], lms[MIDDLE_DIP], 0.55)
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, shaft_pt, t_val * 0.96)
+        elif target_pose == PoseName.THUMB_RING_PINCH:
+            lms = apply_finger_curl(lms, ("ring", "pinky"), curl_amount=0.82)
+            shaft_pt = _lerp_lm(lms[RING_PIP], lms[RING_DIP], 0.55)
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, shaft_pt, t_val * 0.96)
+        elif target_pose == PoseName.THUMB_PINKY_PINCH:
+            lms = apply_finger_curl(lms, ("pinky",), curl_amount=0.82)
+            shaft_pt = _lerp_lm(lms[PINKY_PIP], lms[PINKY_DIP], 0.55)
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, shaft_pt, t_val * 0.96)
+        elif target_pose == PoseName.THUMB_PINKY_BASE:
+            # 4 fingers slightly curved (still >= 1.25 ext) + relaxed thumb folded into inner center-palm
+            lms = apply_finger_curl(lms, ("index", "middle", "ring", "pinky"), curl_amount=0.18)
+            inner_palm = Landmark(
+                x=0.65 * lms[MIDDLE_MCP].x + 0.35 * lms[WRIST].x + 0.015 * scale,
+                y=0.65 * lms[MIDDLE_MCP].y + 0.35 * lms[WRIST].y,
+                z=0.65 * lms[MIDDLE_MCP].z + 0.35 * lms[WRIST].z - 0.012 * scale,
+            )
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, inner_palm, t_val * 0.96)
+        elif target_pose == PoseName.THUMB_INDEX_PINCH:
+            lms = apply_finger_curl(lms, ("middle", "ring", "pinky"), curl_amount=0.82)
+            shaft_pt = _lerp_lm(lms[INDEX_PIP], lms[INDEX_DIP], 0.50)
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, shaft_pt, t_val * 0.96)
+        elif target_pose == PoseName.THUMB_INDEX_MIDDLE_PINCH:
+            lms = apply_finger_curl(lms, ("ring", "pinky"), curl_amount=0.82)
+            mid_pt = _lerp_lm(lms[INDEX_TIP], lms[MIDDLE_TIP], 0.5)
+            lms[INDEX_TIP] = _lerp_lm(lms[INDEX_TIP], mid_pt, t_val * 0.85)
+            lms[MIDDLE_TIP] = _lerp_lm(lms[MIDDLE_TIP], mid_pt, t_val * 0.85)
+            lms[THUMB_TIP] = _lerp_lm(open_thumb, mid_pt, t_val * 0.96)
+        return lms
+
+    def _emit(t_val: float) -> None:
+        nonlocal frame_idx
+        out.append((frame_idx * dt_ms, _build(t_val)))
+        frame_idx += 1
+
+    if start_closed:
+        for _ in range(open_frames + close_frames + hold_frames):
+            _emit(1.0)
+        return out
 
     for _ in range(open_frames):
         _emit(0.0)

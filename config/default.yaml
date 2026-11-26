@@ -134,10 +134,13 @@ classifier:
     enable_approach_gate: true         # Require separated -> closed approach before new pinch entry
     approach_window_ms: 1500.0         # Window (ms) in which pair must have been seen open
     approach_open_margin: 0.04         # Distance above pinch_on_dist counting as open/poised
+    approach_decay_tau_ms: 400.0       # Time constant (ms) for FPS-independent open-dist decay
     enable_posture_gate: true          # Require extended index finger for middle/ring/pinky clicks
     index_ext_min: 1.25                # Min ||index_tip-wrist|| / ||index_mcp-wrist|| ratio
     enable_motion_gate: true           # Reject new pinch entries during fast wrist motion/rotation
-    max_wrist_speed: 0.18              # Max normalized 2D wrist linear speed (screen-units/s)
+    max_wrist_speed: 0.18              # Legacy screen-units/s fallback when palm_width_2d unavailable
+    max_wrist_speed_pw: 1.50           # Max palm-width-normalized wrist speed (palm-widths/s)
+    motion_ema_tau_ms: 32.0            # Time constant (ms) for FPS-independent velocity EMA (~0.65 at 30fps)
     max_wrist_ang_speed_deg_s: 95.0    # Max 3D palm angular speed (deg/s) on new pinch entry
     enable_grip_guard: true            # Suppress loose contact when >= 3 fingers are half-curled
     grip_half_curled_min: 3

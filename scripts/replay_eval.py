@@ -339,6 +339,14 @@ def evaluate_recordings(
                     fr["landmarks_2d"], fr["world_landmarks"], fr["handedness"]
                 )
                 probs_d = {k.value: round(float(v), 4) for k, v in ho.pose.pose_probabilities.items()}
+                # V051-08: Capture internal heuristic gate debug state (latched, blocked_by, speeds)
+                gate_debug: Dict[str, Any] = {}
+                dbg_src = getattr(clf, "last_debug", None)
+                if dbg_src is None:
+                    fb_clf = getattr(clf, "_fallback", None)
+                    dbg_src = getattr(fb_clf, "last_debug", None) if fb_clf is not None else None
+                if isinstance(dbg_src, dict) and hand in dbg_src:
+                    gate_debug = deepcopy(dbg_src[hand])
                 for trig in fired:
                     ft_by_type[trig] += 1
                     sc["counts"][trig] += 1
@@ -360,6 +368,7 @@ def evaluate_recordings(
                             "palm_size": round(float(ho.cursor.palm_size), 5),
                             "palm_facing_dot": diag["palm_facing_dot"],
                             "hand_visible_ms": round(hand_visible_ms, 1),
+                            "gate_debug": gate_debug,
                         }
                     )
 

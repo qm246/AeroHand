@@ -4659,3 +4659,180 @@ def test_rebuild_preserves_cumulative_shadow_counters(tmp_path: Path, monkeypatc
     rt._apply_live_settings_now(cfg2)
     assert isinstance(rt.classifier, GuardedClassifier)
     assert rt.classifier.telemetry()["shadow_frames"] == 3
+
+
+# ==============================================================================
+# V051-07 / V051-08: FPS- & Scale-Invariant Intent Gates + Gate Debug
+# ==============================================================================
+
+
+def _make_scaled_shifted_hand(scale: float, dx: float = 0.0, dy: float = 0.0) -> List[Landmark]:
+    base = _make_open_hand(forward_z=-0.25)
+    w = base[0]
+    return [
+        Landmark(
+            x=w.x + (p.x - w.x) * scale + dx,
+            y=w.y + (p.y - w.y) * scale + dy,
+            z=w.z + (p.z - w.z) * scale,
+        )
+        for p in base
+    ]
+
+
+def _pinch_middle_copy(lms: List[Landmark]) -> List[Landmark]:
+    out = list(lms)
+    out[4] = Landmark(out[12].x, out[12].y, out[12].z)
+    return out
+
+
+def test_motion_gate_same_decision_at_30_and_60fps():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    pw = math.hypot(
+        _make_open_hand()[5].x - _make_open_hand()[17].x,
+        _make_open_hand()[5].y - _make_open_hand()[17].y,
+    )
+
+    for speed_pw, expect_blocked in ((0.8, False), (2.3, True)):
+        decisions = []
+        ema_vals = []
+        for fps in (30.0, 60.0):
+            clf = Heuristic3DPinchClassifier(cfg)
+            dt_ms = 1000.0 / fps
+            n_open = int(round(0.30 * fps))  # 300ms moving open hand
+            for i in range(n_open):
+                t_s = (i * dt_ms) / 1000.0
+                h = _make_scaled_shifted_hand(1.0, dx=speed_pw * pw * t_s)
+                clf.predict(h, h, "Right", i * dt_ms)
+            # Pinch on next frame while still translating at the exact same physical speed
+            t_s = (n_open * dt_ms) / 1000.0
+            h_pinch = _pinch_middle_copy(_make_scaled_shifted_hand(1.0, dx=speed_pw * pw * t_s))
+            pred = clf.predict(h_pinch, h_pinch, "Right", n_open * dt_ms)
+            dbg = clf.last_debug["Right"]
+            decisions.append(pred.pose == PoseName.IDLE)
+            ema_vals.append(dbg["eff_speed_pw"])
+        assert decisions == [expect_blocked, expect_blocked], (
+            f"speed_pw={speed_pw}: 30fps vs 60fps mismatch {decisions}, ema={ema_vals}"
+        )
+        assert abs(ema_vals[0] - ema_vals[1]) < 0.15
+
+
+def test_motion_gate_invariant_to_palm_size():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    base = _make_open_hand()
+    base_pw = math.hypot(base[5].x - base[17].x, base[5].y - base[17].y)
+
+    # Near hand (scale=1.6, pw~0.19) vs far hand (scale=0.55, pw~0.066):
+    # At 1.0 pw/s, near image speed is 0.19 (> old 0.18) yet palm-normalized speed is 1.0 (< 1.50) -> ALLOWED!
+    # At 2.1 pw/s, far image speed is 0.139 (< old 0.18) yet palm-normalized speed is 2.1 (> 1.50) -> BLOCKED!
+    for speed_pw, expect_pose in ((1.0, PoseName.THUMB_MIDDLE_PINCH), (2.1, PoseName.IDLE)):
+        for scale in (0.55, 1.60):
+            clf = Heuristic3DPinchClassifier(cfg)
+            pw = base_pw * scale
+            for i in range(8):
+                t_s = (i * 33.33) / 1000.0
+                h = _make_scaled_shifted_hand(scale, dx=speed_pw * pw * t_s)
+                clf.predict(h, h, "Right", i * 33.33)
+            t_s = (8 * 33.33) / 1000.0
+            h_p = _pinch_middle_copy(_make_scaled_shifted_hand(scale, dx=speed_pw * pw * t_s))
+            pred = clf.predict(h_p, h_p, "Right", 8 * 33.33)
+            assert pred.pose == expect_pose, (
+                f"scale={scale}, speed_pw={speed_pw}: expected {expect_pose}, got {pred.pose}, dbg={clf.last_debug['Right']}"
+            )
+
+
+def test_approach_decay_time_based():
+    cfg = dict(load_config()["classifier"]["heuristic_3d"])
+    cfg["enable_motion_gate"] = False
+    open_dists = []
+    for fps in (30.0, 60.0):
+        clf = Heuristic3DPinchClassifier(cfg)
+        dt_ms = 1000.0 / fps
+        base = _make_open_hand()
+        # Frame 0: wide open
+        clf.predict(base, base, "Right", 0.0)
+        # Next 400ms: hold thumb moderately closer (still open, d_mid ~ 0.48 > 0.38)
+        semi = list(base)
+        semi[4] = Landmark(
+            x=base[12].x - 0.055,
+            y=base[12].y + 0.015,
+            z=base[12].z,
+        )
+        steps = int(round(0.40 * fps))
+        for i in range(1, steps + 1):
+            clf.predict(semi, semi, "Right", i * dt_ms)
+        open_dists.append(clf.last_debug["Right"]["open_dist"]["thumb_middle_pinch"])
+    assert abs(open_dists[0] - open_dists[1]) < 0.04, f"FPS-dependent decay mismatch: {open_dists}"
+
+
+def test_v050_regression_ddev_ft_not_worse():
+    ddev_files = sorted(Path("data/converted/negatives").glob("gctl_d_dev_*.json"))
+    if not ddev_files:
+        pytest.skip("Local converted D-dev corpus not present in workspace")
+    mod = _load_replay_eval_module("replay_eval_ddev_reg")
+    rep = mod.evaluate_recordings(
+        negative_paths=ddev_files,
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert rep["false_triggers"]["total"] <= 4, f"D-dev FT regressed above 4: {rep['false_triggers']}"
+
+
+def test_predict_exposes_gate_debug_blocked_reasons():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    # 1. Static contact -> approach blocked
+    clf_app = Heuristic3DPinchClassifier(cfg)
+    h_pinch = _pinch_middle_copy(_make_open_hand())
+    pred_app = clf_app.predict(h_pinch, h_pinch, "Right", 100.0)
+    assert pred_app.pose == PoseName.IDLE
+    dbg_app = clf_app.last_debug["Right"]
+    assert "approach" in dbg_app["blocked_reasons"]
+    assert "approach" in dbg_app["blocked_by"].get("thumb_middle_pinch", [])
+
+    # 2. Fast wrist swipe -> motion blocked
+    clf_mot = Heuristic3DPinchClassifier(cfg)
+    h0 = _make_open_hand()
+    clf_mot.predict(h0, h0, "Right", 0.0)
+    h1 = _pinch_middle_copy(_make_scaled_shifted_hand(1.0, dx=0.05))
+    pred_mot = clf_mot.predict(h1, h1, "Right", 33.0)
+    assert pred_mot.pose == PoseName.IDLE
+    dbg_mot = clf_mot.last_debug["Right"]
+    assert "motion" in dbg_mot["blocked_reasons"]
+    assert dbg_mot["eff_speed_pw"] > clf_mot.max_wrist_speed_pw
+    assert dbg_mot["palm_width_2d"] > 0.0
+
+
+def test_ft_jsonl_contains_gate_debug(tmp_path: Path):
+    import json
+
+    mod = _load_replay_eval_module("replay_eval_gate_dbg")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h_open = _make_open_hand(forward_z=-0.25)
+    h_pinch = _pinch_middle_copy(h_open)
+    # 6 open frames -> 3 pinched frames -> 6 open frames => intentional-looking left click on idle file
+    for i in range(6):
+        col.add_frame(h_open, h_open, "Right", 0.95, 1000 + i * 33)
+    for i in range(3):
+        col.add_frame(h_pinch, h_pinch, "Right", 0.95, 1000 + (6 + i) * 33)
+    for i in range(6):
+        col.add_frame(h_open, h_open, "Right", 0.95, 1000 + (9 + i) * 33)
+    neg_fp = col.save(tmp_path)
+
+    jsonl_fp = tmp_path / "ft_gate_dbg.jsonl"
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        ft_jsonl_path=jsonl_fp,
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert rep["false_triggers"]["total"] >= 1
+    lines = [json.loads(ln) for ln in jsonl_fp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    assert len(lines) >= 1
+    gd = lines[0].get("gate_debug")
+    assert isinstance(gd, dict)
+    for k in ("latched", "blocked_by", "blocked_reasons", "eff_speed_pw", "eff_ang_deg_s", "palm_width_2d", "open_dist"):
+        assert k in gd

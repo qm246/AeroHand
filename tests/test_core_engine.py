@@ -3836,11 +3836,22 @@ def test_promotion_check_script_rejects_insufficient_exposure():
     assert res_fail["criteria"]["runtime_guard_active"]["passed"] is True
 
     # Case 2: All criteria satisfied -> MUST pass!
+    zero_by_type = {
+        "left_click": 0,
+        "right_click": 0,
+        "drag_start": 0,
+        "scroll_stroke": 0,
+        "palm_wheel": 0,
+        "window_tile": 0,
+        "spaces_nav": 0,
+        "dictation_start": 0,
+    }
     good_sealed = {
         "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
         "false_triggers": {
             "hand_present_idle_hours": 1.60,
             "total_upper_bound_per_hour": 1.87,
+            "by_type": dict(zero_by_type),
         },
     }
     res_ok = promo_mod.check_onnx_promotion(
@@ -5146,7 +5157,20 @@ def test_promotion_stage_veto_does_not_require_subject_heldout():
     sealed_ok = {
         "model_hash": "c" * 24,
         "heldout_audit": {"touched": 1, "model_hash": "c" * 24},
-        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.60,
+            "total_upper_bound_per_hour": 1.87,
+            "by_type": {
+                "left_click": 0,
+                "right_click": 0,
+                "drag_start": 0,
+                "scroll_stroke": 0,
+                "palm_wheel": 0,
+                "window_tile": 0,
+                "spaces_nav": 0,
+                "dictation_start": 0,
+            },
+        },
     }
 
     res_veto = promo_mod.check_onnx_promotion(
@@ -5198,6 +5222,7 @@ def test_promotion_zero_ft_at_1p5h_borderline_passes():
                 "total": 0,
                 "hand_present_idle_hours": 1.5,
                 "total_upper_bound_per_hour": ucb_0_at_1p5,
+                "by_type": {k: 0 for k in replay_mod.ALL_TRIGGER_TYPES},
             },
         },
         latency_p95_ms=1.5,
@@ -5627,7 +5652,20 @@ def test_promotion_fails_when_vitals_lacks_hash():
         "model_hash": "e" * 24,
         "model_sha256": "f" * 64,
         "heldout_audit": {"touched": 1, "model_hash": "e" * 24, "model_sha256": "f" * 64},
-        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.60,
+            "total_upper_bound_per_hour": 1.87,
+            "by_type": {
+                "left_click": 0,
+                "right_click": 0,
+                "drag_start": 0,
+                "scroll_stroke": 0,
+                "palm_wheel": 0,
+                "window_tile": 0,
+                "spaces_nav": 0,
+                "dictation_start": 0,
+            },
+        },
     }
     vitals_no_hash = {"classifier": {"onnx_p95_ms": 1.2, "guard_active": True, "fell_back": False}}
 
@@ -5651,7 +5689,20 @@ def test_promotion_fails_when_vitals_hash_differs():
         "model_hash": "e" * 24,
         "model_sha256": "f" * 64,
         "heldout_audit": {"touched": 1, "model_hash": "e" * 24, "model_sha256": "f" * 64},
-        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.60,
+            "total_upper_bound_per_hour": 1.87,
+            "by_type": {
+                "left_click": 0,
+                "right_click": 0,
+                "drag_start": 0,
+                "scroll_stroke": 0,
+                "palm_wheel": 0,
+                "window_tile": 0,
+                "spaces_nav": 0,
+                "dictation_start": 0,
+            },
+        },
     }
     vitals_wrong = {
         "classifier": {
@@ -6879,3 +6930,153 @@ def test_data_audit_reports_clean_partial_corpus_and_allow_partial_exit(tmp_path
     assert exc_strict.value.code != 0
 
     audit_mod.main(["--sessions", str(sess_dir), "--recall", str(recall_dir), "--allow-partial", "--json"])
+
+
+# ==============================================================================
+# V060-03: Tiered False-Trigger Ceilings (Tier A <= 2/h, B <= 6/h, C <= 6/h)
+# ==============================================================================
+
+
+def test_tiered_ft_ucb_gate_and_promotion_checks():
+    from aerohand.core.types import ALL_POSE_NAMES
+
+    replay_mod = _load_replay_eval_module("replay_eval_v060_03_tiers")
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "promo_v060_03_tiers")
+
+    cfg = load_config()
+    assert "eval" in cfg and "ft_tiers" in cfg["eval"]
+    assert cfg["eval"]["ft_tiers"]["A"]["max_ucb_per_hour"] == pytest.approx(2.0)
+    assert cfg["eval"]["ft_tiers"]["B"]["max_ucb_per_hour"] == pytest.approx(6.0)
+    assert cfg["eval"]["ft_tiers"]["C"]["max_ucb_per_hour"] == pytest.approx(6.0)
+
+    all_high = {p.value: {"precision": 0.99, "recall": 0.99, "f1": 0.99, "support": 500} for p in ALL_POSE_NAMES}
+    metrics_ok = {"model_hash": "a" * 24, "subject_heldout_metrics": {"per_class": all_high}}
+
+    def _by_type(**overrides: int) -> dict[str, int]:
+        base = {k: 0 for k in replay_mod.ALL_TRIGGER_TYPES}
+        base.update(overrides)
+        return base
+
+    # 1. At 1.5h: 0 Tier A, 3 Tier B (UCB=5.169<=6), 3 Tier C (UCB=5.169<=6) -> MUST PASS!
+    sealed_pass = {
+        "model_hash": "a" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.5,
+            "total": 6,
+            "by_type": _by_type(scroll_stroke=3, dictation_start=3),
+        },
+    }
+    res_pass = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok,
+        sealed_eval_report=sealed_pass,
+        latency_p95_ms=1.2,
+        config=cfg,
+        stage="veto",
+    )
+    assert res_pass["passed"] is True
+    tiers = res_pass["criteria"]["sealed_negatives_ft_ucb"]["tiers"]
+    assert tiers["A"]["passed"] is True and tiers["A"]["count"] == 0
+    assert tiers["B"]["passed"] is True and tiers["B"]["count"] == 3
+    assert tiers["C"]["passed"] is True and tiers["C"]["count"] == 3
+
+    # 2. At 1.5h: 1 Tier A click (UCB=3.163 > 2.0) -> MUST FAIL!
+    sealed_fail_a = {
+        "model_hash": "a" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.5,
+            "total": 1,
+            "by_type": _by_type(left_click=1),
+        },
+    }
+    res_a = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok, sealed_eval_report=sealed_fail_a, latency_p95_ms=1.2, config=cfg, stage="veto"
+    )
+    assert res_a["passed"] is False
+    assert res_a["criteria"]["sealed_negatives_ft_ucb"]["tiers"]["A"]["passed"] is False
+
+    # 3. At 1.5h: 4 Tier B scroll (UCB=6.102 > 6.0) -> MUST FAIL!
+    sealed_fail_b = {
+        "model_hash": "a" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
+        "false_triggers": {
+            "hand_present_idle_hours": 1.5,
+            "total": 4,
+            "by_type": _by_type(scroll_stroke=4),
+        },
+    }
+    res_b = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok, sealed_eval_report=sealed_fail_b, latency_p95_ms=1.2, config=cfg, stage="veto"
+    )
+    assert res_b["passed"] is False
+    assert res_b["criteria"]["sealed_negatives_ft_ucb"]["tiers"]["B"]["passed"] is False
+
+    # 4. Missing `by_type` -> MUST FAIL explicitly (no silent pooled fallback)!
+    sealed_no_by_type = {
+        "model_hash": "a" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
+        "false_triggers": {"hand_present_idle_hours": 1.6, "total": 0, "total_upper_bound_per_hour": 1.87},
+    }
+    res_missing = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok, sealed_eval_report=sealed_no_by_type, latency_p95_ms=1.2, config=cfg, stage="veto"
+    )
+    assert res_missing["passed"] is False
+    assert "by_type" in res_missing["criteria"]["sealed_negatives_ft_ucb"]["detail"]
+
+    # 5. Unknown trigger type in `by_type` -> MUST FAIL explicitly!
+    bad_bt = _by_type()
+    bad_bt["unmapped_trigger"] = 1
+    sealed_unknown = {
+        "model_hash": "a" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
+        "false_triggers": {"hand_present_idle_hours": 1.6, "total": 1, "by_type": bad_bt},
+    }
+    res_unk = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok, sealed_eval_report=sealed_unknown, latency_p95_ms=1.2, config=cfg, stage="veto"
+    )
+    assert res_unk["passed"] is False
+    assert "unknown" in res_unk["criteria"]["sealed_negatives_ft_ucb"]["detail"].lower()
+
+    # 6. Config override of `eval.ft_tiers` is respected!
+    strict_cfg = load_config()
+    strict_cfg["eval"]["ft_tiers"]["B"]["max_ucb_per_hour"] = 4.0
+    res_ovr = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok, sealed_eval_report=sealed_pass, latency_p95_ms=1.2, config=strict_cfg, stage="veto"
+    )
+    assert res_ovr["passed"] is False
+    assert res_ovr["criteria"]["sealed_negatives_ft_ucb"]["tiers"]["B"]["passed"] is False
+
+
+def test_replay_eval_emits_tiered_ft_report_and_respects_config_override(tmp_path: Path):
+    import json
+
+    replay_mod = _load_replay_eval_module("replay_eval_v060_03_rep")
+    h = _make_open_hand(forward_z=-0.25)
+    flat = [c for lm in h for c in (lm.x, lm.y, lm.z)]
+    samples = [
+        {
+            "timestamp_ms": i * 33,
+            "label": 0,
+            "label_name": "idle",
+            "handedness": "Right",
+            "hand_id": "Right",
+            "confidence": 0.95,
+            "landmarks_2d": flat,
+            "world_landmarks": flat,
+        }
+        for i in range(15)
+    ]
+    fp = tmp_path / "idle_short.json"
+    fp.write_text(
+        json.dumps({"schema": "aerohand_pinch_v2", "session_meta": {"subject": "minh"}, "samples": samples}),
+        encoding="utf-8",
+    )
+    cfg = load_config()
+    cfg["eval"]["ft_tiers"]["A"]["max_ucb_per_hour"] = 1.5
+    rep = replay_mod.evaluate_recordings(negative_paths=[fp], config=cfg, min_exposure_hours_for_claim=0.0)
+    tiers = rep["false_triggers"]["tiers"]
+    assert set(tiers.keys()) == {"A", "B", "C"}
+    assert tiers["A"]["max_ucb_per_hour"] == pytest.approx(1.5)
+    assert tiers["A"]["count"] == 0
+    assert "garwood_exposure_table" in tiers["A"]

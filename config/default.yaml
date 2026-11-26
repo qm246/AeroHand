@@ -160,6 +160,19 @@ collector:
   recall_dir: "data/recall"            # Cued event-level recall sessions (excluded from train/FT replay)
   negative_window_s: 3.0               # Capture +/- 1.5s around the last false trigger
 
+eval:
+  min_exposure_hours: 1.5              # Minimum hand-present idle hours for sealed FT UCB claims
+  ft_tiers:
+    A:
+      triggers: ["left_click", "right_click", "drag_start", "window_tile", "spaces_nav", "palm_wheel"]
+      max_ucb_per_hour: 2.0            # High-impact actions: 0 events allowed at 1.5h (95% Garwood UCB)
+    B:
+      triggers: ["scroll_stroke"]
+      max_ucb_per_hour: 6.0            # Reversible scroll strokes: <= 3 events allowed at 1.5h
+    C:
+      triggers: ["dictation_start"]
+      max_ucb_per_hour: 6.0            # Dictation arming (protected by RMS/duration filter): <= 3 at 1.5h
+
 pose_state_machine:
   pose_hold_threshold_ms: 180
   pose_hold_motion_threshold_px: 15.0

@@ -61,6 +61,126 @@ ALL_TRIGGER_TYPES: Tuple[str, ...] = (
     "dictation_start",
 )
 
+DEFAULT_FT_TIERS: Dict[str, Dict[str, Any]] = {
+    "A": {
+        "triggers": ["left_click", "right_click", "drag_start", "window_tile", "spaces_nav", "palm_wheel"],
+        "max_ucb_per_hour": 2.0,
+    },
+    "B": {
+        "triggers": ["scroll_stroke"],
+        "max_ucb_per_hour": 6.0,
+    },
+    "C": {
+        "triggers": ["dictation_start"],
+        "max_ucb_per_hour": 6.0,
+    },
+}
+
+
+def resolve_ft_tiers(config: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+    """Resolve tiered FT UCB ceiling config from `config['eval']['ft_tiers']` (V060-03)."""
+    raw_tiers = ((config or {}).get("eval") or {}).get("ft_tiers")
+    if not isinstance(raw_tiers, dict) or not raw_tiers:
+        return deepcopy(DEFAULT_FT_TIERS)
+    resolved: Dict[str, Dict[str, Any]] = {}
+    for tier_name, spec in raw_tiers.items():
+        if not isinstance(spec, dict):
+            raise ValueError(f"eval.ft_tiers.{tier_name} must be a mapping")
+        trigs = [str(t).strip() for t in (spec.get("triggers") or []) if str(t).strip()]
+        if not trigs:
+            raise ValueError(f"eval.ft_tiers.{tier_name}.triggers must be a non-empty list")
+        max_ucb = float(spec.get("max_ucb_per_hour", 2.0))
+        if max_ucb <= 0.0:
+            raise ValueError(f"eval.ft_tiers.{tier_name}.max_ucb_per_hour must be > 0 (got {max_ucb})")
+        resolved[str(tier_name)] = {"triggers": trigs, "max_ucb_per_hour": max_ucb}
+    return resolved
+
+
+def evaluate_tiered_ft_ucb(
+    by_type: Any,
+    exposure_hours: float,
+    tiers_cfg: Dict[str, Dict[str, Any]],
+    *,
+    ci_level: float = 0.95,
+) -> Dict[str, Any]:
+    """
+    Evaluate pooled per-tier 95% Garwood Poisson UCB ceilings (V060-03).
+    Fails loudly if `by_type` is missing, contains unknown trigger types not mapped to any tier,
+    or omits any trigger listed in the configured tiers.
+    """
+    errors: List[str] = []
+    if not isinstance(by_type, dict) or not by_type:
+        return {
+            "passed": False,
+            "tiers": {},
+            "unknown_triggers": [],
+            "missing_triggers": [],
+            "errors": ["missing false_triggers.by_type per-trigger breakdown"],
+        }
+
+    mapped_triggers: set[str] = set()
+    for spec in tiers_cfg.values():
+        mapped_triggers.update(spec["triggers"])
+
+    unknown_triggers = sorted(str(k) for k in by_type.keys() if str(k) not in mapped_triggers)
+    missing_triggers = sorted(t for t in mapped_triggers if t not in by_type)
+    if unknown_triggers:
+        errors.append(f"unknown trigger type(s) not mapped to any tier: {unknown_triggers}")
+    if missing_triggers:
+        errors.append(f"missing trigger count(s) in false_triggers.by_type: {missing_triggers}")
+
+    tiers_out: Dict[str, Dict[str, Any]] = {}
+    all_tiers_ok = True
+    for tier_name, spec in tiers_cfg.items():
+        trigs = list(spec["triggers"])
+        max_ucb = float(spec["max_ucb_per_hour"])
+        cnt = 0
+        tier_valid = True
+        for t in trigs:
+            if t not in by_type:
+                tier_valid = False
+                continue
+            val = by_type[t]
+            if not isinstance(val, (int, float)) or int(val) < 0:
+                errors.append(f"invalid count for trigger '{t}': {val!r}")
+                tier_valid = False
+                continue
+            cnt += int(val)
+        rate = (
+            0.0
+            if cnt == 0
+            else (float("inf") if exposure_hours <= 1e-9 else round(float(cnt) / exposure_hours, 3))
+        )
+        ucb = poisson_upper_bound_rate(cnt, exposure_hours, ci_level=ci_level)
+        tier_pass = bool(tier_valid and (ucb <= max_ucb + 1e-9))
+        if not tier_pass:
+            all_tiers_ok = False
+            if tier_valid:
+                errors.append(
+                    f"Tier {tier_name} UCB={ucb:.3f}/h (count={cnt}) exceeds ceiling {max_ucb:.2f}/h"
+                )
+        tiers_out[tier_name] = {
+            "triggers": trigs,
+            "count": cnt,
+            "rate_per_hour": rate,
+            "upper_bound_per_hour": ucb,
+            "max_ucb_per_hour": max_ucb,
+            "passed": tier_pass,
+            "garwood_exposure_table": {
+                f"k={k}": required_exposure_hours(k, max_ucb=max_ucb, ci_level=ci_level)
+                for k in (0, 1, 2, 3, 4)
+            },
+        }
+
+    overall_ok = bool(all_tiers_ok and not unknown_triggers and not missing_triggers and not errors)
+    return {
+        "passed": overall_ok,
+        "tiers": tiers_out,
+        "unknown_triggers": unknown_triggers,
+        "missing_triggers": missing_triggers,
+        "errors": errors,
+    }
+
 
 def _collect_json_paths(inputs: Sequence[str | Path]) -> List[Path]:
     return collect_json_paths(inputs)
@@ -173,7 +293,7 @@ def evaluate_recordings(
     backend_name: str = "heuristic_3d",
     width: float = 1920.0,
     height: float = 1080.0,
-    max_ft_per_hour: float = 2.0,
+    max_ft_per_hour: Optional[float] = None,
     ci_level: float = 0.95,
     min_exposure_hours_for_claim: float = 1.5,
     baseline: Optional[Dict[str, Any]] = None,
@@ -453,10 +573,17 @@ def evaluate_recordings(
             }
         )
 
+    tiers_cfg = resolve_ft_tiers(base_cfg)
+    tiered = evaluate_tiered_ft_ucb(ft_by_type, idle_hours, tiers_cfg, ci_level=ci_level)
     total_ucb = poisson_upper_bound_rate(total_ft, idle_hours, ci_level=ci_level)
+    tightest_cap = (
+        float(max_ft_per_hour)
+        if max_ft_per_hour is not None
+        else min(float(spec["max_ucb_per_hour"]) for spec in tiers_cfg.values())
+    )
     required_for_target = (
-        poisson_upper_bound_count(0, ci_level=ci_level) / float(max_ft_per_hour)
-        if max_ft_per_hour > 0.0
+        poisson_upper_bound_count(0, ci_level=ci_level) / tightest_cap
+        if tightest_cap > 0.0
         else float("inf")
     )
     eff_min_exp = (
@@ -477,8 +604,11 @@ def evaluate_recordings(
         "right_clicks": ft_by_type["right_click"],
         "drags": ft_by_type["drag_start"],
         "dictation_starts": ft_by_type["dictation_start"],
-        # Complete 8-trigger breakdown (V041-03)
+        # Complete 8-trigger breakdown (V041-03) & tiered ceilings (V060-03)
         "by_type": dict(ft_by_type),
+        "tiers": tiered["tiers"],
+        "tiers_passed": tiered["passed"],
+        "tiers_errors": tiered["errors"],
         "total": total_ft,
         "ci_level": float(ci_level),
         "idle_duration_s": round(idle_duration_ms / 1000.0, 3),
@@ -535,8 +665,11 @@ def evaluate_recordings(
             "regressed_macro_f1": regressed_f1,
         }
 
-    # Gate on UPPER CONFIDENCE BOUND and sufficient exposure (V041-01)
-    ft_ok = (total_ucb <= float(max_ft_per_hour)) and exposure_sufficient
+    # Gate on tiered 95% UCB ceilings by default (V060-03), or explicit legacy max_ft_per_hour override
+    if max_ft_per_hour is None:
+        ft_ok = bool(tiered["passed"]) and exposure_sufficient
+    else:
+        ft_ok = (total_ucb <= float(max_ft_per_hour)) and exposure_sufficient
     passed = bool(ft_ok and (not regressed_f1))
 
     return {
@@ -549,7 +682,7 @@ def evaluate_recordings(
         "false_triggers": ft_report,
         "click_anchor_stats": anchor_stats,
         "baseline_diff": baseline_diff,
-        "max_ft_per_hour": float(max_ft_per_hour),
+        "max_ft_per_hour": float(tightest_cap),
         "ci_level": float(ci_level),
         "min_exposure_hours_for_claim": float(min_exposure_hours_for_claim),
         "passed": passed,
@@ -608,7 +741,7 @@ def evaluate_sealed_heldout(
     normalizer_path: Optional[str | Path] = None,
     model_hash: Optional[str] = None,
     force_idle: bool = False,
-    max_ft_per_hour: float = 2.0,
+    max_ft_per_hour: Optional[float] = None,
     ci_level: float = 0.95,
     min_exposure_hours_for_claim: float = 1.5,
     baseline: Optional[Dict[str, Any]] = None,
@@ -714,7 +847,12 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--normalizer", type=str, default=None, help="Path to normalizer JSON (for onnx_tcn)")
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config path")
     parser.add_argument("--baseline", type=str, default=None, help="Optional baseline JSON report for regression diff")
-    parser.add_argument("--max-ft-per-hour", type=float, default=2.0, help="Fail if FT upper confidence bound exceeds this cap")
+    parser.add_argument(
+        "--max-ft-per-hour",
+        type=float,
+        default=None,
+        help="Optional legacy pooled FT UCB override (default: use tiered eval.ft_tiers ceilings)",
+    )
     parser.add_argument("--ci-level", type=float, default=0.95, help="One-sided Poisson confidence level for FT upper bound (default 0.95)")
     parser.add_argument(
         "--min-exposure-hours-for-claim",

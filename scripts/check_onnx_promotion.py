@@ -240,7 +240,7 @@ def check_onnx_promotion(
             "detail": c1_detail,
         }
 
-    # Criterion 2: Sealed negatives FT 95% UCB <= 2.0/h over >= 1.5h hand-present idle exposure
+    # Criterion 2: Tiered sealed negatives FT 95% UCB ceilings (V060-03: Tier A<=2/h, B<=6/h, C<=6/h)
     ft = sealed_eval_report.get("false_triggers") or {}
     exp_h = float(ft.get("hand_present_idle_hours", 0.0))
     if ft.get("total_upper_bound_per_hour") is not None:
@@ -251,33 +251,54 @@ def check_onnx_promotion(
         ucb = float("inf")
     has_sealed_audit = isinstance(ho_audit, dict) and int(ho_audit.get("touched", 0)) >= 1
 
+    eval_cfg = cfg.get("eval") or {}
+    eff_min_exp = float(eval_cfg.get("min_exposure_hours", min_exposure_hours))
+    tiers_cfg = replay_mod.resolve_ft_tiers(cfg)
+    tiered = replay_mod.evaluate_tiered_ft_ucb(ft.get("by_type"), exp_h, tiers_cfg)
+
+    tier_a_cap = float((tiers_cfg.get("A") or {}).get("max_ucb_per_hour", max_ft_ucb_per_hour))
     garwood_table = {
-        f"k={k}": replay_mod.required_exposure_hours(k, max_ucb=max_ft_ucb_per_hour)
+        f"k={k}": replay_mod.required_exposure_hours(k, max_ucb=tier_a_cap)
         for k in (0, 1, 2, 3)
     }
+    tier_garwood_tables = {
+        t_name: {
+            f"k={k}": replay_mod.required_exposure_hours(k, max_ucb=float(spec["max_ucb_per_hour"]))
+            for k in (0, 1, 2, 3, 4)
+        }
+        for t_name, spec in tiers_cfg.items()
+    }
     exposure_note = (
-        f"UCB <= {max_ft_ucb_per_hour:.1f}/h at {min_exposure_hours:.1f}h requires 0 FT "
+        f"Tier A UCB <= {tier_a_cap:.1f}/h at {eff_min_exp:.1f}h requires 0 FT "
         f"(Garwood 95% min exposure: k=0 -> {garwood_table['k=0']:.2f}h, "
-        f"k=1 -> {garwood_table['k=1']:.2f}h, k=2 -> {garwood_table['k=2']:.2f}h)."
+        f"k=1 -> {garwood_table['k=1']:.2f}h, k=2 -> {garwood_table['k=2']:.2f}h); "
+        f"Tier B/C UCB <= 6.0/h allows <= 3 FT at {eff_min_exp:.1f}h."
     )
 
     c2_reasons: List[str] = []
     if not has_sealed_audit:
         c2_reasons.append("missing sealed heldout_audit (must come from `replay_eval.py --heldout`)")
-    if exp_h + 1e-9 < float(min_exposure_hours):
-        c2_reasons.append(f"hand_present_idle_hours={exp_h:.4f}h < {min_exposure_hours:.2f}h")
-    if ucb > float(max_ft_ucb_per_hour) + 1e-9:
-        c2_reasons.append(f"total_upper_bound_per_hour={ucb:.3f}/h > {max_ft_ucb_per_hour:.2f}/h")
+    if exp_h + 1e-9 < eff_min_exp:
+        c2_reasons.append(f"hand_present_idle_hours={exp_h:.4f}h < {eff_min_exp:.2f}h")
+    if not tiered["passed"]:
+        c2_reasons.extend(tiered["errors"])
     c2_pass = len(c2_reasons) == 0
+    tier_req_desc = ", ".join(
+        f"Tier {tn} <= {float(sp['max_ucb_per_hour']):.1f}/h" for tn, sp in tiers_cfg.items()
+    )
     criteria["sealed_negatives_ft_ucb"] = {
         "passed": c2_pass,
         "hand_present_idle_hours": round(exp_h, 6),
         "total_upper_bound_per_hour": round(ucb, 3) if np.isfinite(ucb) else None,
         "has_sealed_audit": has_sealed_audit,
+        "tiers": tiered["tiers"],
+        "unknown_triggers": tiered["unknown_triggers"],
+        "missing_triggers": tiered["missing_triggers"],
         "garwood_exposure_table": garwood_table,
+        "tier_garwood_tables": tier_garwood_tables,
         "note": exposure_note,
-        "required": f"sealed UCB <= {max_ft_ucb_per_hour:.2f}/h over >= {min_exposure_hours:.2f}h",
-        "detail": "Passed sealed FT UCB and exposure gate." if c2_pass else "; ".join(c2_reasons),
+        "required": f"sealed {tier_req_desc} over >= {eff_min_exp:.2f}h",
+        "detail": "Passed tiered sealed FT UCB and exposure gate." if c2_pass else "; ".join(c2_reasons),
     }
 
     # Criterion 3: M1 CPU p95 latency < 3.0 ms

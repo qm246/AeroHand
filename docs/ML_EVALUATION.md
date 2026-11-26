@@ -1,4 +1,4 @@
-# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.2)
+# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.3)
 
 Tài liệu này quy định quy trình thu thập dữ liệu, huấn luyện Causal 1D-TCN, đánh giá A/B giữa hai tập đặc trưng (`invariant348` và `airmouse885`), kiểm thử hồi quy ngoại tuyến (`replay_eval.py`) và triển khai an toàn qua Shadow Mode.
 
@@ -210,3 +210,14 @@ Hoàn tất 5 hạng mục theo **Plan v5** trước khi bắt đầu thu bằng
   - `recording_io.exclude_sealed_content` tìm `sealed_manifest.json` trong `data_root`, `--sealed-root` (hỗ trợ ở `train_tcn.py`, `replay_eval.py`, `domain_check.py`) và các thư mục cha của đầu vào, đồng thời cảnh báo rõ khi tìm thấy `0` manifest.
   - `replay_eval.compute_eval_model_hash("heuristic_3d", ...)` chỉ băm `classifier.heuristic_3d` + `smoothing` + mã nguồn `heuristic_3d.py` & `palm_frame.py` (không đổi hash khi chỉnh `veto_*`).
   - `runtime._swap_classifier_async` dùng khóa `_classifier_swap_lock` + `engine._classifier_lock` (`RLock`) để export counter sát lúc hoán đổi và loại bỏ thế hệ nạp cũ bị trễ.
+
+### Bản vá ổn định `v0.5.3` (`V053-01` → `V053-06` — Plan v6)
+
+Mọi lỗi `B1`–`B5` đều được tái hiện bằng test đỏ trên `56fee6a` trước khi sửa:
+
+- **Bảo vệ latch giữ lâu dưới fist guard (`V053-01` / B1)**: thêm `classifier.heuristic_3d.fist_guard_protect_latch_ms: 500.0`. Khi `is_full_curled_fist` (cả 4 ngón `< 0.72`), chỉ xóa latch trẻ (`< 500 ms`), giữ nguyên latch giữ lâu và chỉ chấm điểm các pose được bảo vệ (không cho chốt latch mới). Đã kiểm chứng trên kịch bản tổng hợp drag/dictation giữ ≥ 600 ms và nắm tay chậm (`close_frames=15`); *lưu ý: drag mới kiểm bằng dữ liệu tổng hợp, chưa kiểm trên bản ghi drag thật*.
+- **Đồng nhất bộ đếm nuốt sự kiện & khung chờ giữa `veto` và `shadow` (`V053-02` / B2)**: bổ sung `veto_swallowed_events`, `veto_pending_frames`, `shadow_would_swallow_events`, `shadow_would_pending_frames` (kèm `export_counters`/`import_counters` và telemetry heuristic). Chốt sự kiện chưa `accepted` đã qua khung `ready` khi về `idle`, đổi pose hoặc `reset(hand)` (không chốt khi `reset(None)`), đồng thời ghi `_last_veto_by_hand` để `veto_retried_within_1s` bắt được lần thử lại.
+- **Abstain nhất quán lúc warm-up (`V053-03` / B3)**: khi gặp khung `ready=False` lúc chưa thấy khung `ready` nào trong sự kiện → cho pose heuristic đi qua và đánh dấu `accepted` (scope `entry`) để không tách thành 2 nhịp/double-click khi buffer đầy; nếu đã thấy `ready` nhưng chưa `accepted` → tiếp tục trả `idle` và giữ nguyên `approve_streak`. *(Đánh đổi chấp nhận ở `v0.5.3`, sẽ đo lại ở `V060-04` khi `seq_len=15`.)*
+- **Chống ghi đè cấu hình khi đang nạp ONNX nền (`V053-04` / B4)**: khi luồng `_swap_classifier_async` còn sống mà có thay đổi cấu hình classifier → bỏ qua nhánh in-place để đi qua rebuild (tăng `_classifier_swap_gen`), loại bỏ hoàn toàn thế hệ nạp cũ.
+- **Chặn rào held-out hỏng im lặng (`V053-05` / B5)**: gom bộ đọc chung `read_sealed_manifest_hashes` tại `aerohand/ml/recording_io.py`, `raise ValueError` kèm đường dẫn nếu `sealed_manifest.json` lỗi JSON hoặc có `0` mã SHA-256 hợp lệ.
+- **Nghiệm thu macOS M1 Pro**: `ruff` 0 lỗi, **199 passed**, i18n `vi`↔`en` khớp `15/15`, `D-dev` giữ nguyên **4 FT** (`32,33/h`, UCB `73,99/h`), `T-dev` giữ nguyên **17 FT** (`100,60/h`, UCB `150,89/h`), positives cục bộ giữ nguyên (`145s: 4 fr/1 bout`; `250s: 177 fr/28 bouts`).

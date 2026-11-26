@@ -1,4 +1,4 @@
-# AeroHand v0.5.2 — Canonical Default Configuration
+# AeroHand v0.5.3 — Canonical Default Configuration
 # User customizations are persisted as minimal deltas in `config/user_overrides.yaml`.
 
 ui:

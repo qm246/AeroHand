@@ -1,3 +1,3 @@
 """AeroHand — Low-latency touchless macOS hand controller (Airpoint parity × GestureCtl safety)."""
 
-__version__ = "0.5.2"
+__version__ = "0.5.3"

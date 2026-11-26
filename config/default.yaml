@@ -12,6 +12,7 @@ ui:
   show_palm_wheel_overlay: true        # On-screen 5-petal radial menu overlay
   palm_wheel_fixed: false              # false = follow palm position, true = center screen
   show_window_tile_preview: true       # Frosted glass snap-zone preview before release
+  show_collector_overlay: true         # Large floating top-center teleprompter while recording in ML Studio
   enable_tracking_warnings: true       # Smart warnings: low light, too far/close, edge
   hints:
     click: false

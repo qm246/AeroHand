@@ -135,11 +135,135 @@
   .pw-finger-tag { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.6px; color: #94a3b8; }
   .pw-slot-label { font-size: 12px; font-weight: 600; color: #f8fafc; text-align: center; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 110px; }
   .pw-sub-badge { font-size: 9px; color: #60a5fa; font-weight: 600; }
+
+  /* 5. ML Studio Floating Teleprompter Recording Guide (Top-Center, Right Below Webcam) */
+  #collector-guide {
+    display: none;
+    width: min(760px, 88vw);
+    padding: 20px 28px 18px;
+    border-radius: 22px;
+    background: rgba(10, 15, 28, 0.92);
+    border: 2.5px solid rgba(45, 212, 191, 0.72);
+    box-shadow: 0 18px 54px rgba(0, 0, 0, 0.62), 0 0 36px rgba(45, 212, 191, 0.22);
+    backdrop-filter: blur(22px);
+    -webkit-backdrop-filter: blur(22px);
+    color: #f8fafc;
+    transition: border-color 140ms ease, box-shadow 140ms ease;
+  }
+  #collector-guide.visible { display: block; }
+  #collector-guide.state-rec {
+    border-color: rgba(251, 113, 133, 0.92);
+    box-shadow: 0 18px 54px rgba(0, 0, 0, 0.65), 0 0 42px rgba(251, 113, 133, 0.34);
+  }
+  #collector-guide.state-cue {
+    border-color: rgba(251, 191, 36, 0.95);
+    box-shadow: 0 18px 54px rgba(0, 0, 0, 0.65), 0 0 46px rgba(251, 191, 36, 0.36);
+  }
+  #collector-guide.state-done {
+    border-color: rgba(52, 211, 153, 0.92);
+    box-shadow: 0 18px 54px rgba(0, 0, 0, 0.62), 0 0 38px rgba(52, 211, 153, 0.30);
+  }
+  .cg-top {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    margin-bottom: 12px; flex-wrap: wrap;
+  }
+  .cg-badges { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .cg-pill {
+    display: inline-flex; align-items: center; gap: 7px;
+    padding: 5px 12px; border-radius: 999px;
+    font-size: 13px; font-weight: 700; letter-spacing: 0.45px; text-transform: uppercase;
+    background: rgba(45, 212, 191, 0.18); color: #5eead4;
+    border: 1px solid rgba(45, 212, 191, 0.40);
+  }
+  #collector-guide.state-rec .cg-pill.main {
+    background: rgba(251, 113, 133, 0.24); color: #fda4af; border-color: rgba(251, 113, 133, 0.55);
+  }
+  #collector-guide.state-cue .cg-pill.main {
+    background: rgba(251, 191, 36, 0.24); color: #fde68a; border-color: rgba(251, 191, 36, 0.60);
+  }
+  #collector-guide.state-done .cg-pill.main {
+    background: rgba(52, 211, 153, 0.24); color: #6ee7b7; border-color: rgba(52, 211, 153, 0.55);
+  }
+  .cg-pill.dry {
+    background: rgba(251, 191, 36, 0.20); color: #fcd34d; border-color: rgba(251, 191, 36, 0.50);
+  }
+  .cg-pill.step {
+    background: rgba(255, 255, 255, 0.09); color: #e2e8f0; border-color: rgba(255, 255, 255, 0.18);
+  }
+  .cg-meta {
+    font-size: 13px; font-weight: 600; color: #94a3b8;
+  }
+  .cg-dot {
+    width: 10px; height: 10px; border-radius: 999px; background: #2dd4bf;
+  }
+  #collector-guide.state-rec .cg-dot { background: #fb7185; animation: blink 0.8s infinite; }
+  #collector-guide.state-cue .cg-dot { background: #fbbf24; animation: blink 0.65s infinite; }
+  #collector-guide.state-done .cg-dot { background: #34d399; animation: none; }
+  .cg-body {
+    display: flex; align-items: center; justify-content: space-between; gap: 22px;
+  }
+  .cg-text { flex: 1; min-width: 0; }
+  .cg-title {
+    font-size: 34px; font-weight: 800; line-height: 1.15; letter-spacing: -0.4px;
+    color: #ffffff; margin-bottom: 6px;
+  }
+  #collector-guide.state-cue .cg-title { color: #fef08a; }
+  .cg-sub {
+    font-size: 19px; font-weight: 500; line-height: 1.35; color: #e2e8f0;
+  }
+  .cg-timer {
+    font-size: 46px; font-weight: 800; font-variant-numeric: tabular-nums;
+    letter-spacing: -1px; color: #5eead4; min-width: 104px; text-align: right;
+  }
+  #collector-guide.state-rec .cg-timer { color: #fda4af; }
+  #collector-guide.state-cue .cg-timer { color: #fde047; }
+  #collector-guide.state-done .cg-timer { color: #6ee7b7; font-size: 36px; }
+  .cg-progress-track {
+    margin-top: 14px; height: 8px; border-radius: 999px;
+    background: rgba(255, 255, 255, 0.12); overflow: hidden;
+  }
+  .cg-progress-fill {
+    height: 100%; width: 0%; border-radius: 999px;
+    background: linear-gradient(90deg, #2dd4bf, #60a5fa);
+    transition: width 80ms linear;
+  }
+  #collector-guide.state-rec .cg-progress-fill { background: linear-gradient(90deg, #fb7185, #f43f5e); }
+  #collector-guide.state-cue .cg-progress-fill { background: linear-gradient(90deg, #fbbf24, #f59e0b); }
+  #collector-guide.state-done .cg-progress-fill { background: linear-gradient(90deg, #34d399, #10b981); width: 100%; }
+  .cg-footer {
+    margin-top: 12px; display: flex; align-items: center; justify-content: space-between;
+    gap: 14px; font-size: 14px; font-weight: 600; color: #cbd5e1; flex-wrap: wrap;
+  }
+  .cg-hand-ok { color: #6ee7b7; }
+  .cg-hand-miss { color: #fbbf24; font-weight: 700; }
+  .cg-next { color: #94a3b8; font-weight: 500; }
 </style>
 </head>
 <body>
   <div id="tile-preview"><div class="tile-badge" id="tile-badge"></div></div>
   <div id="toast-stack">
+    <div id="collector-guide">
+      <div class="cg-top">
+        <div class="cg-badges">
+          <span class="cg-pill main"><span class="cg-dot"></span><span id="cg-mode-lbl"></span></span>
+          <span class="cg-pill dry" id="cg-dry-pill" style="display:none">DRY-RUN</span>
+          <span class="cg-pill step" id="cg-step-pill"></span>
+        </div>
+        <div class="cg-meta" id="cg-meta-lbl"></div>
+      </div>
+      <div class="cg-body">
+        <div class="cg-text">
+          <div class="cg-title" id="cg-title"></div>
+          <div class="cg-sub" id="cg-sub"></div>
+        </div>
+        <div class="cg-timer" id="cg-timer"></div>
+      </div>
+      <div class="cg-progress-track" id="cg-prog-wrap"><div class="cg-progress-fill" id="cg-prog-fill"></div></div>
+      <div class="cg-footer">
+        <span id="cg-hand-status"></span>
+        <span class="cg-next" id="cg-next-lbl"></span>
+      </div>
+    </div>
     <div id="hint-toast" class="toast-pill"><span class="dot"></span><span id="hint-text"></span></div>
     <div id="dict-toast" class="toast-pill dictation">
       <span class="dot"></span>
@@ -164,6 +288,7 @@
     show_palm_wheel_overlay: true,
     palm_wheel_fixed: false,
     show_window_tile_preview: true,
+    show_collector_overlay: true,
     enable_tracking_warnings: true,
     hints: {},
   };
@@ -339,7 +464,155 @@
 
     // 6. On-Screen Palm Wheel Radial Menu
     renderPalmWheels(snap.palm_wheels, ui, i18n, lang);
+
+    // 7. ML Studio Floating Teleprompter Recording Guide
+    renderCollectorGuide(snap.collector_guide, ui, i18n, lang);
   };
+
+  function renderCollectorGuide(cg, ui, i18n, lang) {
+    const root = document.getElementById("collector-guide");
+    if (!root) return;
+    if (!cg || ui.show_collector_overlay === false) {
+      root.className = "";
+      return;
+    }
+    const isVi = lang !== "en";
+    const colI18n = (i18n && i18n.collector) || {};
+    const poses = (i18n && i18n.poses) || {};
+    const meta = cg.session_meta || {};
+    const guided = cg.guided || {};
+    const cued = cg.cued || {};
+
+    const modeEl = document.getElementById("cg-mode-lbl");
+    const dryEl = document.getElementById("cg-dry-pill");
+    const stepEl = document.getElementById("cg-step-pill");
+    const metaEl = document.getElementById("cg-meta-lbl");
+    const titleEl = document.getElementById("cg-title");
+    const subEl = document.getElementById("cg-sub");
+    const timerEl = document.getElementById("cg-timer");
+    const progWrap = document.getElementById("cg-prog-wrap");
+    const progFill = document.getElementById("cg-prog-fill");
+    const handEl = document.getElementById("cg-hand-status");
+    const nextEl = document.getElementById("cg-next-lbl");
+
+    const angleTxt = (meta.wrist_angle || "0") + "°";
+    const distMapVi = { near: "Gần", mid: "Vừa", far: "Xa" };
+    const lightMapVi = { bright: "Đủ sáng", backlit: "Nghịch sáng", dim: "Thiếu sáng" };
+    const distTxt = isVi ? (distMapVi[meta.distance] || meta.distance || "Vừa") : (meta.distance || "mid");
+    const lightTxt = isVi ? (lightMapVi[meta.lighting] || meta.lighting || "Đủ sáng") : (meta.lighting || "bright");
+    const handPref = cued.active ? (cued.hand || meta.hand || "Right") : (meta.hand || "Right");
+    metaEl.textContent = `${handPref} • ${angleTxt} • ${distTxt} • ${lightTxt}`;
+
+    if (cg.hands_count > 0 && cg.hand) {
+      handEl.className = "cg-hand-ok";
+      const okLbl = colI18n.ov_hand_ok || (isVi ? "Đã thấy tay" : "Hand visible");
+      const inCued = !!(cued.active || (cued.phase === "done" && cued.has_unsaved));
+      const shownCnt = inCued ? (cued.samples || 0) : (cg.total || 0);
+      handEl.textContent = `✓ ${okLbl} (${cg.hand}) • ${shownCnt} ${isVi ? "mẫu" : "frames"}`;
+    } else {
+      handEl.className = "cg-hand-miss";
+      handEl.textContent = "⚠ " + (colI18n.ov_hand_missing || (isVi ? "KHÔNG THẤY TAY!" : "NO HAND DETECTED!"));
+    }
+
+    // Priority 1: Cued Recall Mode
+    if (cued.active || (cued.phase === "done" && cued.has_unsaved)) {
+      dryEl.style.display = "inline-flex";
+      dryEl.textContent = colI18n.cued_dry_run_badge || "DRY-RUN";
+      progWrap.style.display = "block";
+      nextEl.textContent = "";
+      if (cued.phase === "done") {
+        root.className = "visible state-done";
+        modeEl.textContent = colI18n.ov_cued_done || "CUED RECALL DONE";
+        stepEl.textContent = `${cued.cues_issued || 0} / ${cued.total_cues || 0}`;
+        titleEl.textContent = `✓ ${colI18n.ov_cued_done || "HOÀN THÀNH"}`;
+        subEl.textContent = colI18n.ov_cued_done_sub || "";
+        timerEl.textContent = "✓";
+        progFill.style.width = "100%";
+      } else if (cued.phase === "cue") {
+        root.className = "visible state-cue";
+        modeEl.textContent = colI18n.ov_cued_go || "PERFORM NOW";
+        stepEl.textContent = `${(cued.cue_index || 0) + 1} / ${cued.total_cues || 0}`;
+        const trigKey = cued.expected_trigger || "";
+        const trigTitle = colI18n["ov_trig_" + trigKey] || trigKey.toUpperCase();
+        titleEl.textContent = `🎯 ${trigTitle}`;
+        subEl.textContent = isVi ? (cued.instruction_vi || cued.instruction_en || "") : (cued.instruction_en || "");
+        const rem = Number(cued.remaining_s || 0);
+        const tot = Math.max(0.1, Number(cued.phase_total_s || 2.5));
+        timerEl.textContent = rem.toFixed(1) + "s";
+        progFill.style.width = Math.max(0, Math.min(100, (rem / tot) * 100)).toFixed(1) + "%";
+      } else {
+        // Rest phase: NEVER reveal upcoming cue before cue_ts_ms!
+        root.className = "visible";
+        modeEl.textContent = isVi ? "NGHỈ GIỮA LỆNH" : "REST INTERVAL";
+        stepEl.textContent = `${(cued.cue_index || 0) + 1} / ${cued.total_cues || 0}`;
+        titleEl.textContent = `⏸ ${colI18n.ov_cued_rest_title || "REST HAND"}`;
+        subEl.textContent = colI18n.ov_cued_rest_sub || "";
+        const rem = Number(cued.remaining_s || 0);
+        const tot = Math.max(0.1, Number(cued.phase_total_s || 1.2));
+        timerEl.textContent = rem.toFixed(1) + "s";
+        progFill.style.width = Math.max(0, Math.min(100, (rem / tot) * 100)).toFixed(1) + "%";
+      }
+      return;
+    }
+
+    // Priority 2: Guided 14-Step Recording Script
+    if (guided.active || guided.phase === "done") {
+      dryEl.style.display = "none";
+      progWrap.style.display = "block";
+      if (guided.phase === "done") {
+        root.className = "visible state-done";
+        modeEl.textContent = colI18n.ov_guided_done || "DONE";
+        stepEl.textContent = `${guided.total_steps || 14} / ${guided.total_steps || 14}`;
+        titleEl.textContent = `✓ ${colI18n.ov_guided_done || "HOÀN THÀNH"}`;
+        subEl.textContent = colI18n.ov_guided_done_sub || "";
+        timerEl.textContent = "✓";
+        progFill.style.width = "100%";
+        nextEl.textContent = "";
+      } else {
+        const isRec = guided.phase === "recording";
+        root.className = isRec ? "visible state-rec" : "visible";
+        modeEl.textContent = isRec
+          ? (colI18n.ov_guided_rec || "RECORDING")
+          : (colI18n.ov_guided_prep || "GET READY");
+        stepEl.textContent = `${isVi ? "Bước" : "Step"} ${(guided.step_index || 0) + 1} / ${guided.total_steps || 14}`;
+        const pLbl = poses[guided.pose] || guided.pose || "idle";
+        titleEl.textContent = pLbl;
+        subEl.textContent = isVi
+          ? (guided.condition_note_vi || guided.condition_note || "")
+          : (guided.condition_note || "");
+        const rem = Number(guided.remaining_s || 0);
+        const tot = Math.max(0.1, Number(guided.phase_total_s || (isRec ? 5.0 : 3.0)));
+        timerEl.textContent = rem.toFixed(1) + "s";
+        progFill.style.width = Math.max(0, Math.min(100, (rem / tot) * 100)).toFixed(1) + "%";
+        if (guided.next_pose) {
+          const nPose = poses[guided.next_pose] || guided.next_pose;
+          const nNote = isVi ? (guided.next_note_vi || guided.next_note || "") : (guided.next_note || "");
+          nextEl.textContent = (colI18n.ov_next_prefix || "Next: ") + (nNote || nPose);
+        } else {
+          nextEl.textContent = "";
+        }
+      }
+      return;
+    }
+
+    // Priority 3: Manual Recording Mode
+    if (cg.recording) {
+      dryEl.style.display = "none";
+      progWrap.style.display = "none";
+      root.className = "visible state-rec";
+      modeEl.textContent = colI18n.ov_manual_rec || "MANUAL RECORDING";
+      const curPose = cg.current_pose || "idle";
+      const curCnt = (cg.counts && cg.counts[curPose]) || 0;
+      stepEl.textContent = `${curCnt} ${isVi ? "mẫu" : "samples"}`;
+      titleEl.textContent = poses[curPose] || curPose;
+      subEl.textContent = colI18n.hold_hint || "";
+      timerEl.textContent = "REC";
+      nextEl.textContent = "";
+      return;
+    }
+
+    root.className = "";
+  }
 
   window.addEventListener("DOMContentLoaded", () => notifyHost("overlay_ready"));
 </script>

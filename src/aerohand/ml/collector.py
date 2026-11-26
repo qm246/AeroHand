@@ -177,26 +177,27 @@ class GuidedStep:
     duration_s: float = 5.0
     condition_note: str = ""
     hard_negative_group: str = ""
+    condition_note_vi: str = ""
 
 
 def default_guided_steps(step_duration_s: float = 5.0) -> List[GuidedStep]:
     """Build a structured 7-class + all-8 hard-negative guided recording script (14 steps)."""
     d = max(2.0, float(step_duration_s))
     return [
-        GuidedStep(PoseName.IDLE, d, "Resting open/relaxed hand", "resting"),
-        GuidedStep(PoseName.IDLE, d, "Near-miss pinch (1-2 cm apart)", "near_miss"),
-        GuidedStep(PoseName.IDLE, d, "Typing on keyboard", "typing"),
-        GuidedStep(PoseName.IDLE, d, "Touching hair / face / glasses", "hair_face"),
-        GuidedStep(PoseName.IDLE, d, "Holding cup / phone", "cup_phone"),
-        GuidedStep(PoseName.IDLE, d, "Waving / gesturing casually", "waving"),
-        GuidedStep(PoseName.IDLE, d, "Fist open/close & stretching", "fist_open"),
-        GuidedStep(PoseName.IDLE, d, "Fast pose-to-pose transitions", "transitions"),
-        GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Thumb + Index pinch (hold & loose)"),
-        GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "Thumb + Middle pinch (tap & hold)"),
-        GuidedStep(PoseName.THUMB_RING_PINCH, d, "Thumb + Ring pinch (still & sliding)"),
-        GuidedStep(PoseName.THUMB_PINKY_PINCH, d, "Thumb + Pinky tip pinch"),
-        GuidedStep(PoseName.THUMB_PINKY_BASE, d, "Thumb + Pinky base touch"),
-        GuidedStep(PoseName.THUMB_INDEX_MIDDLE_PINCH, d, "3-Finger drag pinch (still & moving)"),
+        GuidedStep(PoseName.IDLE, d, "Resting open/relaxed hand", "resting", "Tay thả lỏng tự nhiên / xòe mở (KHÔNG chụm)"),
+        GuidedStep(PoseName.IDLE, d, "Near-miss pinch (1-2 cm apart)", "near_miss", "Chụm hờ cách 1–2 cm (tuyệt đối KHÔNG chạm nhau)"),
+        GuidedStep(PoseName.IDLE, d, "Typing on keyboard", "typing", "Gõ bàn phím tự nhiên như bình thường"),
+        GuidedStep(PoseName.IDLE, d, "Touching hair / face / glasses", "hair_face", "Vuốt tóc / chạm mặt / chỉnh kính tự nhiên"),
+        GuidedStep(PoseName.IDLE, d, "Holding cup / phone", "cup_phone", "Cầm cốc nước / cầm điện thoại tự nhiên"),
+        GuidedStep(PoseName.IDLE, d, "Waving / gesturing casually", "waving", "Vẫy tay / ra hiệu tự nhiên trước camera"),
+        GuidedStep(PoseName.IDLE, d, "Fist open/close & stretching", "fist_open", "Nắm chặt nắm đấm rồi xòe ra & duỗi các ngón"),
+        GuidedStep(PoseName.IDLE, d, "Fast pose-to-pose transitions", "transitions", "Chuyển nhanh giữa các tư thế mở / khép tay"),
+        GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Thumb + Index pinch (hold & loose)", "", "Chụm đầu Ngón cái + Ngón trỏ (giữ chắc & hơi lỏng)"),
+        GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "Thumb + Middle pinch (tap & hold)", "", "Chụm đầu Ngón cái + Ngón giữa (chạm nhanh & giữ)"),
+        GuidedStep(PoseName.THUMB_RING_PINCH, d, "Thumb + Ring pinch (still & sliding)", "", "Chụm đầu Ngón cái + Áp út (giữ yên & trượt nhẹ)"),
+        GuidedStep(PoseName.THUMB_PINKY_PINCH, d, "Thumb + Pinky tip pinch", "", "Chụm đầu Ngón cái + đầu Ngón út"),
+        GuidedStep(PoseName.THUMB_PINKY_BASE, d, "Thumb + Pinky base touch", "", "Đưa Ngón cái chạm vào GỐC (đốt dưới) Ngón út"),
+        GuidedStep(PoseName.THUMB_INDEX_MIDDLE_PINCH, d, "3-Finger drag pinch (still & moving)", "", "Chụm 3 ngón Cái + Trỏ + Giữa (giữ yên & di chuyển)"),
     ]
 
 
@@ -631,10 +632,16 @@ class PinchDataCollector:
             if self._guided_idx < len(self._guided_steps)
             else None
         )
+        next_step = (
+            self._guided_steps[self._guided_idx + 1]
+            if (self._guided_idx + 1) < len(self._guided_steps)
+            else None
+        )
         rem_s = 0.0
+        phase_total_s = 0.0
         if self._guided_active and step is not None:
-            target = self._countdown_s if self._guided_phase == "countdown" else step.duration_s
-            rem_s = max(0.0, target - (t - self._guided_phase_start_ms) / 1000.0)
+            phase_total_s = float(self._countdown_s if self._guided_phase == "countdown" else step.duration_s)
+            rem_s = max(0.0, phase_total_s - (t - self._guided_phase_start_ms) / 1000.0)
         return {
             "active": self._guided_active,
             "phase": self._guided_phase,
@@ -642,7 +649,13 @@ class PinchDataCollector:
             "total_steps": len(self._guided_steps),
             "pose": step.pose.value if step is not None else None,
             "condition_note": step.condition_note if step is not None else "",
+            "condition_note_vi": (step.condition_note_vi or step.condition_note) if step is not None else "",
+            "hard_negative_group": step.hard_negative_group if step is not None else "",
+            "next_pose": next_step.pose.value if next_step is not None else None,
+            "next_note": next_step.condition_note if next_step is not None else "",
+            "next_note_vi": (next_step.condition_note_vi or next_step.condition_note) if next_step is not None else "",
             "remaining_s": round(rem_s, 1),
+            "phase_total_s": round(phase_total_s, 2),
         }
 
     # ------------------------------------------------------------------
@@ -857,6 +870,10 @@ class PinchDataCollector:
             except OSError:
                 pass
             self._cued_last_draft_path = None
+        if not self._cued_active:
+            self._cued_phase = "idle"
+        self._cued_samples.clear()
+        self._cued_events.clear()
         return out_fp
 
     def cued_status(self, now_ms: Optional[float] = None) -> Dict[str, Any]:
@@ -866,9 +883,14 @@ class PinchDataCollector:
             else None
         )
         rem_s = 0.0
-        if self._cued_active and item is not None and self._cued_phase_start_ms is not None and now_ms is not None:
+        phase_total_s = 0.0
+        if self._cued_active and item is not None:
             target_ms = float(self._cued_gap_ms if self._cued_phase == "rest" else item["window_ms"])
-            rem_s = max(0.0, (target_ms - (float(now_ms) - self._cued_phase_start_ms)) / 1000.0)
+            phase_total_s = target_ms / 1000.0
+            if self._cued_phase_start_ms is not None and now_ms is not None:
+                rem_s = max(0.0, (target_ms - (float(now_ms) - self._cued_phase_start_ms)) / 1000.0)
+            else:
+                rem_s = phase_total_s
         return {
             "active": self._cued_active,
             "phase": self._cued_phase,
@@ -882,6 +904,7 @@ class PinchDataCollector:
             "instruction_en": item["instruction_en"] if (self._cued_phase == "cue" and item is not None) else "",
             "instruction_vi": item["instruction_vi"] if (self._cued_phase == "cue" and item is not None) else "",
             "remaining_s": round(rem_s, 1),
+            "phase_total_s": round(phase_total_s, 2),
             "has_unsaved": len(self._cued_samples) > 0,
             "draft_path": str(self._cued_last_draft_path) if self._cued_last_draft_path else None,
         }
@@ -1063,6 +1086,8 @@ class PinchDataCollector:
         }
         out_fp.write_text(json.dumps(payload), encoding="utf-8")
         self.clear_draft()
+        if not self._guided_active and self._guided_phase == "done":
+            self._guided_phase = "idle"
         return out_fp
 
 

@@ -754,7 +754,8 @@ class AeroHandRuntime:
         return self.collector_status()
 
     def collector_start_guided(self) -> Dict[str, Any]:
-        self.collector.start_guided()
+        now_ms = float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
+        self.collector.start_guided(now_ms=now_ms)
         return self.collector_status()
 
     def collector_stop_guided(self) -> Dict[str, Any]:
@@ -909,7 +910,9 @@ class AeroHandRuntime:
             "corpus_progress": combined,
             "total": sum(counts.values()),
             "session_meta": self.collector.session_meta,
-            "guided": self.collector.guided_status(),
+            "guided": self.collector.guided_status(
+                now_ms=float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
+            ),
             "cued": self.collector.cued_status(
                 now_ms=float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
             ),

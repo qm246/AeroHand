@@ -7562,3 +7562,39 @@ def test_eval_event_recall_reports_paired_veto_latency_overhead_ms(tmp_path: Pat
     assert rep["paired"]["veto_latency_overhead_p95_ms"] is not None
     # Overhead must be strictly smaller than human reaction + click latency from cue_ts (pure veto delay)
     assert 0.0 <= trig_paired["veto_latency_overhead_p50_ms"] <= 150.0
+
+
+def test_collector_teleprompter_overlay_fields_and_cued_rest_privacy():
+    from aerohand.i18n.translations import TRANSLATIONS
+
+    # 1. Guided status exposes bilingual notes, phase_total_s, and next-step preview
+    col = PinchDataCollector(default_subject="minh")
+    st_prep = col.start_guided(now_ms=1000.0)
+    assert st_prep["active"] is True
+    assert st_prep["phase"] == "countdown"
+    assert st_prep["phase_total_s"] == pytest.approx(3.0)
+    assert st_prep["condition_note_vi"] != ""
+    assert st_prep["next_pose"] is not None
+    assert st_prep["next_note_vi"] != ""
+
+    # 2. Cued status exposes phase_total_s and NEVER leaks upcoming cue during rest phase
+    col2 = PinchDataCollector(default_subject="minh")
+    col2.start_cued_session(cues_per_trigger=1, window_ms=2500, gap_ms=1200, seed=7, triggers=["window_tile"])
+    st_rest = col2.tick_cued(0.0)
+    assert st_rest["phase"] == "rest"
+    assert st_rest["phase_total_s"] == pytest.approx(1.2)
+    assert st_rest["pose"] is None
+    assert st_rest["expected_trigger"] is None
+    assert st_rest["instruction_vi"] == ""
+
+    st_cue = col2.tick_cued(1200.0)
+    assert st_cue["phase"] == "cue"
+    assert st_cue["phase_total_s"] == pytest.approx(2.5)
+    assert st_cue["expected_trigger"] == "window_tile"
+    assert "20 px" in st_cue["instruction_vi"]
+
+    # 3. Full vi <-> en i18n parity including new teleprompter keys
+    vi_c = TRANSLATIONS["vi"]["collector"]
+    en_c = TRANSLATIONS["en"]["collector"]
+    assert set(vi_c.keys()) == set(en_c.keys())
+    assert "ov_cued_rest_title" in vi_c and "ov_trig_window_tile" in vi_c

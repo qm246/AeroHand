@@ -1095,6 +1095,16 @@ class AeroHandAppDelegate(AppKit.NSObject):
             return
         snap: RuntimeSnapshot = self.runtime.get_snapshot()
         window_visible = bool(self.window is not None and self.window.isVisible())
+        col_snap = snap.collector or {}
+        col_guided = col_snap.get("guided") or {}
+        col_cued = col_snap.get("cued") or {}
+        has_collector_overlay = bool(
+            col_snap.get("recording")
+            or col_guided.get("active")
+            or col_guided.get("phase") == "done"
+            or col_cued.get("active")
+            or (col_cued.get("phase") == "done" and col_cued.get("has_unsaved"))
+        )
         has_urgent_overlay = (
             snap.click_event_seq != self._last_click_dispatched_seq
             or bool(snap.palm_wheels)
@@ -1104,6 +1114,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
             or bool(snap.dictation.get("discard_active"))
             or (snap.active_hint is not None)
             or (snap.warning is not None)
+            or has_collector_overlay
         )
         need_clear_overlay = self._overlay_had_visuals and (not has_urgent_overlay)
         self._overlay_had_visuals = has_urgent_overlay
@@ -1209,6 +1220,21 @@ class AeroHandAppDelegate(AppKit.NSObject):
                         pw_local["cursor_y"] = round(py_w - qy, 1)
                         local_wheels.append(pw_local)
 
+                compact_collector = None
+                if is_active_panel and has_collector_overlay:
+                    compact_collector = {
+                        "recording": bool(col_snap.get("recording", False)),
+                        "current_pose": col_snap.get("current_pose", "idle"),
+                        "total": int(col_snap.get("total", 0)),
+                        "counts": col_snap.get("counts") or {},
+                        "session_meta": col_snap.get("session_meta") or {},
+                        "guided": col_guided,
+                        "cued": col_cued,
+                        "hand": snap.hand,
+                        "hands_count": int(snap.hands_count),
+                        "live_pose": snap.active_pose or snap.pose,
+                    }
+
                 snap_payload = {
                     "click_event_seq": snap.click_event_seq if local_click is not None else 0,
                     "click_event": local_click,
@@ -1218,6 +1244,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
                     "active_hint_text": snap.active_hint_text if is_active_panel else None,
                     "warning": snap.warning if is_active_panel else None,
                     "dictation": snap.dictation if is_active_panel else {},
+                    "collector_guide": compact_collector,
                 }
                 builder: OverlayPayloadBuilder = entry["payload_builder"]
                 ov_payload = builder.build(snap_payload, ui_cfg, lang, pack)

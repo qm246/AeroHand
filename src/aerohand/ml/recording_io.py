@@ -585,3 +585,17 @@ def load_recording_frames(
         "raw_frame_count": len(raw_timestamps),
     }
     return frames_out, meta
+
+
+def group_frames_by_timestamp(
+    frames: Sequence[Dict[str, Any]],
+) -> List[Tuple[float, List[Dict[str, Any]]]]:
+    """Group consecutive frames sharing identical `timestamp_ms` so 2-hand frames replay together."""
+    grouped: List[Tuple[float, List[Dict[str, Any]]]] = []
+    for fr in frames:
+        ts = float(fr["timestamp_ms"])
+        if grouped and grouped[-1][0] == ts:
+            grouped[-1][1].append(fr)
+        else:
+            grouped.append((ts, [fr]))
+    return grouped

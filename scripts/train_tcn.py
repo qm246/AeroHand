@@ -159,20 +159,47 @@ def _segment_samples_into_windows(
     seq_len: int = 5,
     force_idle: bool = False,
     max_gap_ms: float = 100.0,
+    deliberate_marks_ms: Sequence[float] = (),
+    mark_half_window_ms: float = 1500.0,
     skip_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[List[List[ParsedSample]], np.ndarray]:
-    """Parse raw sample dicts and build gap-free, single-hand sliding windows of length `seq_len`."""
+    """
+    Parse raw sample dicts and build gap-free, per-hand sliding windows of length `seq_len`.
+    Tracks runs independently per `hand_id` so interleaved 2-hand frames produce valid windows,
+    breaks runs across `hand_present=False` or timestamp gaps > `max_gap_ms`, and excludes
+    frames inside `+/- mark_half_window_ms` of any `deliberate_marks_ms` timestamp.
+    """
     stats = skip_stats if skip_stats is not None else {}
+    marks = [float(m) for m in deliberate_marks_ms]
 
     def _bump(reason: str) -> None:
         stats[reason] = stats.get(reason, 0) + 1
 
     runs: List[List[ParsedSample]] = []
-    cur_run: List[ParsedSample] = []
+    runs_by_hand: Dict[str, List[ParsedSample]] = {}
+
+    def _flush_hand(hid: str) -> None:
+        r = runs_by_hand.pop(hid, None)
+        if r:
+            runs.append(r)
+
+    def _flush_all() -> None:
+        for hid in list(runs_by_hand.keys()):
+            _flush_hand(hid)
 
     for s in samples:
         if not isinstance(s, dict):
             _bump("non_dict")
+            continue
+
+        ts_ms = _resolve_sample_timestamp_ms(s)
+        if s.get("hand_present") is False:
+            _flush_all()
+            continue
+
+        if marks and ts_ms is not None and any(abs(ts_ms - m) <= mark_half_window_ms for m in marks):
+            _flush_all()
+            _bump("deliberate_mark")
             continue
 
         if force_idle:
@@ -200,7 +227,6 @@ def _segment_samples_into_windows(
         lms3d = _to_landmarks(raw_3d) or None
         handed: Handedness = "Left" if str(s.get("handedness", "Right")) == "Left" else "Right"
         hand_id = str(s.get("hand_id") or handed)
-        ts_ms = _resolve_sample_timestamp_ms(s)
 
         parsed = ParsedSample(
             label_idx=label_idx,
@@ -211,10 +237,10 @@ def _segment_samples_into_windows(
             timestamp_ms=ts_ms,
         )
 
-        # Break contiguous run on hand_id change or timestamp gap > max_gap_ms
+        # Break this hand's contiguous run on timestamp gap > max_gap_ms or backward jump
+        cur_run = runs_by_hand.get(hand_id)
         if cur_run:
             prev = cur_run[-1]
-            hand_changed = prev.hand_id != parsed.hand_id
             time_gap = (
                 max_gap_ms > 0.0
                 and prev.timestamp_ms is not None
@@ -224,13 +250,15 @@ def _segment_samples_into_windows(
                     or (parsed.timestamp_ms < prev.timestamp_ms)
                 )
             )
-            if hand_changed or time_gap:
-                runs.append(cur_run)
-                cur_run = []
-        cur_run.append(parsed)
+            if time_gap:
+                _flush_hand(hand_id)
+                cur_run = None
+        if cur_run is None:
+            runs_by_hand[hand_id] = [parsed]
+        else:
+            cur_run.append(parsed)
 
-    if cur_run:
-        runs.append(cur_run)
+    _flush_all()
 
     windows: List[List[ParsedSample]] = []
     ys: List[int] = []
@@ -284,6 +312,8 @@ def samples_to_sequences(
     seq_len: int = 5,
     force_idle: bool = False,
     max_gap_ms: float = 100.0,
+    deliberate_marks_ms: Sequence[float] = (),
+    mark_half_window_ms: float = 1500.0,
     skip_stats: Optional[Dict[str, int]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Convert raw sample dicts (snake_case v1/v2 or SDK camelCase v4.0) into gap-safe `(N, seq_len, F)` arrays."""
@@ -292,6 +322,8 @@ def samples_to_sequences(
         seq_len=seq_len,
         force_idle=force_idle,
         max_gap_ms=max_gap_ms,
+        deliberate_marks_ms=deliberate_marks_ms,
+        mark_half_window_ms=mark_half_window_ms,
         skip_stats=skip_stats,
     )
     return _featurize_windows(windows, feature_set=feature_set, seq_len=seq_len, skip_stats=skip_stats)
@@ -309,12 +341,24 @@ def load_session_sequences(
     """Load one JSON session into gap-safe sliding `(N, seq_len, F)` sequences and labels `(N,)`."""
     data = json.loads(session_path.read_text(encoding="utf-8"))
     samples = data.get("samples") or data.get("frames") or []
+    smeta = data.get("session_meta") if isinstance(data, dict) and isinstance(data.get("session_meta"), dict) else {}
+    raw_marks = data.get("deliberate_marks_ms") if isinstance(data, dict) else None
+    if raw_marks is None:
+        raw_marks = smeta.get("deliberate_marks_ms")
+    marks = [float(m) for m in raw_marks if isinstance(m, (int, float))] if isinstance(raw_marks, list) else []
+    half_win = float(
+        (data.get("mark_half_window_ms") if isinstance(data, dict) else None)
+        or smeta.get("mark_half_window_ms")
+        or 1500.0
+    )
     return samples_to_sequences(
         samples,
         feature_set=feature_set,
         seq_len=seq_len,
         force_idle=force_idle,
         max_gap_ms=max_gap_ms,
+        deliberate_marks_ms=marks,
+        mark_half_window_ms=half_win,
         skip_stats=skip_stats,
     )
 
@@ -350,10 +394,12 @@ def load_session_bundle(
     norm_samples: List[Dict[str, Any]] = []
     for fr in frames:
         if not fr["hand_present"] or not fr["landmarks_2d"]:
+            norm_samples.append({"timestamp_ms": fr["timestamp_ms"], "hand_present": False})
             continue
         norm_samples.append(
             {
                 "timestamp_ms": fr["timestamp_ms"],
+                "hand_present": True,
                 "label_name": fr["label_name"],
                 "handedness": fr["handedness"],
                 "hand_id": f"{fr['hand_id']}#s{fr.get('segment_id', 0)}",
@@ -370,6 +416,8 @@ def load_session_bundle(
         seq_len=seq_len,
         force_idle=force_idle,
         max_gap_ms=max_gap_ms,
+        deliberate_marks_ms=rec_meta.get("deliberate_marks_ms") or (),
+        mark_half_window_ms=float(rec_meta.get("mark_half_window_ms", 1500.0)),
         skip_stats=skip_stats,
     )
     prefix = "neg:" if force_idle else ""

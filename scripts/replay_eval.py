@@ -45,6 +45,7 @@ from aerohand.ml.recording_io import (
     collect_json_paths,
     exclude_cued_events,
     exclude_sealed_content,
+    group_frames_by_timestamp,
     load_recording_frames,
     sha256_file,
 )
@@ -331,6 +332,10 @@ def evaluate_recordings(
         (p, True) for p in neg_filtered
     ]
 
+    # Pre-load recordings so passive chunks from the same session share deliberate_marks across chunk edges
+    loaded_items: List[Tuple[Path, bool, List[Dict[str, Any]], Dict[str, Any]]] = []
+    session_marks_by_prefix: Dict[str, set[float]] = {}
+    unique_marks_seen: set[Tuple[str, float]] = set()
     for fp, is_neg in work_items:
         assert_not_heldout(fp, allow_sealed_aerohand=allow_sealed_aerohand)
         frames, rec_meta = load_recording_frames(
@@ -340,6 +345,16 @@ def evaluate_recordings(
             continue
         if not frames:
             continue
+        loaded_items.append((fp, is_neg, frames, rec_meta))
+        f_marks = [float(m) for m in (rec_meta.get("deliberate_marks_ms") or [])]
+        prefix = fp.name.rsplit("_chunk", 1)[0] if "_chunk" in fp.name else fp.name
+        if f_marks:
+            session_marks_by_prefix.setdefault(prefix, set()).update(f_marks)
+            for m in f_marks:
+                unique_marks_seen.add((prefix, m))
+    deliberate_marks_total = len(unique_marks_seen)
+
+    for fp, _is_neg, frames, rec_meta in loaded_items:
         evaluated_files.append(fp.name)
         sc_name = str(rec_meta.get("scenario") or fp.stem)
         file_wall_ms = float(rec_meta.get("wall_clock_ms", 0.0))
@@ -363,44 +378,49 @@ def evaluate_recordings(
             clf = Heuristic3DPinchClassifier((base_cfg.get("classifier") or {}).get("heuristic_3d"))
         else:
             try:
-                clf.reset()
-            except Exception:
-                pass
+                clf.reset(None)  # type: ignore[call-arg]
+            except TypeError:
+                try:
+                    clf.reset()
+                except Exception:
+                    pass
 
         eng = HandCursorEngine(deepcopy(base_cfg), classifier=clf)
         eng.anchor_cursor("Right", width * 0.5, height * 0.5)
         eng.anchor_cursor("Left", width * 0.5, height * 0.5)
 
         prev_present_ts: Optional[float] = None
-        prev_scrolling = False
+        prev_scrolling_by_hand: Dict[str, bool] = {"Right": False, "Left": False}
         visible_since_by_hand: Dict[str, float] = {}
         prev_wrist_by_hand: Dict[str, Tuple[float, float, float]] = {}
         prev_rot_by_hand: Dict[str, Tuple[float, float, float, float]] = {}
         last_latch_entry_by_hand: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
-        file_marks_ms = [float(m) for m in (rec_meta.get("deliberate_marks_ms") or [])]
+        prefix = fp.name.rsplit("_chunk", 1)[0] if "_chunk" in fp.name else fp.name
+        file_marks_ms = sorted(session_marks_by_prefix.get(prefix, set()))
         mark_half_win = float(rec_meta.get("mark_half_window_ms", 1500.0))
-        deliberate_marks_total += len(file_marks_ms)
 
-        for fr in frames:
-            ts = float(fr["timestamp_ms"])
+        for ts, batch in group_frames_by_timestamp(frames):
             in_deliberate_mark = bool(file_marks_ms) and any(
                 abs(ts - m) <= mark_half_win for m in file_marks_ms
             )
-            if not fr["hand_present"] or not fr["landmarks_2d"]:
+            present_batch = [fr for fr in batch if fr["hand_present"] and fr["landmarks_2d"]]
+            if not present_batch:
                 eng.process_frame([], ts, width, height)
                 prev_present_ts = None
-                prev_scrolling = False
+                prev_scrolling_by_hand["Right"] = False
+                prev_scrolling_by_hand["Left"] = False
                 visible_since_by_hand.clear()
                 prev_wrist_by_hand.clear()
                 prev_rot_by_hand.clear()
                 last_latch_entry_by_hand.clear()
                 continue
 
+            batch_idle_gt = any(bool(fr["is_idle_gt"]) for fr in present_batch)
             if prev_present_ts is not None:
                 dt = ts - prev_present_ts
                 if 0.0 < dt <= 500.0:
                     total_duration_ms += dt
-                    if fr["is_idle_gt"] and not in_deliberate_mark:
+                    if batch_idle_gt and not in_deliberate_mark:
                         idle_duration_ms += dt
                         sc["idle_duration_ms"] += dt
                 else:
@@ -409,126 +429,146 @@ def evaluate_recordings(
                     prev_rot_by_hand.clear()
             else:
                 total_duration_ms += 33.33
-                if fr["is_idle_gt"] and not in_deliberate_mark:
+                if batch_idle_gt and not in_deliberate_mark:
                     idle_duration_ms += 33.33
                     sc["idle_duration_ms"] += 33.33
             prev_present_ts = ts
 
-            hand = str(fr["handedness"])
-            if hand not in visible_since_by_hand:
-                visible_since_by_hand[hand] = ts
-            hand_visible_ms = max(0.0, ts - visible_since_by_hand[hand])
+            hand_inputs: List[HandInput] = []
+            frame_by_hand: Dict[str, Dict[str, Any]] = {}
+            kin_by_hand: Dict[str, Tuple[float, float, float]] = {}
 
-            w0 = fr["landmarks_2d"][0]
-            wrist_speed = 0.0
-            if hand in prev_wrist_by_hand:
-                px, py, pts = prev_wrist_by_hand[hand]
-                dt_s = (ts - pts) / 1000.0
-                if 0.005 <= dt_s <= 0.35:
-                    wrist_speed = math.hypot(w0.x - px, w0.y - py) / dt_s
-            prev_wrist_by_hand[hand] = (w0.x, w0.y, ts)
+            for fr in present_batch:
+                hand = str(fr["handedness"])
+                frame_by_hand[hand] = fr
+                if hand not in visible_since_by_hand:
+                    visible_since_by_hand[hand] = ts
+                hand_visible_ms = max(0.0, ts - visible_since_by_hand[hand])
 
-            rot = compute_hand_rotation(fr["landmarks_2d"])
-            wrist_ang_speed = 0.0
-            if rot is not None:
-                if hand in prev_rot_by_hand:
-                    pp, pyaw, proll, pts = prev_rot_by_hand[hand]
+                w0 = fr["landmarks_2d"][0]
+                wrist_speed = 0.0
+                if hand in prev_wrist_by_hand:
+                    px, py, pts = prev_wrist_by_hand[hand]
                     dt_s = (ts - pts) / 1000.0
                     if 0.005 <= dt_s <= 0.35:
-                        dp = ((rot.pitch - pp + 180.0) % 360.0) - 180.0
-                        dy = ((rot.yaw - pyaw + 180.0) % 360.0) - 180.0
-                        dr = ((rot.roll - proll + 180.0) % 360.0) - 180.0
-                        wrist_ang_speed = math.sqrt(dp * dp + dy * dy + dr * dr) / dt_s
-                prev_rot_by_hand[hand] = (rot.pitch, rot.yaw, rot.roll, ts)
+                        wrist_speed = math.hypot(w0.x - px, w0.y - py) / dt_s
+                prev_wrist_by_hand[hand] = (w0.x, w0.y, ts)
 
-            h_in = HandInput(
-                handedness=fr["handedness"],
-                landmarks=fr["landmarks_2d"],
-                world_landmarks=fr["world_landmarks"],
-                confidence=fr["confidence"],
-                timestamp_ms=int(round(ts)),
-            )
-            outs = eng.process_frame([h_in], ts, width, height)
-            if not outs:
-                prev_scrolling = False
-                continue
-            ho = outs[0]
-            y_true_all.append(int(fr["label_idx"]))
-            y_pred_all.append(POSE_TO_IDX.get(ho.pose.pose.value, 0))
+                rot = compute_hand_rotation(fr["landmarks_2d"])
+                wrist_ang_speed = 0.0
+                if rot is not None:
+                    if hand in prev_rot_by_hand:
+                        pp, pyaw, proll, pts = prev_rot_by_hand[hand]
+                        dt_s = (ts - pts) / 1000.0
+                        if 0.005 <= dt_s <= 0.35:
+                            dp = ((rot.pitch - pp + 180.0) % 360.0) - 180.0
+                            dy = ((rot.yaw - pyaw + 180.0) % 360.0) - 180.0
+                            dr = ((rot.roll - proll + 180.0) % 360.0) - 180.0
+                            wrist_ang_speed = math.sqrt(dp * dp + dy * dy + dr * dr) / dt_s
+                    prev_rot_by_hand[hand] = (rot.pitch, rot.yaw, rot.roll, ts)
 
-            if ho.pose.is_clicking and ho.pose.click_x is not None and ho.pose.click_y is not None:
-                anchor_offsets_px.append(
-                    math.hypot(float(ho.pose.click_x) - ho.cursor.x, float(ho.pose.click_y) - ho.cursor.y)
+                kin_by_hand[hand] = (hand_visible_ms, wrist_speed, wrist_ang_speed)
+                hand_inputs.append(
+                    HandInput(
+                        handedness=fr["handedness"],
+                        landmarks=fr["landmarks_2d"],
+                        world_landmarks=fr["world_landmarks"],
+                        confidence=fr["confidence"],
+                        timestamp_ms=int(round(ts)),
+                    )
                 )
 
-            fired: List[str] = []
-            if fr["is_idle_gt"] and not in_deliberate_mark:
-                p = ho.pose
-                if p.is_clicking:
-                    fired.append("left_click")
-                if p.is_right_clicking:
-                    fired.append("right_click")
-                if p.grab_just_started:
-                    fired.append("drag_start")
-                if p.is_scrolling and not prev_scrolling:
-                    fired.append("scroll_stroke")
-                if p.palm_wheel_action is not None:
-                    fired.append("palm_wheel")
-                if p.window_tile_direction is not None:
-                    fired.append("window_tile")
-                if p.spaces_nav_direction is not None:
-                    fired.append("spaces_nav")
-                if p.dictation_just_started:
-                    fired.append("dictation_start")
-            prev_scrolling = bool(ho.pose.is_scrolling)
+            outs = eng.process_frame(hand_inputs, ts, width, height)
+            present_hands = {ho.hand for ho in outs}
+            for hk in ("Right", "Left"):
+                if hk not in present_hands:
+                    prev_scrolling_by_hand[hk] = False
+                    visible_since_by_hand.pop(hk, None)
+                    prev_wrist_by_hand.pop(hk, None)
+                    prev_rot_by_hand.pop(hk, None)
+                    last_latch_entry_by_hand.pop(hk, None)
 
-            # Track latest live heuristic debug state so release-edge triggers (left/right click) can also see latch_entry
             dbg_src = getattr(clf, "last_debug", None)
             if dbg_src is None:
                 fb_clf = getattr(clf, "_fallback", None)
                 dbg_src = getattr(fb_clf, "last_debug", None) if fb_clf is not None else None
-            live_gate_debug: Dict[str, Any] = {}
-            if isinstance(dbg_src, dict) and hand in dbg_src:
-                live_gate_debug = deepcopy(dbg_src[hand])
-                live_le = live_gate_debug.get("latch_entry")
-                if isinstance(live_le, dict) and live_le:
-                    last_latch_entry_by_hand[hand] = (ts, deepcopy(live_le))
 
-            if fired:
-                diag = extract_frame_diagnostics(
-                    fr["landmarks_2d"], fr["world_landmarks"], fr["handedness"]
-                )
-                probs_d = {k.value: round(float(v), 4) for k, v in ho.pose.pose_probabilities.items()}
-                # V051-08 / V052-03: Capture internal heuristic gate debug state (latched, latch_entry, blocked_by, speeds)
-                gate_debug: Dict[str, Any] = deepcopy(live_gate_debug)
-                if gate_debug and not gate_debug.get("latch_entry"):
-                    prev_le = last_latch_entry_by_hand.get(hand)
-                    if prev_le is not None and 0.0 <= (ts - prev_le[0]) <= 300.0:
-                        gate_debug["recent_latch_entry"] = deepcopy(prev_le[1])
-                for trig in fired:
-                    ft_by_type[trig] += 1
-                    sc["counts"][trig] += 1
-                    ft_events.append(
-                        {
-                            "scenario": sc_name,
-                            "file": fp.name,
-                            "timestamp_ms": round(ts, 2),
-                            "hand": hand,
-                            "trigger_type": trig,
-                            "pose_probabilities": probs_d,
-                            "thumb_distances": diag["thumb_distances"],
-                            "curled_count": diag["curled_count"],
-                            "half_curled_count": diag["half_curled_count"],
-                            "finger_extensions": diag["finger_extensions"],
-                            "wrist_speed": round(wrist_speed, 4),
-                            "wrist_ang_speed_deg_s": round(wrist_ang_speed, 2),
-                            "dir_z": round(float(ho.cursor.pointing_dir_z), 4),
-                            "palm_size": round(float(ho.cursor.palm_size), 5),
-                            "palm_facing_dot": diag["palm_facing_dot"],
-                            "hand_visible_ms": round(hand_visible_ms, 1),
-                            "gate_debug": gate_debug,
-                        }
+            for ho in outs:
+                hand = ho.hand
+                fr = frame_by_hand.get(hand)
+                if fr is None:
+                    continue
+                hand_visible_ms, wrist_speed, wrist_ang_speed = kin_by_hand.get(hand, (0.0, 0.0, 0.0))
+                y_true_all.append(int(fr["label_idx"]))
+                y_pred_all.append(POSE_TO_IDX.get(ho.pose.pose.value, 0))
+
+                if ho.pose.is_clicking and ho.pose.click_x is not None and ho.pose.click_y is not None:
+                    anchor_offsets_px.append(
+                        math.hypot(float(ho.pose.click_x) - ho.cursor.x, float(ho.pose.click_y) - ho.cursor.y)
                     )
+
+                fired: List[str] = []
+                if fr["is_idle_gt"] and not in_deliberate_mark:
+                    p = ho.pose
+                    if p.is_clicking:
+                        fired.append("left_click")
+                    if p.is_right_clicking:
+                        fired.append("right_click")
+                    if p.grab_just_started:
+                        fired.append("drag_start")
+                    if p.is_scrolling and not prev_scrolling_by_hand.get(hand, False):
+                        fired.append("scroll_stroke")
+                    if p.palm_wheel_action is not None:
+                        fired.append("palm_wheel")
+                    if p.window_tile_direction is not None:
+                        fired.append("window_tile")
+                    if p.spaces_nav_direction is not None:
+                        fired.append("spaces_nav")
+                    if p.dictation_just_started:
+                        fired.append("dictation_start")
+                prev_scrolling_by_hand[hand] = bool(ho.pose.is_scrolling)
+
+                live_gate_debug: Dict[str, Any] = {}
+                if isinstance(dbg_src, dict) and hand in dbg_src:
+                    live_gate_debug = deepcopy(dbg_src[hand])
+                    live_le = live_gate_debug.get("latch_entry")
+                    if isinstance(live_le, dict) and live_le:
+                        last_latch_entry_by_hand[hand] = (ts, deepcopy(live_le))
+
+                if fired:
+                    diag = extract_frame_diagnostics(
+                        fr["landmarks_2d"], fr["world_landmarks"], fr["handedness"]
+                    )
+                    probs_d = {k.value: round(float(v), 4) for k, v in ho.pose.pose_probabilities.items()}
+                    gate_debug: Dict[str, Any] = deepcopy(live_gate_debug)
+                    if gate_debug and not gate_debug.get("latch_entry"):
+                        prev_le = last_latch_entry_by_hand.get(hand)
+                        if prev_le is not None and 0.0 <= (ts - prev_le[0]) <= 300.0:
+                            gate_debug["recent_latch_entry"] = deepcopy(prev_le[1])
+                    for trig in fired:
+                        ft_by_type[trig] += 1
+                        sc["counts"][trig] += 1
+                        ft_events.append(
+                            {
+                                "scenario": sc_name,
+                                "file": fp.name,
+                                "timestamp_ms": round(ts, 2),
+                                "hand": hand,
+                                "trigger_type": trig,
+                                "pose_probabilities": probs_d,
+                                "thumb_distances": diag["thumb_distances"],
+                                "curled_count": diag["curled_count"],
+                                "half_curled_count": diag["half_curled_count"],
+                                "finger_extensions": diag["finger_extensions"],
+                                "wrist_speed": round(wrist_speed, 4),
+                                "wrist_ang_speed_deg_s": round(wrist_ang_speed, 2),
+                                "dir_z": round(float(ho.cursor.pointing_dir_z), 4),
+                                "palm_size": round(float(ho.cursor.palm_size), 5),
+                                "palm_facing_dot": diag["palm_facing_dot"],
+                                "hand_visible_ms": round(hand_visible_ms, 1),
+                                "gate_debug": gate_debug,
+                            }
+                        )
 
     if ft_jsonl_path is not None:
         jfp = Path(ft_jsonl_path)

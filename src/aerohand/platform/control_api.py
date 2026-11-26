@@ -402,7 +402,17 @@ class LocalControlAPIServer:
                         self._send_json(200, {"ok": True})
                     elif path == "/api/mode":
                         if parent._set_dry_run is not None:
-                            parent._set_dry_run(bool(body.get("dry_run", False)))
+                            accepted = parent._set_dry_run(bool(body.get("dry_run", False)))
+                            if accepted is False:
+                                self._send_json(
+                                    409,
+                                    {
+                                        "ok": False,
+                                        "dry_run": True,
+                                        "error": "Refused: dry_run is locked while cued or passive recording is active.",
+                                    },
+                                )
+                                return
                         self._send_json(200, {"ok": True})
                     elif path == "/api/show":
                         if parent._show_window is not None:

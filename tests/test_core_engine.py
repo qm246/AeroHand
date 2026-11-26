@@ -7295,3 +7295,270 @@ def test_passive_record_runtime_forces_dry_run_and_api_mark_endpoint(tmp_path: P
         assert body["marks_count"] == 1
     finally:
         rt.stop()
+
+
+# ==============================================================================
+# V060-06b: Post-Review Bug Fixes (Passive Cap/Coalesce, 2-Hand Grouping, Marks, Latency Delta)
+# ==============================================================================
+
+
+def test_passive_recorder_day_rollover_mtime_cap_and_absent_coalescing(tmp_path: Path):
+    import json
+    import os
+
+    from aerohand.ml.collector import PassiveIdleRecorder
+
+    h_open = _make_open_hand(forward_z=-0.25)
+    # 1. Coalesce consecutive hand-absent frames -> 20 empty frames become 1 marker
+    coal_dir = tmp_path / "coalesce"
+    rec_c = PassiveIdleRecorder(coal_dir, default_subject="minh", chunk_max_frames=100)
+    rec_c.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=0)], 0)
+    for i in range(1, 21):
+        rec_c.add_frame([], i * 33)
+    rec_c.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=700)], 700)
+    rec_c.close()
+    saved_c = json.loads(next(coal_dir.glob("*.json")).read_text(encoding="utf-8"))
+    absent_samples = [s for s in saved_c["samples"] if s.get("hand_present") is False]
+    assert len(absent_samples) == 1
+    assert len(saved_c["samples"]) == 3
+
+    # 2. Day rollover unlatches _cap_reached AND daily bytes counted by file st_mtime (not filename date)
+    import time as _time
+
+    now_real = _time.time()
+    day_state = {"epoch": now_real - 86400.0}  # Yesterday -> today (real wall-clock mtime matches Day 2!)
+    roll_dir = tmp_path / "rollover"
+    rec_r = PassiveIdleRecorder(
+        roll_dir,
+        default_subject="minh",
+        chunk_max_frames=5,
+        max_daily_mb=0.0001,
+        now_fn=lambda: day_state["epoch"],
+    )
+    # Day 1 (yesterday): write 5 frames -> chunk 1 written (~10 KB > 100 B cap) -> _cap_reached=True
+    for i in range(5):
+        rec_r.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    assert rec_r._cap_reached is True
+    day1_files = sorted(roll_dir.glob("*.json"))
+    assert len(day1_files) == 1
+    # Set day1 file mtime to yesterday and advance clock to today
+    os.utime(day1_files[0], (day_state["epoch"], day_state["epoch"]))
+    day_state["epoch"] = now_real
+    # Day 2 (today): add_frame MUST notice day change, reset _cap_reached, and write Day 2 chunk #2!
+    for i in range(5, 10):
+        rec_r.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    all_files = sorted(roll_dir.glob("*.json"))
+    assert len(all_files) == 2
+    # And Day 2 cap MUST now be active (by mtime of chunk #2, even though filename still has Day 1 stamp!)
+    assert rec_r._cap_reached is True
+    for i in range(10, 15):
+        rec_r.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    rec_r.close()
+    assert len(sorted(roll_dir.glob("*.json"))) == 2
+
+
+def test_replay_eval_groups_two_hands_by_timestamp_and_train_windows_handle_interleaved_hands(tmp_path: Path):
+    import json
+
+    replay_mod = _load_replay_eval_module("replay_eval_v060_2hand")
+    train_mod = _load_train_tcn_module("train_tcn_v060_2hand")
+    audit_mod = _load_script_module("scripts/data_audit.py", "data_audit_v060_2hand")
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+
+    h_open = _make_open_hand(forward_z=-0.25)
+    h_pinch = _pinch_middle_copy(h_open)
+    flat_open = [c for lm in h_open for c in (lm.x, lm.y, lm.z)]
+    flat_pinch = [c for lm in h_pinch for c in (lm.x, lm.y, lm.z)]
+
+    # Build 20 timestamps where BOTH Right and Left appear at identical timestamp_ms:
+    # Right opens (0..9), pinches (10..13), releases (14..19); Left stays open the whole time.
+    samples = []
+    for i in range(20):
+        ts = i * 33
+        r_flat = flat_pinch if (10 <= i <= 13) else flat_open
+        samples.append(
+            {
+                "timestamp_ms": ts,
+                "hand_present": True,
+                "label": 0,
+                "label_name": "idle",
+                "handedness": "Right",
+                "hand_id": "Right",
+                "confidence": 0.95,
+                "landmarks_2d": r_flat,
+                "world_landmarks": r_flat,
+            }
+        )
+        samples.append(
+            {
+                "timestamp_ms": ts,
+                "hand_present": True,
+                "label": 0,
+                "label_name": "idle",
+                "handedness": "Left",
+                "hand_id": "Left",
+                "confidence": 0.95,
+                "landmarks_2d": flat_open,
+                "world_landmarks": flat_open,
+            }
+        )
+
+    fp = tmp_path / "two_hand_interleaved.json"
+    fp.write_text(
+        json.dumps({"schema": "aerohand_pinch_v2", "session_meta": {"subject": "minh"}, "samples": samples}),
+        encoding="utf-8",
+    )
+
+    # 1. replay_eval MUST group [Right, Left] per timestamp so Left does NOT reset Right's state!
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = replay_mod.evaluate_recordings(
+        negative_paths=[fp],
+        config=cfg,
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert rep["false_triggers"]["by_type"]["left_click"] >= 1
+
+    # 2. train_tcn._segment_samples_into_windows MUST preserve per-hand contiguous runs (16 + 16 = 32 windows)
+    wins, ys = train_mod._segment_samples_into_windows(samples, seq_len=5, force_idle=True, max_gap_ms=100.0)
+    assert len(wins) == 32 and len(ys) == 32
+
+    # 3. data_audit._estimate_train_windows MUST also count 32 windows across both interleaved hands
+    from aerohand.ml.recording_io import load_recording_frames
+
+    frs, _ = load_recording_frames(fp, force_idle=True)
+    est = audit_mod._estimate_train_windows(frs, seq_len=5, max_gap_ms=100.0)
+    assert est["idle"] == 32
+
+
+def test_deliberate_marks_cross_chunk_boundaries_and_excluded_from_train_tcn(tmp_path: Path):
+    import json
+
+    from aerohand.ml.collector import PassiveIdleRecorder
+
+    train_mod = _load_train_tcn_module("train_tcn_v060_marks")
+    h_open = _make_open_hand(forward_z=-0.25)
+
+    # 1. Forward & backward cross-chunk mark propagation
+    p_dir = tmp_path / "passive_boundary"
+    rec = PassiveIdleRecorder(p_dir, default_subject="minh", chunk_max_frames=10, mark_half_window_ms=1500.0)
+    # Chunk 1: frames 0..297ms (10 frames), mark at t=297 right before flush -> must spill forward to Chunk 2
+    for i in range(9):
+        rec.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    rec.mark_deliberate_gesture(297)
+    rec.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=297)], 297)  # flushes chunk 1
+    # Chunk 2: frames 330..627ms -> mark at t=400 (within 1500ms of chunk 1 end 297) -> must patch chunk 1 backward!
+    for i in range(10, 15):
+        rec.add_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=i * 33)], i * 33)
+    rec.mark_deliberate_gesture(400)
+    rec.close()
+
+    chunks = sorted(p_dir.glob("*.json"))
+    assert len(chunks) == 2
+    c1 = json.loads(chunks[0].read_text(encoding="utf-8"))
+    c2 = json.loads(chunks[1].read_text(encoding="utf-8"))
+    assert 297 in c2["deliberate_marks_ms"]  # forward spillover
+    assert 400 in c1["deliberate_marks_ms"]  # backward patch
+
+    # 2. train_tcn.load_session_bundle MUST exclude frames within +/- mark_half_window_ms of deliberate_marks_ms
+    flat = [c for lm in h_open for c in (lm.x, lm.y, lm.z)]
+    marked_samples = [
+        {
+            "timestamp_ms": i * 33,
+            "hand_present": True,
+            "label": 0,
+            "label_name": "idle",
+            "handedness": "Right",
+            "hand_id": "Right",
+            "confidence": 0.95,
+            "landmarks_2d": flat,
+            "world_landmarks": flat,
+        }
+        for i in range(30)  # 0..957ms
+    ]
+    mfp = tmp_path / "marked_passive.json"
+    mfp.write_text(
+        json.dumps(
+            {
+                "schema": "aerohand_pinch_v2",
+                "recording_kind": "passive_idle_claim",
+                "session_meta": {"subject": "minh", "kind": "passive_idle_claim"},
+                "deliberate_marks_ms": [500],
+                "mark_half_window_ms": 200.0,  # excludes [300, 700]
+                "samples": marked_samples,
+            }
+        ),
+        encoding="utf-8",
+    )
+    skip_stats: dict[str, int] = {}
+    bundle = train_mod.load_session_bundle(mfp, seq_len=5, force_idle=True, skip_stats=skip_stats)
+    assert skip_stats.get("deliberate_mark", 0) > 0
+    for win in bundle.windows:
+        for item in win:
+            assert item.timestamp_ms is not None
+            assert not (300.0 <= item.timestamp_ms <= 700.0)
+
+
+def test_api_mode_refuses_disabling_dry_run_during_passive_record(tmp_path: Path):
+    import urllib.error
+    import urllib.request
+
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["api"]["enabled"] = True
+    cfg["api"]["port"] = 0
+    rt = AeroHandRuntime(cfg, dry_run=False, passive_record_dir=tmp_path / "passive_api")
+    rt._start_api_if_enabled()
+    try:
+        assert rt._api_server is not None
+        port = rt._api_server.bound_port
+        tok = rt._api_server.token
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}/api/mode",
+            data=b'{"dry_run": false}',
+            headers={"Content-Type": "application/json", "X-AeroHand-Token": tok},
+            method="POST",
+        )
+        with pytest.raises(urllib.error.HTTPError) as exc_info:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc_info.value.code == 409
+        assert rt.dry_run is True
+        assert rt.input_ctl.dry_run is True
+    finally:
+        rt.stop()
+
+
+def test_eval_event_recall_reports_paired_veto_latency_overhead_ms(tmp_path: Path):
+    recall_mod = _load_script_module("scripts/eval_event_recall.py", "eval_recall_v060_lat")
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+
+    h_open = _make_open_hand(forward_z=-0.25)
+    h_pinch = _pinch_middle_copy(h_open)
+
+    col = PinchDataCollector(default_subject="minh")
+    col.start_cued_session(cues_per_trigger=1, hand="Right", window_ms=1200, gap_ms=1000, seed=9, triggers=["left_click"])
+    t = 0
+    while t <= 2300:
+        col.tick_cued(t)
+        if not col.is_cued_active:
+            break
+        h_cur = h_pinch if (1066 <= t <= 1264) else h_open
+        col.add_cued_frame([HandInput("Right", h_cur, h_cur, confidence=0.95, timestamp_ms=t)], t)
+        t += 33
+    fp = col.save_cued(tmp_path / "recall")
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["classifier"]["veto_confirm_frames"] = 3
+    approve_onnx = _ScriptedClf([(PoseName.THUMB_MIDDLE_PINCH, 0.92, 0.05, True)])
+    rep = recall_mod.evaluate_paired_event_recall([fp], config=cfg, onnx_classifier=approve_onnx)
+    trig_paired = rep["paired"]["by_trigger"]["left_click"]
+    assert trig_paired["both_hits"] == 1
+    assert trig_paired["veto_latency_overhead_p50_ms"] is not None
+    assert trig_paired["veto_latency_overhead_p95_ms"] is not None
+    assert rep["paired"]["veto_latency_overhead_p95_ms"] is not None
+    # Overhead must be strictly smaller than human reaction + click latency from cue_ts (pure veto delay)
+    assert 0.0 <= trig_paired["veto_latency_overhead_p50_ms"] <= 150.0

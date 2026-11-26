@@ -130,39 +130,43 @@ def _estimate_train_windows(
     *,
     seq_len: int = 5,
     max_gap_ms: float = 100.0,
+    deliberate_marks_ms: Sequence[float] = (),
+    mark_half_window_ms: float = 1500.0,
 ) -> Dict[str, int]:
-    """Count gap-free, single-hand sliding windows of length `seq_len` per class."""
+    """Count gap-free, per-hand sliding windows of length `seq_len` per class (2-hand safe)."""
     counts: Dict[str, int] = {p.value: 0 for p in ALL_POSE_NAMES}
-    run_labels: List[str] = []
-    prev_hid: Optional[str] = None
-    prev_ts: Optional[float] = None
+    runs_by_hand: Dict[str, List[str]] = {}
+    prev_ts_by_hand: Dict[str, float] = {}
+    marks = [float(m) for m in deliberate_marks_ms]
 
-    def _flush() -> None:
-        if len(run_labels) >= seq_len:
+    def _flush_hand(hid: str) -> None:
+        run_labels = runs_by_hand.pop(hid, None)
+        prev_ts_by_hand.pop(hid, None)
+        if run_labels and len(run_labels) >= seq_len:
             for lbl in run_labels[seq_len - 1 :]:
                 if lbl in counts:
                     counts[lbl] += 1
 
+    def _flush_all() -> None:
+        for hid in list(runs_by_hand.keys()):
+            _flush_hand(hid)
+
     for fr in frames:
+        ts = float(fr["timestamp_ms"])
         if not fr["hand_present"] or not fr["landmarks_2d"]:
-            _flush()
-            run_labels = []
-            prev_hid = None
-            prev_ts = None
+            _flush_all()
+            continue
+        if marks and any(abs(ts - m) <= mark_half_window_ms for m in marks):
+            _flush_all()
             continue
         hid = str(fr.get("hand_id") or fr.get("handedness") or "Right")
-        ts = float(fr["timestamp_ms"])
-        if run_labels:
-            hand_changed = prev_hid != hid
-            time_gap = prev_ts is not None and ((ts - prev_ts) > max_gap_ms or ts < prev_ts)
-            if hand_changed or time_gap:
-                _flush()
-                run_labels = []
-        run_labels.append(str(fr["label_name"]))
-        prev_hid = hid
-        prev_ts = ts
+        prev_ts = prev_ts_by_hand.get(hid)
+        if hid in runs_by_hand and prev_ts is not None and ((ts - prev_ts) > max_gap_ms or ts < prev_ts):
+            _flush_hand(hid)
+        runs_by_hand.setdefault(hid, []).append(str(fr["label_name"]))
+        prev_ts_by_hand[hid] = ts
 
-    _flush()
+    _flush_all()
     return counts
 
 
@@ -454,7 +458,11 @@ def run_data_audit(
             all_dts_ms.extend(timing["sample_dts_ms"])
 
             if src_name in ("sessions", "negatives", "converted"):
-                w_cnts = _estimate_train_windows(frames, seq_len=seq_len)
+                w_cnts = _estimate_train_windows(
+                    frames,
+                    seq_len=seq_len,
+                    deliberate_marks_ms=marks_ms,
+                )
                 for k, v in w_cnts.items():
                     train_windows_by_class[k] += v
 

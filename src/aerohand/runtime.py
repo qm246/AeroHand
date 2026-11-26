@@ -362,11 +362,11 @@ class AeroHandRuntime:
         else:
             self._last_action_text = "Tracking resumed"
 
-    def set_dry_run(self, dry_run: bool) -> None:
+    def set_dry_run(self, dry_run: bool) -> bool:
         target = bool(dry_run)
         if not target and (self.collector.is_cued_active or self.passive_recorder is not None):
             logger.warning("[COLLECT] Refusing live HID output while cued or passive recording is active.")
-            return
+            return False
         if target:
             with self._lerp_lock:
                 self._lerp_active = False
@@ -378,6 +378,7 @@ class AeroHandRuntime:
         self.dry_run = target
         self.input_ctl.dry_run = self.dry_run
         self._last_action_text = "Mode: Dry-Run" if self.dry_run else "Mode: Live Control"
+        return True
 
     def trigger_recenter(self) -> None:
         self._refresh_display_bounds()

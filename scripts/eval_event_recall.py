@@ -40,6 +40,7 @@ from aerohand.ml.recording_io import (
     assert_not_heldout,
     collect_json_paths,
     exclude_sealed_content,
+    group_frames_by_timestamp,
     load_recording_frames,
 )
 
@@ -66,20 +67,6 @@ def wilson_interval(hits: int, n: int, *, z: float = Z_95) -> Tuple[float, float
     center = (p + z2 / (2.0 * float(n))) / denom
     half = (float(z) / denom) * math.sqrt((p * (1.0 - p) / float(n)) + (z2 / (4.0 * float(n) * float(n))))
     return round(max(0.0, center - half), 4), round(min(1.0, center + half), 4)
-
-
-def _group_frames_by_timestamp(
-    frames: Sequence[Dict[str, Any]],
-) -> List[Tuple[float, List[Dict[str, Any]]]]:
-    """Group consecutive frames sharing identical `timestamp_ms` so 2-hand frames replay together."""
-    grouped: List[Tuple[float, List[Dict[str, Any]]]] = []
-    for fr in frames:
-        ts = float(fr["timestamp_ms"])
-        if grouped and grouped[-1][0] == ts:
-            grouped[-1][1].append(fr)
-        else:
-            grouped.append((ts, [fr]))
-    return grouped
 
 
 def _replay_single_cued_file(
@@ -112,7 +99,7 @@ def _replay_single_cued_file(
     prev_scrolling: Dict[str, bool] = {"Right": False, "Left": False}
     fired_events: List[Dict[str, Any]] = []
 
-    for ts, batch in _group_frames_by_timestamp(frames):
+    for ts, batch in group_frames_by_timestamp(frames):
         hand_inputs: List[HandInput] = []
         for fr in batch:
             if fr["hand_present"] and fr["landmarks_2d"]:
@@ -381,6 +368,7 @@ def evaluate_paired_event_recall(
     v_by_key = {c["key"]: c for c in rep_v["cue_results"]}
 
     paired_by_trigger: Dict[str, Dict[str, Any]] = {}
+    all_overheads_ms: List[float] = []
     all_passed = True
     for trig, h_stats in rep_h["by_trigger"].items():
         v_stats = rep_v["by_trigger"].get(trig, {"n": 0, "hits": 0, "recall": 0.0})
@@ -396,6 +384,17 @@ def evaluate_paired_event_recall(
         both_h = sum(1 for k in keys if h_by_key[k]["hit"] and v_by_key.get(k, {}).get("hit", False))
         both_m = sum(1 for k in keys if not h_by_key[k]["hit"] and not v_by_key.get(k, {}).get("hit", False))
 
+        # Pure veto overhead latency (veto_hit_ts - heuristic_hit_ts) on cues hit by both backends
+        trig_overheads = [
+            float(v_by_key[k]["hit_ts_ms"]) - float(h_by_key[k]["hit_ts_ms"])
+            for k in keys
+            if h_by_key[k]["hit"]
+            and v_by_key.get(k, {}).get("hit", False)
+            and h_by_key[k].get("hit_ts_ms") is not None
+            and v_by_key[k].get("hit_ts_ms") is not None
+        ]
+        all_overheads_ms.extend(trig_overheads)
+
         trig_pass = True if n == 0 else (drop <= float(max_recall_drop) + 1e-9)
         if not trig_pass:
             all_passed = False
@@ -410,6 +409,15 @@ def evaluate_paired_event_recall(
             "veto_only_hits": v_only,
             "both_hits": both_h,
             "both_misses": both_m,
+            "veto_latency_overhead_p50_ms": (
+                round(float(np.percentile(trig_overheads, 50)), 2) if trig_overheads else None
+            ),
+            "veto_latency_overhead_p95_ms": (
+                round(float(np.percentile(trig_overheads, 95)), 2) if trig_overheads else None
+            ),
+            "veto_latency_overhead_max_ms": (
+                round(float(max(trig_overheads)), 2) if trig_overheads else None
+            ),
             "max_recall_drop": float(max_recall_drop),
             "passed": trig_pass,
         }
@@ -422,6 +430,15 @@ def evaluate_paired_event_recall(
         "paired": {
             "passed": all_passed,
             "gate_scope": "per_trigger",
+            "veto_latency_overhead_p50_ms": (
+                round(float(np.percentile(all_overheads_ms, 50)), 2) if all_overheads_ms else None
+            ),
+            "veto_latency_overhead_p95_ms": (
+                round(float(np.percentile(all_overheads_ms, 95)), 2) if all_overheads_ms else None
+            ),
+            "veto_latency_overhead_max_ms": (
+                round(float(max(all_overheads_ms)), 2) if all_overheads_ms else None
+            ),
             "by_trigger": paired_by_trigger,
         },
         "veto_telemetry": rep_v.get("classifier_telemetry"),

@@ -15,7 +15,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 
@@ -1267,6 +1267,7 @@ class PassiveIdleRecorder:
         max_daily_mb: float = 256.0,
         mark_half_window_ms: float = 1500.0,
         max_gap_ms: float = 100.0,
+        now_fn: Optional[Callable[[], float]] = None,
     ) -> None:
         self.out_dir: Path = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -1275,6 +1276,7 @@ class PassiveIdleRecorder:
         self.max_daily_bytes: int = max(1, int(round(float(max_daily_mb) * 1024.0 * 1024.0)))
         self.mark_half_window_ms: float = max(100.0, float(mark_half_window_ms))
         self.max_gap_ms: float = max(10.0, float(max_gap_ms))
+        self._now_fn: Callable[[], float] = now_fn or time.time
 
         self._session_meta: Dict[str, Any] = {
             "kind": "passive_idle_claim",
@@ -1297,8 +1299,9 @@ class PassiveIdleRecorder:
         self._session_meta["condition_id"] = compute_condition_id(self._session_meta)
 
         self._lock = threading.Lock()
-        self._session_stamp: str = time.strftime("%Y%m%d_%H%M%S")
-        self._day_str: str = time.strftime("%Y%m%d")
+        now_epoch = self._now_fn()
+        self._session_stamp: str = time.strftime("%Y%m%d_%H%M%S", time.localtime(now_epoch))
+        self._day_str: str = time.strftime("%Y%m%d", time.localtime(now_epoch))
         self._chunk_index: int = 0
         self._chunks_written: int = 0
         self._written_files: List[Path] = []
@@ -1308,18 +1311,28 @@ class PassiveIdleRecorder:
         self._last_ts_by_hand: Dict[str, int] = {}
         self._seg_id_by_hand: Dict[str, int] = {}
         self._next_seg_id: int = 0
+        self._last_was_hand_absent: bool = False
+        self._last_flushed_path: Optional[Path] = None
+        self._last_flushed_max_ts: Optional[int] = None
         self._total_samples_recorded: int = 0
         self._accum_idle_ms: float = 0.0
         self._cap_reached: bool = False
         self._closed: bool = False
 
+    @staticmethod
+    def _day_str_for(epoch_s: float) -> str:
+        return time.strftime("%Y%m%d", time.localtime(epoch_s))
+
     def _current_daily_bytes(self, day_str: str) -> int:
+        """Sum disk size of all passive chunks modified on `day_str` (by `st_mtime`, midnight-safe)."""
         total = 0
         if not self.out_dir.is_dir():
             return 0
-        for fp in self.out_dir.glob(f"aerohand_passive_*_{day_str}_*.json"):
+        for fp in self.out_dir.glob("aerohand_passive_*.json"):
             try:
-                total += fp.stat().st_size
+                st = fp.stat()
+                if self._day_str_for(st.st_mtime) == day_str:
+                    total += st.st_size
             except OSError:
                 continue
         return total
@@ -1332,11 +1345,15 @@ class PassiveIdleRecorder:
     ) -> float:
         idle_ms = 0.0
         prev_present_ts: Optional[float] = None
+        last_counted_ts: Optional[float] = None
         for s in samples:
             ts = float(s.get("timestamp_ms", 0))
             if s.get("hand_present") is False or len(s.get("landmarks_2d") or []) < 63:
                 prev_present_ts = None
                 continue
+            if last_counted_ts == ts:
+                continue
+            last_counted_ts = ts
             excluded = any(abs(ts - float(m)) <= half_window_ms for m in marks_ms)
             if prev_present_ts is not None:
                 dt = ts - prev_present_ts
@@ -1348,9 +1365,16 @@ class PassiveIdleRecorder:
         return idle_ms
 
     def add_frame(self, hands: Sequence[Any], timestamp_ms: int) -> None:
-        """Append one camera frame's landmarks (or hand-absent marker) and flush when chunk is full."""
+        """Append one camera frame's landmarks (coalescing consecutive hand-absent markers) and flush per chunk."""
         with self._lock:
-            if self._closed or self._cap_reached:
+            if self._closed:
+                return
+            # Check day rollover BEFORE early-returning on `_cap_reached` so midnight resets cap cleanly
+            today = self._day_str_for(self._now_fn())
+            if today != self._day_str:
+                self._day_str = today
+                self._cap_reached = False
+            if self._cap_reached:
                 return
             ts = int(timestamp_ms)
             added = 0
@@ -1393,7 +1417,10 @@ class PassiveIdleRecorder:
                 )
                 added += 1
 
-            if added == 0:
+            if added > 0:
+                self._last_was_hand_absent = False
+            elif not self._last_was_hand_absent:
+                # Coalesce consecutive hand-absent frames into a single reset marker to save daily cap
                 self._buf.append(
                     {
                         "timestamp_ms": ts,
@@ -1408,16 +1435,58 @@ class PassiveIdleRecorder:
                         "world_landmarks": [],
                     }
                 )
+                self._last_was_hand_absent = True
 
             if len(self._buf) >= self.chunk_max_frames:
                 self._flush_locked()
+
+    def _patch_previous_chunk_mark_locked(self, ts: int) -> None:
+        """Back-patch a deliberate mark into the immediately preceding chunk when +/-half_window crosses boundary."""
+        fp = self._last_flushed_path
+        if fp is None or not fp.is_file():
+            return
+        try:
+            payload = json.loads(fp.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                return
+            marks = list(payload.get("deliberate_marks_ms") or [])
+            if ts in marks:
+                return
+            marks.append(ts)
+            marks.sort()
+            samples = payload.get("samples") if isinstance(payload.get("samples"), list) else []
+            old_idle_ms = float(
+                (payload.get("session_meta") or {}).get("hand_present_idle_hours", 0.0)
+            ) * 3_600_000.0
+            new_idle_ms = self._compute_chunk_idle_ms(samples, marks, self.mark_half_window_ms)
+            self._accum_idle_ms = max(0.0, self._accum_idle_ms - old_idle_ms + new_idle_ms)
+            payload["deliberate_marks_ms"] = marks
+            payload["deliberate_marks_count"] = len(marks)
+            if isinstance(payload.get("session_meta"), dict):
+                payload["session_meta"]["deliberate_marks_ms"] = marks
+                payload["session_meta"]["deliberate_marks_count"] = len(marks)
+                payload["session_meta"]["hand_present_idle_hours"] = round(new_idle_ms / 3_600_000.0, 6)
+            tmp_fp = fp.with_suffix(".json.tmp")
+            tmp_fp.write_bytes(json.dumps(payload).encode("utf-8"))
+            tmp_fp.replace(fp)
+        except Exception as exc:
+            logger.warning(f"[PASSIVE] Could not back-patch cross-chunk mark into {fp.name}: {exc}")
 
     def mark_deliberate_gesture(self, timestamp_ms: int, *, note: str = "") -> Dict[str, Any]:
         """Mark a deliberate gesture timestamp (+/- 1.5s excluded from idle exposure; NEVER for false triggers)."""
         with self._lock:
             ts = int(timestamp_ms)
-            self._chunk_marks_ms.append(ts)
-            self._all_marks_ms.append(ts)
+            if ts not in self._chunk_marks_ms:
+                self._chunk_marks_ms.append(ts)
+            if ts not in self._all_marks_ms:
+                self._all_marks_ms.append(ts)
+            # Propagate backward into previous chunk if its tail falls within mark_half_window_ms
+            if (
+                self._last_flushed_path is not None
+                and self._last_flushed_max_ts is not None
+                and 0.0 <= float(ts - self._last_flushed_max_ts) <= self.mark_half_window_ms
+            ):
+                self._patch_previous_chunk_mark_locked(ts)
             return {
                 "ok": True,
                 "timestamp_ms": ts,
@@ -1429,7 +1498,8 @@ class PassiveIdleRecorder:
     def _flush_locked(self) -> Optional[Path]:
         if not self._buf:
             return None
-        today = time.strftime("%Y%m%d")
+        now_epoch = self._now_fn()
+        today = self._day_str_for(now_epoch)
         if today != self._day_str:
             self._day_str = today
             self._cap_reached = False
@@ -1446,9 +1516,12 @@ class PassiveIdleRecorder:
 
         self._chunk_index += 1
         samples = list(self._buf)
-        chunk_marks = list(self._chunk_marks_ms)
+        chunk_marks = sorted(set(self._chunk_marks_ms))
+        chunk_max_ts = max(int(s.get("timestamp_ms", 0)) for s in samples)
+        # Carry forward marks whose +half_window_ms spills into the next chunk
+        carry_forward = [m for m in chunk_marks if (chunk_max_ts - m) <= self.mark_half_window_ms]
         self._buf.clear()
-        self._chunk_marks_ms.clear()
+        self._chunk_marks_ms = carry_forward
 
         chunk_idle_ms = self._compute_chunk_idle_ms(samples, chunk_marks, self.mark_half_window_ms)
         self._accum_idle_ms += chunk_idle_ms
@@ -1467,7 +1540,7 @@ class PassiveIdleRecorder:
             "schema": "aerohand_pinch_v2",
             "schema_version": 2,
             "recording_kind": "passive_idle_claim",
-            "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "collected_at": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now_epoch)),
             "session_meta": meta,
             "deliberate_marks_ms": chunk_marks,
             "deliberate_marks_count": len(chunk_marks),
@@ -1476,7 +1549,7 @@ class PassiveIdleRecorder:
             "samples": samples,
         }
         raw_bytes = json.dumps(payload).encode("utf-8")
-        if (used_bytes + len(raw_bytes)) > self.max_daily_bytes and self._chunks_written > 0:
+        if (used_bytes + len(raw_bytes)) > self.max_daily_bytes and used_bytes > 0:
             self._cap_reached = True
             logger.warning(
                 f"[PASSIVE] Writing chunk #{self._chunk_index} would exceed daily cap "
@@ -1488,6 +1561,8 @@ class PassiveIdleRecorder:
         tmp_fp.replace(out_fp)
         self._chunks_written += 1
         self._written_files.append(out_fp)
+        self._last_flushed_path = out_fp
+        self._last_flushed_max_ts = chunk_max_ts
         if (used_bytes + len(raw_bytes)) >= self.max_daily_bytes:
             self._cap_reached = True
         return out_fp

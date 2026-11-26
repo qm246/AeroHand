@@ -84,6 +84,7 @@ class _PerHandIntentState:
         "last_open_ms",
         "last_open_dist",
         "latched",
+        "latch_info",
     )
 
     def __init__(self, ts_ms: float, wrist_xy: Tuple[float, float], rot_mat: np.ndarray) -> None:
@@ -96,6 +97,7 @@ class _PerHandIntentState:
         self.last_open_ms: Dict[PoseName, float] = {}
         self.last_open_dist: Dict[PoseName, float] = {}
         self.latched: Set[PoseName] = set()
+        self.latch_info: Dict[PoseName, Dict[str, Any]] = {}
 
 
 class Heuristic3DPinchClassifier:
@@ -167,7 +169,13 @@ class Heuristic3DPinchClassifier:
             scale_metric="palm_width",
         )
         if pf is None:
-            self.last_debug[handedness] = {"valid_palm_frame": False, "blocked_by": {}, "latched": []}
+            self.last_debug[handedness] = {
+                "valid_palm_frame": False,
+                "blocked_by": {},
+                "latched": [],
+                "latch_age_ms": {},
+                "latch_entry": {},
+            }
             return PinchPrediction(pose=PoseName.IDLE, probabilities=idle_probabilities(), confidence="low")
 
         # Update per-hand FPS- & palm-size-invariant motion & rotation kinematics (V051-07)
@@ -250,6 +258,7 @@ class Heuristic3DPinchClassifier:
                 st.last_open_ms[pose_key] = timestamp_ms
             if dist_val >= off_d:
                 st.latched.discard(pose_key)
+                st.latch_info.pop(pose_key, None)
 
         # Check whether any canonical pinch pose is currently in tight contact (V051-09)
         any_tight_pinch = (
@@ -291,6 +300,8 @@ class Heuristic3DPinchClassifier:
             self.last_debug[handedness] = {
                 "valid_palm_frame": True,
                 "latched": [],
+                "latch_age_ms": {},
+                "latch_entry": {},
                 "blocked_by": {"all": ["fist"]},
                 "blocked_reasons": ["fist"],
                 "eff_speed_pw": round(eff_speed_pw, 4),
@@ -378,10 +389,31 @@ class Heuristic3DPinchClassifier:
                     all_reasons.update(reasons)
                 elif raw_sc >= self._latch_score_threshold:
                     st.latched.add(pose_key)
+                    st.latch_info[pose_key] = {
+                        "since_ms": round(float(timestamp_ms), 2),
+                        "dist": round(float(dist_val), 4),
+                        "raw_sc": round(float(raw_sc), 4),
+                        "eff_speed_pw": round(float(eff_speed_pw), 4),
+                        "eff_ang_deg_s": round(float(eff_ang), 2),
+                        "open_dist": round(float(prev_open_dist.get(pose_key, 0.0)), 4),
+                        "idx_ext": round(float(idx_ext), 4),
+                        "half_curled_count": int(half_curled_count),
+                    }
+
+        latched_sorted = sorted(st.latched, key=lambda p: p.value)
+        latch_age_ms: Dict[str, float] = {}
+        latch_entry: Dict[str, Dict[str, Any]] = {}
+        for lp in latched_sorted:
+            info = st.latch_info.get(lp)
+            if info is not None:
+                latch_age_ms[lp.value] = round(max(0.0, float(timestamp_ms) - float(info["since_ms"])), 2)
+                latch_entry[lp.value] = dict(info)
 
         self.last_debug[handedness] = {
             "valid_palm_frame": True,
-            "latched": sorted(p.value for p in st.latched),
+            "latched": [p.value for p in latched_sorted],
+            "latch_age_ms": latch_age_ms,
+            "latch_entry": latch_entry,
             "blocked_by": blocked_by,
             "blocked_reasons": sorted(all_reasons),
             "eff_speed_pw": round(eff_speed_pw, 4),

@@ -250,6 +250,7 @@ def evaluate_recordings(
         visible_since_by_hand: Dict[str, float] = {}
         prev_wrist_by_hand: Dict[str, Tuple[float, float, float]] = {}
         prev_rot_by_hand: Dict[str, Tuple[float, float, float, float]] = {}
+        last_latch_entry_by_hand: Dict[str, Tuple[float, Dict[str, Dict[str, Any]]]] = {}
 
         for fr in frames:
             ts = float(fr["timestamp_ms"])
@@ -260,6 +261,7 @@ def evaluate_recordings(
                 visible_since_by_hand.clear()
                 prev_wrist_by_hand.clear()
                 prev_rot_by_hand.clear()
+                last_latch_entry_by_hand.clear()
                 continue
 
             if prev_present_ts is not None:
@@ -348,19 +350,29 @@ def evaluate_recordings(
                     fired.append("dictation_start")
             prev_scrolling = bool(ho.pose.is_scrolling)
 
+            # Track latest live heuristic debug state so release-edge triggers (left/right click) can also see latch_entry
+            dbg_src = getattr(clf, "last_debug", None)
+            if dbg_src is None:
+                fb_clf = getattr(clf, "_fallback", None)
+                dbg_src = getattr(fb_clf, "last_debug", None) if fb_clf is not None else None
+            live_gate_debug: Dict[str, Any] = {}
+            if isinstance(dbg_src, dict) and hand in dbg_src:
+                live_gate_debug = deepcopy(dbg_src[hand])
+                live_le = live_gate_debug.get("latch_entry")
+                if isinstance(live_le, dict) and live_le:
+                    last_latch_entry_by_hand[hand] = (ts, deepcopy(live_le))
+
             if fired:
                 diag = extract_frame_diagnostics(
                     fr["landmarks_2d"], fr["world_landmarks"], fr["handedness"]
                 )
                 probs_d = {k.value: round(float(v), 4) for k, v in ho.pose.pose_probabilities.items()}
-                # V051-08: Capture internal heuristic gate debug state (latched, blocked_by, speeds)
-                gate_debug: Dict[str, Any] = {}
-                dbg_src = getattr(clf, "last_debug", None)
-                if dbg_src is None:
-                    fb_clf = getattr(clf, "_fallback", None)
-                    dbg_src = getattr(fb_clf, "last_debug", None) if fb_clf is not None else None
-                if isinstance(dbg_src, dict) and hand in dbg_src:
-                    gate_debug = deepcopy(dbg_src[hand])
+                # V051-08 / V052-03: Capture internal heuristic gate debug state (latched, latch_entry, blocked_by, speeds)
+                gate_debug: Dict[str, Any] = deepcopy(live_gate_debug)
+                if gate_debug and not gate_debug.get("latch_entry"):
+                    prev_le = last_latch_entry_by_hand.get(hand)
+                    if prev_le is not None and 0.0 <= (ts - prev_le[0]) <= 300.0:
+                        gate_debug["recent_latch_entry"] = deepcopy(prev_le[1])
                 for trig in fired:
                     ft_by_type[trig] += 1
                     sc["counts"][trig] += 1

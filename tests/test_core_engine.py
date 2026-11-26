@@ -5691,3 +5691,154 @@ def test_promotion_fails_when_vitals_hash_differs():
     )
     assert res_good["passed"] is True
     assert res_good["criteria"]["provenance_hash_match"]["passed"] is True
+
+
+# ==============================================================================
+# V052-03: Latch-Entry Debug Diagnostics (`latch_entry`, `latch_age_ms`)
+# ==============================================================================
+
+
+def test_latch_entry_debug_recorded_at_latch_time():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    h_open = _make_open_hand()
+    h_pinch = _pinch_middle_copy(h_open)
+
+    # Open frames to prime approach gate
+    for i in range(4):
+        clf.predict(h_open, h_open, "Right", i * 33.0)
+    assert clf.last_debug["Right"]["latch_entry"] == {}
+    assert clf.last_debug["Right"]["latch_age_ms"] == {}
+
+    # Enter pinch slowly at t=132 -> latches and snapshots entry metrics
+    pred_enter = clf.predict(h_pinch, h_pinch, "Right", 132.0)
+    assert pred_enter.pose == PoseName.THUMB_MIDDLE_PINCH
+    dbg_enter = clf.last_debug["Right"]
+    assert "thumb_middle_pinch" in dbg_enter["latched"]
+    entry = dbg_enter["latch_entry"]["thumb_middle_pinch"]
+    for key in (
+        "since_ms",
+        "dist",
+        "raw_sc",
+        "eff_speed_pw",
+        "eff_ang_deg_s",
+        "open_dist",
+        "idx_ext",
+        "half_curled_count",
+    ):
+        assert key in entry
+    assert entry["since_ms"] == pytest.approx(132.0)
+    assert entry["raw_sc"] >= 0.85
+    assert entry["open_dist"] > entry["dist"]
+    assert dbg_enter["latch_age_ms"]["thumb_middle_pinch"] == pytest.approx(0.0)
+
+    # Move wrist fast on the next frame while staying pinched -> latch_entry stays frozen at entry values!
+    h_fast_pinch = _pinch_middle_copy(_make_scaled_shifted_hand(1.0, dx=0.06))
+    clf.predict(h_fast_pinch, h_fast_pinch, "Right", 165.0)
+    dbg_moved = clf.last_debug["Right"]
+    assert dbg_moved["eff_speed_pw"] > clf.max_wrist_speed_pw
+    assert dbg_moved["latch_entry"]["thumb_middle_pinch"]["since_ms"] == pytest.approx(132.0)
+    assert dbg_moved["latch_entry"]["thumb_middle_pinch"]["eff_speed_pw"] == entry["eff_speed_pw"]
+
+
+def test_gate_debug_latch_age_increases_while_held():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    h_open = _make_open_hand()
+    h_pinch = _pinch_middle_copy(h_open)
+
+    for i in range(4):
+        clf.predict(h_open, h_open, "Right", i * 33.0)
+    clf.predict(h_pinch, h_pinch, "Right", 200.0)
+    assert clf.last_debug["Right"]["latch_age_ms"]["thumb_middle_pinch"] == pytest.approx(0.0)
+    clf.predict(h_pinch, h_pinch, "Right", 266.0)
+    assert clf.last_debug["Right"]["latch_age_ms"]["thumb_middle_pinch"] == pytest.approx(66.0)
+    clf.predict(h_pinch, h_pinch, "Right", 399.0)
+    assert clf.last_debug["Right"]["latch_age_ms"]["thumb_middle_pinch"] == pytest.approx(199.0)
+
+
+def test_latch_info_cleared_when_latch_released():
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    h_open = _make_open_hand()
+    h_pinch = _pinch_middle_copy(h_open)
+
+    for i in range(4):
+        clf.predict(h_open, h_open, "Right", i * 33.0)
+    clf.predict(h_pinch, h_pinch, "Right", 200.0)
+    assert PoseName.THUMB_MIDDLE_PINCH in clf._hands["Right"].latch_info
+    assert "thumb_middle_pinch" in clf.last_debug["Right"]["latch_entry"]
+
+    # Release back to open hand (dist >= off_dist) -> latch and latch_info MUST both clear!
+    clf.predict(h_open, h_open, "Right", 233.0)
+    assert PoseName.THUMB_MIDDLE_PINCH not in clf._hands["Right"].latched
+    assert PoseName.THUMB_MIDDLE_PINCH not in clf._hands["Right"].latch_info
+    assert clf.last_debug["Right"]["latch_entry"] == {}
+    assert clf.last_debug["Right"]["latch_age_ms"] == {}
+
+
+def test_ft_jsonl_contains_latch_entry(tmp_path: Path):
+    import json
+
+    mod = _load_replay_eval_module("replay_eval_v052_latch_entry")
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    h_open = _make_open_hand(forward_z=-0.25)
+    # Build a held thumb_index_pinch (fires dictation_start while actively latched!)
+    h_idx_pinch = list(h_open)
+    h_idx_pinch[4] = Landmark(h_open[8].x, h_open[8].y, h_open[8].z)
+    for i in range(6):
+        col.add_frame(h_open, h_open, "Right", 0.95, 1000 + i * 33)
+    for i in range(20):  # ~660 ms hold > 350 ms dictation_arm_ms
+        col.add_frame(h_idx_pinch, h_idx_pinch, "Right", 0.95, 1000 + (6 + i) * 33)
+    neg_fp = col.save(tmp_path)
+
+    jsonl_fp = tmp_path / "ft_latch_entry.jsonl"
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    rep = mod.evaluate_recordings(
+        negative_paths=[neg_fp],
+        config=cfg,
+        ft_jsonl_path=jsonl_fp,
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert rep["false_triggers"]["by_type"]["dictation_start"] >= 1
+    lines = [json.loads(ln) for ln in jsonl_fp.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    dict_events = [ev for ev in lines if ev["trigger_type"] == "dictation_start"]
+    assert len(dict_events) >= 1
+    gd = dict_events[0]["gate_debug"]
+    assert "thumb_index_pinch" in gd["latched"]
+    assert "thumb_index_pinch" in gd["latch_entry"]
+    assert "thumb_index_pinch" in gd["latch_age_ms"]
+    assert gd["latch_age_ms"]["thumb_index_pinch"] > 0.0
+    le = gd["latch_entry"]["thumb_index_pinch"]
+    for k in ("since_ms", "dist", "raw_sc", "eff_speed_pw", "eff_ang_deg_s", "open_dist", "idx_ext", "half_curled_count"):
+        assert k in le
+
+
+def test_gate_debug_logging_does_not_change_predictions():
+    from aerohand.core.types import ALL_POSE_NAMES
+
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf_a = Heuristic3DPinchClassifier(cfg)
+    clf_b = Heuristic3DPinchClassifier(cfg)
+    h_open = _make_open_hand()
+    h_pinch = _pinch_middle_copy(h_open)
+    h_pinch_moved = _pinch_middle_copy(_make_scaled_shifted_hand(1.0, dx=0.05))
+    seq = (
+        [(i * 33.0, h_open) for i in range(5)]
+        + [(165.0 + i * 33.0, h_pinch) for i in range(3)]
+        + [(264.0 + i * 33.0, h_pinch_moved) for i in range(3)]
+        + [(363.0 + i * 33.0, h_open) for i in range(3)]
+    )
+    for ts, lms in seq:
+        pa = clf_a.predict(lms, lms, "Right", ts)
+        pb = clf_b.predict(lms, lms, "Right", ts)
+        assert pa.pose == pb.pose
+        assert pa.confidence == pb.confidence
+        for k in ALL_POSE_NAMES:
+            assert pa.probabilities[k] == pytest.approx(pb.probabilities[k])
+    # Verify latch_entry stayed purely observational and matches expected deterministic behavior
+    assert clf_a.predict(h_open, h_open, "Right", 500.0).pose == PoseName.IDLE

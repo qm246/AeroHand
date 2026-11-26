@@ -134,6 +134,7 @@ def build_classifier(
     veto_idle_prob = float(cls_cfg.get("veto_idle_prob", 0.60))
     veto_scope = str(cls_cfg.get("veto_scope", "entry"))
     veto_entry_window_ms = float(cls_cfg.get("veto_entry_window_ms", 300.0))
+    veto_confirm_frames = max(1, int(cls_cfg.get("veto_confirm_frames", 3)))
     veto_on_error = str(cls_cfg.get("veto_on_error", "pass_through"))
     heuristic = Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
 
@@ -163,6 +164,7 @@ def build_classifier(
                         veto_idle_prob=veto_idle_prob,
                         veto_scope=veto_scope,
                         veto_entry_window_ms=veto_entry_window_ms,
+                        veto_confirm_frames=veto_confirm_frames,
                         veto_on_error=veto_on_error,
                         max_p95_ms=max_p95_ms,
                         on_error=on_error,
@@ -419,6 +421,8 @@ class AeroHandRuntime:
         cum = getattr(self, "_cumulative_classifier_counters", {})
         s_frames = int(cum.get("shadow_frames", 0))
         s_dis = int(cum.get("shadow_disagreements", 0))
+        s_ev = int(cum.get("shadow_events", 0))
+        s_wv_ev = int(cum.get("shadow_would_veto_events", 0))
         return {
             "mode": "heuristic",
             "active_backend": type(self.classifier).__name__,
@@ -426,12 +430,17 @@ class AeroHandRuntime:
             "shadow_frames": s_frames,
             "shadow_disagreements": s_dis,
             "shadow_disagreement_rate": round(s_dis / float(s_frames), 4) if s_frames > 0 else 0.0,
+            "shadow_events": s_ev,
+            "shadow_would_veto_events": s_wv_ev,
+            "shadow_would_veto_frames": int(cum.get("shadow_would_veto_frames", 0)),
+            "shadow_would_veto_rate": round(s_wv_ev / float(s_ev), 4) if s_ev > 0 else 0.0,
             "veto_count": int(cum.get("veto_count", 0)),
             "veto_frames": int(cum.get("veto_frames", 0)),
             "veto_retried_within_1s": int(cum.get("veto_retried_within_1s", 0)),
             "veto_abstain_not_ready": int(cum.get("veto_abstain_not_ready", 0)),
             "veto_scope": str(cls_cfg.get("veto_scope", "entry")),
             "veto_entry_window_ms": float(cls_cfg.get("veto_entry_window_ms", 300.0)),
+            "veto_confirm_frames": max(1, int(cls_cfg.get("veto_confirm_frames", 3))),
             "veto_on_error": str(cls_cfg.get("veto_on_error", "pass_through")),
             "veto_min_prob": float(cls_cfg.get("veto_min_prob", 0.35)),
             "veto_idle_prob": float(cls_cfg.get("veto_idle_prob", 0.60)),
@@ -560,6 +569,7 @@ class AeroHandRuntime:
             or float(new_cls.get("veto_idle_prob", 0.60)) != float(old_cls.get("veto_idle_prob", 0.60))
             or str(new_cls.get("veto_scope", "entry")) != str(old_cls.get("veto_scope", "entry"))
             or float(new_cls.get("veto_entry_window_ms", 300.0)) != float(old_cls.get("veto_entry_window_ms", 300.0))
+            or int(new_cls.get("veto_confirm_frames", 3)) != int(old_cls.get("veto_confirm_frames", 3))
             or str(new_cls.get("veto_on_error", "pass_through")) != str(old_cls.get("veto_on_error", "pass_through"))
             or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
         )
@@ -577,6 +587,7 @@ class AeroHandRuntime:
                     veto_idle_prob=float(new_cls.get("veto_idle_prob", 0.60)),
                     veto_scope=str(new_cls.get("veto_scope", "entry")),
                     veto_entry_window_ms=float(new_cls.get("veto_entry_window_ms", 300.0)),
+                    veto_confirm_frames=int(new_cls.get("veto_confirm_frames", 3)),
                     veto_on_error=str(new_cls.get("veto_on_error", "pass_through")),
                     max_p95_ms=float(new_cls.get("max_onnx_p95_ms", 8.0)),
                 )
@@ -591,6 +602,7 @@ class AeroHandRuntime:
                     veto_idle_prob=float(new_cls.get("veto_idle_prob", 0.60)),
                     veto_scope=str(new_cls.get("veto_scope", "entry")),
                     veto_entry_window_ms=float(new_cls.get("veto_entry_window_ms", 300.0)),
+                    veto_confirm_frames=int(new_cls.get("veto_confirm_frames", 3)),
                     veto_on_error=str(new_cls.get("veto_on_error", "pass_through")),
                     max_p95_ms=float(new_cls.get("max_onnx_p95_ms", 8.0)),
                 )

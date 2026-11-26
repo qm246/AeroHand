@@ -120,6 +120,7 @@ classifier:
   veto_idle_prob: 0.60                 # In veto mode: veto if ONNX prob(idle) > 0.60
   veto_scope: "entry"                  # "entry" (only first veto_entry_window_ms) | "always"
   veto_entry_window_ms: 300.0          # Window (ms) after heuristic rising edge where ONNX may veto
+  veto_confirm_frames: 3               # Consecutive ready ONNX approval frames required to accept an entry
   veto_on_error: "pass_through"        # "pass_through" (preserve heuristic on ONNX error) | "idle"
   max_onnx_p95_ms: 8.0                 # Auto-fallback to heuristic if ONNX p95 latency > 8ms
   heuristic_3d:

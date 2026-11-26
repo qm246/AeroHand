@@ -3753,7 +3753,10 @@ def test_veto_blocks_low_probability_pose():
     guarded.predict(h, h, "Right", 250.0)
     heur.set(PoseName.THUMB_INDEX_PINCH, 0.92, 0.08)
     onnx.set(PoseName.THUMB_INDEX_PINCH, 0.82, 0.18)
-    pred_ok = guarded.predict(h, h, "Right", 400.0)
+    # Default veto_confirm_frames=3 requires 3 consecutive approving ready frames before accepting
+    for i in range(2):
+        assert guarded.predict(h, h, "Right", 400.0 + i * 33.0).pose == PoseName.IDLE
+    pred_ok = guarded.predict(h, h, "Right", 466.0)
     assert pred_ok.pose == PoseName.THUMB_INDEX_PINCH
     tel = guarded.telemetry()
     assert tel["veto_count"] == 1
@@ -4393,10 +4396,14 @@ def test_veto_does_not_interrupt_active_hold():
             pass
 
     onnx = _FlipOnnx()
-    guarded = GuardedClassifier(onnx, _HeurDrag(), mode="veto", veto_scope="entry", veto_entry_window_ms=300.0)
+    guarded = GuardedClassifier(
+        onnx, _HeurDrag(), mode="veto", veto_scope="entry", veto_entry_window_ms=300.0, veto_confirm_frames=3
+    )
     h = _make_open_hand()
-    # Entry frame approved at t=0
-    assert guarded.predict(h, h, "Right", 0.0).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+    # Entry frames approved consecutively at t=0, 33, 66 -> accepted on 3rd frame
+    assert guarded.predict(h, h, "Right", 0.0).pose == PoseName.IDLE
+    assert guarded.predict(h, h, "Right", 33.0).pose == PoseName.IDLE
+    assert guarded.predict(h, h, "Right", 66.0).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
     # Mid-drag ONNX flickers to IDLE at t=100..600ms -> entry-only veto MUST NOT interrupt active drag!
     onnx.approve = False
     for ts in (100.0, 250.0, 400.0, 600.0):
@@ -4518,7 +4525,7 @@ def test_veto_scope_always_preserves_legacy_behavior():
             pass
 
     onnx = _FlipOnnx()
-    guarded = GuardedClassifier(onnx, _HeurDrag(), mode="veto", veto_scope="always")
+    guarded = GuardedClassifier(onnx, _HeurDrag(), mode="veto", veto_scope="always", veto_confirm_frames=1)
     h = _make_open_hand()
     assert guarded.predict(h, h, "Right", 0.0).pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
     onnx.approve = False
@@ -5281,3 +5288,231 @@ def test_api_rejects_body_over_limit(tmp_path: Path):
         assert resp.status == 413, f"Expected HTTP 413 Payload Too Large, got {resp.status}: {body}"
     finally:
         srv.stop()
+
+
+# ==============================================================================
+# V052-01: Multi-Frame Veto Confirmation & Aligned Shadow Event Counting
+# ==============================================================================
+
+
+class _ScriptedClf:
+    """Deterministic stub classifier yielding scripted `(pose, p_pose, p_idle, ready)` tuples."""
+
+    def __init__(self, script: List[tuple[PoseName, float, float, bool]]) -> None:
+        self._script = list(script)
+        self._idx = 0
+
+    def predict(self, *args, **kwargs):
+        from aerohand.ml.base import PinchPrediction
+
+        pose, p_pose, p_idle, ready = self._script[min(self._idx, len(self._script) - 1)]
+        self._idx += 1
+        probs = idle_probabilities()
+        probs[PoseName.IDLE] = p_idle
+        if pose != PoseName.IDLE:
+            probs[pose] = p_pose
+        return PinchPrediction(pose, probs, "high" if ready else "low", ready=ready)
+
+    def reset(self, hand=None):
+        pass
+
+
+def test_veto_requires_k_consecutive_approvals():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    # Approve x2, reject x1 (resets streak!), then approve x3 -> only 6th frame accepts!
+    onnx = _ScriptedClf(
+        [
+            (p, 0.85, 0.15, True),
+            (p, 0.85, 0.15, True),
+            (PoseName.IDLE, 0.0, 0.90, True),
+            (p, 0.85, 0.15, True),
+            (p, 0.85, 0.15, True),
+            (p, 0.85, 0.15, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=3, veto_entry_window_ms=300.0)
+    h = _make_open_hand()
+    outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(6)]
+    assert outs == [PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, p]
+    tel = guarded.telemetry()
+    assert tel["veto_confirm_frames"] == 3
+    assert tel["veto_count"] == 1
+    assert tel["veto_frames"] == 1
+
+
+def test_veto_single_approval_frame_does_not_accept():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_INDEX_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    # 1 approval frame followed by rejections -> must NEVER accept
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=3)
+    h = _make_open_hand()
+    outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(4)]
+    assert all(out == PoseName.IDLE for out in outs)
+    assert guarded.telemetry()["veto_count"] == 1
+
+
+def test_veto_confirm_frames_1_matches_legacy_first_approval():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_RING_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    onnx = _ScriptedClf(
+        [
+            (p, 0.85, 0.15, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=1, veto_scope="entry")
+    h = _make_open_hand()
+    assert guarded.predict(h, h, "Right", 0.0).pose == p
+    assert guarded.predict(h, h, "Right", 33.0).pose == p
+    assert guarded.telemetry()["veto_count"] == 0
+
+
+def test_veto_confirm_adds_exactly_k_minus_1_frames_latency():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    for k in (1, 2, 3, 4):
+        heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+        onnx = _ScriptedClf([(p, 0.90, 0.10, True)])
+        guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=k)
+        first_accept_idx = None
+        for idx in range(k + 2):
+            out = guarded.predict(h, h, "Right", idx * 33.0).pose
+            if out == p and first_accept_idx is None:
+                first_accept_idx = idx
+        assert first_accept_idx == k - 1, f"K={k}: expected first accept at frame {k - 1}, got {first_accept_idx}"
+
+
+def test_veto_unready_frames_do_not_reset_streak():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    # Frame 0: ready approve (streak=1 -> IDLE)
+    # Frame 1: unready (abstain -> heur pass-through, streak stays 1, NOT 2 and NOT 0)
+    # Frame 2: ready approve (streak=2 -> IDLE, proves unready did not increment streak)
+    # Frame 3: ready approve (streak=3 -> accepted -> p, proves unready did not reset streak)
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 1.0, False),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="veto", veto_confirm_frames=3)
+    h = _make_open_hand()
+    outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(4)]
+    assert outs == [PoseName.IDLE, p, PoseName.IDLE, p]
+    tel = guarded.telemetry()
+    assert tel["veto_abstain_not_ready"] == 1
+    assert tel["veto_count"] == 0
+
+
+def test_veto_late_accept_after_window_when_streak_reached():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_INDEX_MIDDLE_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    # Reject during window, then after 300 ms approve 3 consecutive frames -> late accept & 1 veto_count
+    onnx = _ScriptedClf(
+        [
+            (PoseName.IDLE, 0.0, 0.95, True),  # t=0 (in window, vetoed)
+            (PoseName.IDLE, 0.0, 0.95, True),  # t=150 (in window)
+            (p, 0.90, 0.10, True),             # t=350 (past window, streak=1 -> still IDLE)
+            (p, 0.90, 0.10, True),             # t=383 (past window, streak=2 -> still IDLE)
+            (p, 0.90, 0.10, True),             # t=416 (past window, streak=3 -> LATE ACCEPT!)
+            (PoseName.IDLE, 0.0, 0.95, True),  # t=450 (accepted hold -> never interrupted!)
+        ]
+    )
+    guarded = GuardedClassifier(
+        onnx, heur, mode="veto", veto_scope="entry", veto_entry_window_ms=300.0, veto_confirm_frames=3
+    )
+    h = _make_open_hand()
+    timestamps = [0.0, 150.0, 350.0, 383.0, 416.0, 450.0]
+    outs = [guarded.predict(h, h, "Right", ts).pose for ts in timestamps]
+    assert outs == [PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, PoseName.IDLE, p, p]
+    assert guarded.telemetry()["veto_count"] == 1
+
+
+def test_veto_never_interrupts_accepted_hold():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_RING_PINCH
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 0.99, True),
+            (PoseName.IDLE, 0.0, 0.99, True),
+            (PoseName.IDLE, 0.0, 0.99, True),
+        ]
+    )
+    guarded = GuardedClassifier(
+        onnx, heur, mode="veto", veto_scope="entry", veto_entry_window_ms=300.0, veto_confirm_frames=3
+    )
+    h = _make_open_hand()
+    outs = [guarded.predict(h, h, "Right", i * 33.0).pose for i in range(6)]
+    assert outs == [PoseName.IDLE, PoseName.IDLE, p, p, p, p]
+    assert guarded.telemetry()["veto_count"] == 0
+
+
+def test_shadow_mode_counts_would_veto_with_k_frame_confirm_rule():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    # Event 1: 1 approval frame then 2 rejections (would be vetoed!) -> release to IDLE
+    # Event 2: 3 consecutive approvals -> would be accepted (NOT vetoed) -> release to IDLE
+    heur = _ScriptedClf(
+        [
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+        ]
+    )
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+        ]
+    )
+    guarded = GuardedClassifier(onnx, heur, mode="shadow", veto_confirm_frames=3)
+    h = _make_open_hand()
+    for i in range(8):
+        out = guarded.predict(h, h, "Right", i * 33.0)
+        # Shadow mode NEVER alters heuristic output
+        assert out.pose == (PoseName.IDLE if i in (3, 7) else p)
+    tel = guarded.telemetry()
+    assert tel["shadow_events"] == 2
+    assert tel["shadow_would_veto_events"] == 1
+    assert tel["shadow_would_veto_rate"] == pytest.approx(0.5)
+    assert load_config()["classifier"]["veto_confirm_frames"] == 3

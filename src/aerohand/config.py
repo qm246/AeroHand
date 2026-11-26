@@ -202,6 +202,7 @@ SAFE_NUMERIC_RANGES: Dict[str, Tuple[float, float]] = {
     "classifier.veto_min_prob": (0.05, 0.95),
     "classifier.veto_idle_prob": (0.05, 0.95),
     "classifier.veto_entry_window_ms": (0.0, 2000.0),
+    "classifier.veto_confirm_frames": (1.0, 10.0),
     "classifier.max_onnx_p95_ms": (1.0, 30.0),
 }
 

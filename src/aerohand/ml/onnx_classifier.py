@@ -205,15 +205,32 @@ class ONNXPinchClassifier:
         )
 
 
+class _HeurEventState:
+    """Per-hand state tracking multi-frame ONNX confirmation for one heuristic pose attempt (V052-01)."""
+
+    __slots__ = ("pose", "enter_ts_ms", "accepted", "ever_accepted", "event_vetoed", "approve_streak", "saw_ready")
+
+    def __init__(self, pose: PoseName, enter_ts_ms: float) -> None:
+        self.pose: PoseName = pose
+        self.enter_ts_ms: float = enter_ts_ms
+        self.accepted: bool = False
+        self.ever_accepted: bool = False
+        self.event_vetoed: bool = False
+        self.approve_streak: int = 0
+        self.saw_ready: bool = False
+
+
 class GuardedClassifier:
     """
-    Production safety wrapper for ONNX TCN + Heuristic3D fallback (V040-04 / V050-04 / V051-03..06):
+    Production safety wrapper for ONNX TCN + Heuristic3D fallback (V040-04 / V050-04 / V051-03..06 / V052-01):
       - Modes:
           * `heuristic`: runs Heuristic3D only.
-          * `shadow`: runs ONNX alongside Heuristic3D and logs disagreement rates on ready frames only.
+          * `shadow`: runs ONNX alongside Heuristic3D and tracks both frame disagreements AND
+            event-level `shadow_would_veto_*` counters using the exact K-frame confirmation rule.
           * `veto`: Heuristic3D proposes; ONNX can ONLY veto non-idle poses when `ready=True`.
-            Default `veto_scope="entry"` applies veto strictly within `veto_entry_window_ms` (300 ms)
-            of the heuristic rising edge so ongoing drags/scrolls/dictations are never interrupted.
+            Default `veto_scope="entry"` requires `K = veto_confirm_frames` consecutive ready
+            ONNX approval frames (`p_proposed >= veto_min_prob` and `p_idle <= veto_idle_prob`)
+            before marking the attempt `accepted`; once accepted, ongoing holds are never interrupted.
             ONNX can NEVER create a new activation when Heuristic3D predicts IDLE.
           * `onnx`: full ONNX 1D-TCN predictions.
       - Latency guard: tracks ONLY real inference calls (`ready=True`, `infer_ms` around `session.run`),
@@ -233,6 +250,7 @@ class GuardedClassifier:
         veto_idle_prob: float = 0.60,
         veto_scope: str = "entry",
         veto_entry_window_ms: float = 300.0,
+        veto_confirm_frames: int = 3,
         veto_on_error: str = "pass_through",
         max_p95_ms: float = 8.0,
         min_latency_samples: int = 30,
@@ -254,6 +272,7 @@ class GuardedClassifier:
         scope_norm = str(veto_scope or "entry").strip().lower()
         self.veto_scope: str = scope_norm if scope_norm in VALID_VETO_SCOPES else "entry"
         self.veto_entry_window_ms: float = max(0.0, float(veto_entry_window_ms))
+        self.veto_confirm_frames: int = max(1, int(veto_confirm_frames))
         err_pol = str(veto_on_error or "pass_through").strip().lower()
         self.veto_on_error: str = err_pol if err_pol in VALID_VETO_ON_ERROR else "pass_through"
 
@@ -274,12 +293,16 @@ class GuardedClassifier:
         self._fallback_reason: Optional[str] = None
         self._shadow_frames: int = 0
         self._shadow_disagreements: int = 0
+        self._shadow_events: int = 0
+        self._shadow_would_veto_events: int = 0
+        self._shadow_would_veto_frames: int = 0
         self._veto_count: int = 0
         self._veto_frames: int = 0
         self._veto_retried_within_1s: int = 0
         self._veto_abstain_not_ready: int = 0
-        # Per-hand rising-edge event tracker: (pose, enter_ts_ms, accepted, event_vetoed)
-        self._heur_event_by_hand: Dict[Handedness, Tuple[PoseName, float, bool, bool]] = {}
+        # Per-hand rising-edge event trackers (V051-05 / V052-01)
+        self._heur_event_by_hand: Dict[Handedness, _HeurEventState] = {}
+        self._shadow_event_by_hand: Dict[Handedness, _HeurEventState] = {}
         # Per-hand last vetoed event for retry-within-1s detection: (pose, veto_ts_ms, released_to_idle)
         self._last_veto_by_hand: Dict[Handedness, Tuple[PoseName, float, bool]] = {}
 
@@ -304,6 +327,7 @@ class GuardedClassifier:
             self._mode = norm
             self._last_veto_by_hand.clear()
             self._heur_event_by_hand.clear()
+            self._shadow_event_by_hand.clear()
             self.reset(None)
 
     def rearm(self) -> None:
@@ -322,10 +346,11 @@ class GuardedClassifier:
         veto_idle_prob: Optional[float] = None,
         veto_scope: Optional[str] = None,
         veto_entry_window_ms: Optional[float] = None,
+        veto_confirm_frames: Optional[int] = None,
         veto_on_error: Optional[str] = None,
         max_p95_ms: Optional[float] = None,
     ) -> None:
-        """Update guard/veto settings in-place without rebuilding ONNX or resetting counters (V051-06)."""
+        """Update guard/veto settings in-place without rebuilding ONNX or resetting counters (V051-06 / V052-01)."""
         if veto_min_prob is not None:
             self.veto_min_prob = max(0.05, min(0.95, float(veto_min_prob)))
         if veto_idle_prob is not None:
@@ -336,6 +361,8 @@ class GuardedClassifier:
                 self.veto_scope = s
         if veto_entry_window_ms is not None:
             self.veto_entry_window_ms = max(0.0, float(veto_entry_window_ms))
+        if veto_confirm_frames is not None:
+            self.veto_confirm_frames = max(1, int(veto_confirm_frames))
         if veto_on_error is not None:
             p = str(veto_on_error).strip().lower()
             if p in VALID_VETO_ON_ERROR:
@@ -354,6 +381,9 @@ class GuardedClassifier:
         return {
             "shadow_frames": self._shadow_frames,
             "shadow_disagreements": self._shadow_disagreements,
+            "shadow_events": self._shadow_events,
+            "shadow_would_veto_events": self._shadow_would_veto_events,
+            "shadow_would_veto_frames": self._shadow_would_veto_frames,
             "veto_count": self._veto_count,
             "veto_frames": self._veto_frames,
             "veto_retried_within_1s": self._veto_retried_within_1s,
@@ -367,6 +397,9 @@ class GuardedClassifier:
             return
         self._shadow_frames = int(counters.get("shadow_frames", self._shadow_frames))
         self._shadow_disagreements = int(counters.get("shadow_disagreements", self._shadow_disagreements))
+        self._shadow_events = int(counters.get("shadow_events", self._shadow_events))
+        self._shadow_would_veto_events = int(counters.get("shadow_would_veto_events", self._shadow_would_veto_events))
+        self._shadow_would_veto_frames = int(counters.get("shadow_would_veto_frames", self._shadow_would_veto_frames))
         self._veto_count = int(counters.get("veto_count", self._veto_count))
         self._veto_frames = int(counters.get("veto_frames", self._veto_frames))
         self._veto_retried_within_1s = int(counters.get("veto_retried_within_1s", self._veto_retried_within_1s))
@@ -400,9 +433,11 @@ class GuardedClassifier:
         if hand is None:
             self._last_veto_by_hand.clear()
             self._heur_event_by_hand.clear()
+            self._shadow_event_by_hand.clear()
         else:
             self._last_veto_by_hand.pop(hand, None)
             self._heur_event_by_hand.pop(hand, None)
+            self._shadow_event_by_hand.pop(hand, None)
         for clf in (self._onnx, self._fallback):
             try:
                 clf.reset(hand)  # type: ignore[call-arg]
@@ -459,6 +494,65 @@ class GuardedClassifier:
                 f"over {len(self._latencies_ms)} inferences."
             )
 
+    def _is_onnx_approving(self, heur_pose: PoseName, onnx_pred: PinchPrediction) -> bool:
+        p_proposed = float(onnx_pred.probabilities.get(heur_pose, 0.0))
+        p_idle = float(onnx_pred.probabilities.get(PoseName.IDLE, 0.0))
+        return (p_proposed >= self.veto_min_prob) and (p_idle <= self.veto_idle_prob)
+
+    def _finalize_shadow_event(self, ev: Optional[_HeurEventState]) -> None:
+        """If a shadow event ended without ever reaching K approvals after seeing ready ONNX, count it."""
+        if ev is not None and ev.saw_ready and (not ev.ever_accepted) and (not ev.event_vetoed):
+            ev.event_vetoed = True
+            self._shadow_would_veto_events += 1
+
+    def _track_shadow_veto_rule(
+        self,
+        heur_pred: PinchPrediction,
+        onnx_pred: PinchPrediction,
+        handedness: Handedness,
+        timestamp_ms: float,
+    ) -> None:
+        """Mirror the exact K-frame veto confirmation rule in shadow mode so counters reflect real veto."""
+        if heur_pred.pose == PoseName.IDLE:
+            prev_ev = self._shadow_event_by_hand.pop(handedness, None)
+            self._finalize_shadow_event(prev_ev)
+            return
+
+        cur_ev = self._shadow_event_by_hand.get(handedness)
+        if cur_ev is None or cur_ev.pose != heur_pred.pose:
+            self._finalize_shadow_event(cur_ev)
+            cur_ev = _HeurEventState(heur_pred.pose, float(timestamp_ms))
+            self._shadow_event_by_hand[handedness] = cur_ev
+            self._shadow_events += 1
+
+        # Unready ONNX frame: abstain cleanly (neither increment nor reset approve_streak)
+        if not onnx_pred.ready:
+            return
+
+        cur_ev.saw_ready = True
+        if self.veto_scope == "entry" and cur_ev.accepted:
+            return
+
+        elapsed_ms = float(timestamp_ms) - cur_ev.enter_ts_ms
+        if self.veto_scope == "entry" and elapsed_ms > self.veto_entry_window_ms and (not cur_ev.event_vetoed):
+            cur_ev.event_vetoed = True
+            self._shadow_would_veto_events += 1
+
+        if self._is_onnx_approving(heur_pred.pose, onnx_pred):
+            cur_ev.approve_streak += 1
+            if cur_ev.approve_streak >= self.veto_confirm_frames:
+                cur_ev.ever_accepted = True
+                if self.veto_scope == "entry":
+                    cur_ev.accepted = True
+            else:
+                self._shadow_would_veto_frames += 1
+        else:
+            cur_ev.approve_streak = 0
+            self._shadow_would_veto_frames += 1
+            if not cur_ev.event_vetoed:
+                cur_ev.event_vetoed = True
+                self._shadow_would_veto_events += 1
+
     def predict(
         self,
         landmarks_2d: Sequence[Landmark],
@@ -480,6 +574,7 @@ class GuardedClassifier:
                     self._shadow_frames += 1
                     if onnx_pred.pose != heur_pred.pose:
                         self._shadow_disagreements += 1
+                self._track_shadow_veto_rule(heur_pred, onnx_pred, handedness, timestamp_ms)
             except Exception as exc:
                 self._record_error(exc, invoke_on_error=False)
             return heur_pred
@@ -507,47 +602,57 @@ class GuardedClassifier:
                     self._last_veto_by_hand[handedness] = (prev_v[0], prev_v[1], True)
                 return heur_pred
 
-            # Track heuristic rising-edge event per hand (V051-05)
+            # Track heuristic rising-edge event per hand (V051-05 / V052-01)
             cur_ev = self._heur_event_by_hand.get(handedness)
-            if cur_ev is None or cur_ev[0] != heur_pred.pose:
+            if cur_ev is None or cur_ev.pose != heur_pred.pose:
                 # Rising edge of a new heuristic pose attempt
                 prev_v = self._last_veto_by_hand.get(handedness)
                 if prev_v is not None and prev_v[2]:
                     if prev_v[0] == heur_pred.pose and 0.0 <= (timestamp_ms - prev_v[1]) <= 1000.0:
                         self._veto_retried_within_1s += 1
                     self._last_veto_by_hand.pop(handedness, None)
-                cur_ev = (heur_pred.pose, float(timestamp_ms), False, False)
+                cur_ev = _HeurEventState(heur_pred.pose, float(timestamp_ms))
                 self._heur_event_by_hand[handedness] = cur_ev
-
-            ev_pose, enter_ts_ms, accepted, event_vetoed = cur_ev
 
             if self._fell_back or onnx_pred is None:
                 return heur_pred
 
-            # V051-04: ONNX warming up / not ready -> abstain cleanly (never silently veto!)
+            # V051-04 / V052-01: ONNX warming up / not ready -> abstain cleanly without changing streak
             if not onnx_pred.ready:
                 self._veto_abstain_not_ready += 1
                 return heur_pred
 
-            # V051-05: In entry scope, once accepted (or past entry window un-vetoed), never interrupt active hold
-            if self.veto_scope == "entry":
-                if accepted or ((timestamp_ms - enter_ts_ms) > self.veto_entry_window_ms and not event_vetoed):
-                    self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, True, False)
-                    return heur_pred
+            cur_ev.saw_ready = True
 
-            p_proposed = float(onnx_pred.probabilities.get(heur_pred.pose, 0.0))
-            p_idle = float(onnx_pred.probabilities.get(PoseName.IDLE, 0.0))
-            if p_proposed < self.veto_min_prob or p_idle > self.veto_idle_prob:
-                self._veto_frames += 1
-                if not event_vetoed:
-                    self._veto_count += 1
-                    self._last_veto_by_hand[handedness] = (heur_pred.pose, float(timestamp_ms), False)
-                self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, False, True)
+            # V051-05 / V052-01: Once accepted in entry scope, never interrupt an active hold
+            if self.veto_scope == "entry" and cur_ev.accepted:
+                return heur_pred
+
+            # Past entry window without prior acceptance: count 1 veto event and keep requiring K approvals (late accept)
+            elapsed_ms = float(timestamp_ms) - cur_ev.enter_ts_ms
+            if self.veto_scope == "entry" and elapsed_ms > self.veto_entry_window_ms and (not cur_ev.event_vetoed):
+                cur_ev.event_vetoed = True
+                self._veto_count += 1
+                self._last_veto_by_hand[handedness] = (heur_pred.pose, float(timestamp_ms), False)
+
+            if self._is_onnx_approving(heur_pred.pose, onnx_pred):
+                cur_ev.approve_streak += 1
+                if cur_ev.approve_streak >= self.veto_confirm_frames:
+                    cur_ev.ever_accepted = True
+                    if self.veto_scope == "entry":
+                        cur_ev.accepted = True
+                    return heur_pred
+                # Pending confirmation (< K consecutive ready approvals): stay IDLE
                 return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
 
-            # Approved by ONNX -> mark accepted so active hold stays uninterrupted in entry scope
-            self._heur_event_by_hand[handedness] = (ev_pose, enter_ts_ms, True, False)
-            return heur_pred
+            # Rejected by ONNX -> reset confirmation streak and veto
+            cur_ev.approve_streak = 0
+            self._veto_frames += 1
+            if not cur_ev.event_vetoed:
+                cur_ev.event_vetoed = True
+                self._veto_count += 1
+                self._last_veto_by_hand[handedness] = (heur_pred.pose, float(timestamp_ms), False)
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
 
         t0 = self._clock_s()
         try:
@@ -561,6 +666,11 @@ class GuardedClassifier:
 
     def telemetry(self) -> Dict[str, Any]:
         rate = (self._shadow_disagreements / float(self._shadow_frames)) if self._shadow_frames > 0 else 0.0
+        wv_rate = (
+            self._shadow_would_veto_events / float(self._shadow_events)
+            if self._shadow_events > 0
+            else 0.0
+        )
         return {
             "mode": self._mode,
             "active_backend": self.active_backend_name,
@@ -568,12 +678,17 @@ class GuardedClassifier:
             "shadow_frames": self._shadow_frames,
             "shadow_disagreements": self._shadow_disagreements,
             "shadow_disagreement_rate": round(rate, 4),
+            "shadow_events": self._shadow_events,
+            "shadow_would_veto_events": self._shadow_would_veto_events,
+            "shadow_would_veto_frames": self._shadow_would_veto_frames,
+            "shadow_would_veto_rate": round(wv_rate, 4),
             "veto_count": self._veto_count,
             "veto_frames": self._veto_frames,
             "veto_retried_within_1s": self._veto_retried_within_1s,
             "veto_abstain_not_ready": self._veto_abstain_not_ready,
             "veto_scope": self.veto_scope,
             "veto_entry_window_ms": self.veto_entry_window_ms,
+            "veto_confirm_frames": self.veto_confirm_frames,
             "veto_on_error": self.veto_on_error,
             "veto_min_prob": self.veto_min_prob,
             "veto_idle_prob": self.veto_idle_prob,

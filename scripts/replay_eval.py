@@ -38,6 +38,7 @@ from aerohand.core.types import ALL_POSE_NAMES, HandInput
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+from aerohand.ml.provenance import compute_onnx_model_hash
 from aerohand.ml.recording_io import (
     POSE_TO_IDX,
     assert_not_heldout,
@@ -561,22 +562,20 @@ def compute_eval_model_hash(
     For `heuristic_3d`, hashes BOTH `cfg["classifier"]` AND the `heuristic_3d.py` source file so
     code edits produce a distinct hash even when YAML thresholds are unchanged.
     """
+    if backend_name == "onnx_tcn" and model_path and normalizer_path:
+        return compute_onnx_model_hash(model_path, normalizer_path)
     h = hashlib.sha256()
     h.update(str(backend_name).encode("utf-8"))
-    if backend_name == "onnx_tcn" and model_path and normalizer_path:
-        for p in (Path(model_path), Path(normalizer_path)):
-            h.update(p.read_bytes())
+    cls_blob = json.dumps(cfg.get("classifier") or {}, sort_keys=True, ensure_ascii=False)
+    h.update(cls_blob.encode("utf-8"))
+    if heuristic_source_bytes is not None:
+        h.update(heuristic_source_bytes)
     else:
-        cls_blob = json.dumps(cfg.get("classifier") or {}, sort_keys=True, ensure_ascii=False)
-        h.update(cls_blob.encode("utf-8"))
-        if heuristic_source_bytes is not None:
-            h.update(heuristic_source_bytes)
-        else:
-            import inspect
+        import inspect
 
-            src_file = inspect.getsourcefile(Heuristic3DPinchClassifier)
-            if src_file and Path(src_file).is_file():
-                h.update(Path(src_file).read_bytes())
+        src_file = inspect.getsourcefile(Heuristic3DPinchClassifier)
+        if src_file and Path(src_file).is_file():
+            h.update(Path(src_file).read_bytes())
     return h.hexdigest()[:24]
 
 

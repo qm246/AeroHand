@@ -5516,3 +5516,178 @@ def test_shadow_mode_counts_would_veto_with_k_frame_confirm_rule():
     assert tel["shadow_would_veto_events"] == 1
     assert tel["shadow_would_veto_rate"] == pytest.approx(0.5)
     assert load_config()["classifier"]["veto_confirm_frames"] == 3
+
+
+# ==============================================================================
+# V052-02: Provenance Binding in Runtime Telemetry & Strict Vitals Promotion Gate
+# ==============================================================================
+
+
+def test_onnx_model_hash_matches_train_formula(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+    from aerohand.ml.recording_io import sha256_file
+
+    train_mod = _load_train_tcn_module("train_v052_02_hash")
+    replay_mod = _load_replay_eval_module("replay_v052_02_hash")
+
+    model_fp = tmp_path / "m_prov.onnx"
+    model_fp.write_bytes(b"fake-onnx-model-payload-v052")
+    norm_fp = tmp_path / "m_prov_normalizer.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _DummyOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            return [np.zeros((1, 7), dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _DummyOrt)
+    clf = ONNXPinchClassifier(model_fp, norm_fp, sequence_length=5, warmup_runs=1)
+    expected_train_hash = train_mod.compute_onnx_model_hash(model_fp, norm_fp)
+    expected_replay_hash = replay_mod.compute_eval_model_hash(
+        "onnx_tcn", load_config(), model_path=model_fp, normalizer_path=norm_fp
+    )
+    assert clf.model_hash == expected_train_hash == expected_replay_hash
+    assert len(clf.model_hash) == 24
+    assert clf.model_sha256 == sha256_file(model_fp)
+
+
+def test_guarded_telemetry_includes_model_hash(tmp_path: Path, monkeypatch):
+    import json
+
+    import onnxruntime as ort
+
+    from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
+    from aerohand.ml.provenance import compute_heuristic_source_sha256
+
+    model_fp = tmp_path / "m_tel.onnx"
+    model_fp.write_bytes(b"guarded-telemetry-onnx-bytes")
+    norm_fp = tmp_path / "m_tel_norm.json"
+    norm_fp.write_text(
+        json.dumps(
+            {
+                "feature_set": "invariant348",
+                "sequence_length": 5,
+                "mean": [0.0] * FEATURE_DIM_3D,
+                "scale": [1.0] * FEATURE_DIM_3D,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _DummyOrt:
+        def __init__(self, *_a, **_kw) -> None:
+            pass
+
+        def get_inputs(self):
+            class _In:
+                name = "input"
+
+            return [_In()]
+
+        def run(self, _out, _feed):
+            return [np.zeros((1, 7), dtype=np.float32)]
+
+    monkeypatch.setattr(ort, "InferenceSession", _DummyOrt)
+    onnx = ONNXPinchClassifier(model_fp, norm_fp, sequence_length=5, warmup_runs=1)
+    guarded = GuardedClassifier(onnx, Heuristic3DPinchClassifier(), mode="veto")
+    tel = guarded.telemetry()
+    assert tel["model_hash"] == onnx.model_hash
+    assert tel["model_sha256"] == onnx.model_sha256
+    assert tel["heuristic_source_sha256"] == compute_heuristic_source_sha256()
+    assert len(tel["heuristic_source_sha256"]) == 64
+
+
+def test_promotion_fails_when_vitals_lacks_hash():
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_v052_vh_missing")
+    cfg = load_config()
+    metrics_ok = {"model_hash": "e" * 24, "model_sha256": "f" * 64, "subject_heldout_metrics": None}
+    sealed_ok = {
+        "model_hash": "e" * 24,
+        "model_sha256": "f" * 64,
+        "heldout_audit": {"touched": 1, "model_hash": "e" * 24, "model_sha256": "f" * 64},
+        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+    }
+    vitals_no_hash = {"classifier": {"onnx_p95_ms": 1.2, "guard_active": True, "fell_back": False}}
+
+    res = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok,
+        sealed_eval_report=sealed_ok,
+        vitals_report=vitals_no_hash,
+        config=cfg,
+        stage="veto",
+    )
+    assert res["passed"] is False
+    assert res["criteria"]["provenance_hash_match"]["passed"] is False
+    assert "vitals_report missing" in res["criteria"]["provenance_hash_match"]["detail"]
+
+
+def test_promotion_fails_when_vitals_hash_differs():
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_v052_vh_diff")
+    cfg = load_config()
+    metrics_ok = {"model_hash": "e" * 24, "model_sha256": "f" * 64, "subject_heldout_metrics": None}
+    sealed_ok = {
+        "model_hash": "e" * 24,
+        "model_sha256": "f" * 64,
+        "heldout_audit": {"touched": 1, "model_hash": "e" * 24, "model_sha256": "f" * 64},
+        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+    }
+    vitals_wrong = {
+        "classifier": {
+            "onnx_p95_ms": 1.2,
+            "guard_active": True,
+            "fell_back": False,
+            "model_hash": "9" * 24,
+            "model_sha256": "8" * 64,
+        }
+    }
+    res_bad = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok,
+        sealed_eval_report=sealed_ok,
+        vitals_report=vitals_wrong,
+        config=cfg,
+        stage="veto",
+    )
+    assert res_bad["passed"] is False
+    assert res_bad["criteria"]["provenance_hash_match"]["passed"] is False
+
+    # Matching vitals hash MUST pass cleanly
+    vitals_good = {
+        "classifier": {
+            "onnx_p95_ms": 1.2,
+            "guard_active": True,
+            "fell_back": False,
+            "model_hash": "e" * 24,
+            "model_sha256": "f" * 64,
+        }
+    }
+    res_good = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_ok,
+        sealed_eval_report=sealed_ok,
+        vitals_report=vitals_good,
+        config=cfg,
+        stage="veto",
+    )
+    assert res_good["passed"] is True
+    assert res_good["criteria"]["provenance_hash_match"]["passed"] is True

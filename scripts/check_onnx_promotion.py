@@ -22,7 +22,6 @@ Prints structured pass/fail per criterion and exits non-zero if ANY criterion fa
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import sys
@@ -34,6 +33,7 @@ import numpy as np
 
 from aerohand.config import load_config
 from aerohand.core.types import ALL_POSE_NAMES
+from aerohand.ml.provenance import compute_onnx_model_hash
 from aerohand.ml.recording_io import sha256_file
 
 
@@ -48,11 +48,7 @@ def _load_replay_eval_helpers():
 
 
 def _compute_onnx_model_hash(model_path: str | Path, normalizer_path: str | Path) -> str:
-    h = hashlib.sha256()
-    h.update(b"onnx_tcn")
-    h.update(Path(model_path).read_bytes())
-    h.update(Path(normalizer_path).read_bytes())
-    return h.hexdigest()[:24]
+    return compute_onnx_model_hash(model_path, normalizer_path)
 
 
 def benchmark_onnx_p95_ms(
@@ -144,6 +140,9 @@ def check_onnx_promotion(
         prov_reasons.append("metrics_report missing model_hash and model_sha256")
     if not (s_hash or s_sha):
         prov_reasons.append("sealed_eval_report missing model_hash and model_sha256")
+    # V052-02: When --vitals is provided, vitals MUST report provenance hash and match metrics/sealed_eval
+    if vitals_report is not None and not (v_hash or v_sha):
+        prov_reasons.append("vitals_report missing classifier.model_hash and classifier.model_sha256")
 
     observed_hashes = {
         k: v
@@ -177,6 +176,16 @@ def check_onnx_promotion(
             prov_reasons.append(
                 f"metrics and sealed_eval do not share a matching model_hash or model_sha256 "
                 f"(metrics={{hash:{m_hash}, sha:{m_sha}}}, sealed={{hash:{s_hash}, sha:{s_sha}}})"
+            )
+    if vitals_report is not None and (v_hash or v_sha) and (m_hash or m_sha or s_hash or s_sha):
+        ref_hash = m_hash or s_hash
+        ref_sha = m_sha or s_sha
+        v_hash_ok = bool(v_hash and ref_hash and v_hash == ref_hash)
+        v_sha_ok = bool(v_sha and ref_sha and v_sha == ref_sha)
+        if not (v_hash_ok or v_sha_ok):
+            prov_reasons.append(
+                f"vitals_report does not share a matching model_hash or model_sha256 with metrics/sealed_eval "
+                f"(vitals={{hash:{v_hash}, sha:{v_sha}}})"
             )
 
     c0_pass = len(prov_reasons) == 0

@@ -49,6 +49,7 @@ from aerohand.ml.collector import (
 )
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
 from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier, resolve_classifier_mode
+from aerohand.ml.provenance import compute_heuristic_source_sha256
 from aerohand.platform.audio import AudioFeedback
 from aerohand.platform.camera import ThreadedCamera, list_cameras
 from aerohand.platform.control_api import LocalControlAPIServer
@@ -452,6 +453,9 @@ class AeroHandRuntime:
             "fallback_reason": None,
             "guard_active": True,
             "max_onnx_p95_ms": float(cls_cfg.get("max_onnx_p95_ms", 8.0)),
+            "model_hash": None,
+            "model_sha256": None,
+            "heuristic_source_sha256": compute_heuristic_source_sha256(),
         }
 
     def _emit_click_pulse(self, kind: str, x: float, y: float) -> None:

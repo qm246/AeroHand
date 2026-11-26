@@ -26,7 +26,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 import subprocess
@@ -38,6 +37,7 @@ import numpy as np
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 from aerohand.ml.features_3d import FEATURE_DIM_3D, extract_invariant_3d_features
 from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
+from aerohand.ml.provenance import compute_onnx_model_hash as _shared_compute_onnx_model_hash
 from aerohand.ml.recording_io import (
     assert_not_heldout,
     collect_json_paths,
@@ -604,12 +604,8 @@ def _get_git_commit() -> str:
 
 
 def compute_onnx_model_hash(onnx_path: str | Path, normalizer_path: str | Path) -> str:
-    """Compute 24-hex fingerprint identical to `replay_eval.compute_eval_model_hash('onnx_tcn', ...)`."""
-    h = hashlib.sha256()
-    h.update(b"onnx_tcn")
-    h.update(Path(onnx_path).read_bytes())
-    h.update(Path(normalizer_path).read_bytes())
-    return h.hexdigest()[:24]
+    """Compute 24-hex fingerprint identical to `aerohand.ml.provenance.compute_onnx_model_hash`."""
+    return _shared_compute_onnx_model_hash(onnx_path, normalizer_path)
 
 
 def augment_window(

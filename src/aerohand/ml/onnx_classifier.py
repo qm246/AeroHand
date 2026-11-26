@@ -27,6 +27,8 @@ from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName, 
 from aerohand.ml.base import PinchClassifier, PinchPrediction
 from aerohand.ml.features_3d import FEATURE_DIM_3D, extract_invariant_3d_features
 from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
+from aerohand.ml.provenance import compute_heuristic_source_sha256, compute_onnx_model_hash
+from aerohand.ml.recording_io import sha256_file
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +76,9 @@ class ONNXPinchClassifier:
         self._mean: np.ndarray = np.zeros(FEATURE_DIM_3D, dtype=np.float32)
         self._scale: np.ndarray = np.ones(FEATURE_DIM_3D, dtype=np.float32)
         self._temperature: float = 1.0
+        self.model_sha256: Optional[str] = None
+        self.normalizer_sha256: Optional[str] = None
+        self.model_hash: Optional[str] = None
         self._load()
 
     def _load(self) -> None:
@@ -122,6 +127,11 @@ class ONNXPinchClassifier:
         )
         self._input_name = self._session.get_inputs()[0].name
 
+        # V052-02: Compute cryptographic provenance hashes matching train_tcn & replay_eval
+        self.model_sha256 = sha256_file(self.model_path)
+        self.normalizer_sha256 = sha256_file(self.normalizer_path)
+        self.model_hash = compute_onnx_model_hash(self.model_path, self.normalizer_path)
+
         # V051-03: Warm-up ORT session so cold-start allocation never trips the latency guard
         if self._warmup_runs > 0:
             dummy = np.zeros((1, self.sequence_length, int(self._mean.shape[0])), dtype=np.float32)
@@ -131,7 +141,7 @@ class ONNXPinchClassifier:
         logger.info(
             f"[ONNX] Loaded TCN model: {self.model_path.name} "
             f"(feature_set={self.feature_set}, dim={self._mean.shape[0]}, seq={self.sequence_length}, "
-            f"warmup={self._warmup_runs})"
+            f"warmup={self._warmup_runs}, model_hash={self.model_hash})"
         )
 
     def reset(self, hand: Optional[Handedness] = None) -> None:
@@ -700,4 +710,7 @@ class GuardedClassifier:
             "fallback_reason": self._fallback_reason,
             "guard_active": True,
             "max_onnx_p95_ms": self.max_p95_ms,
+            "model_hash": getattr(self._onnx, "model_hash", None),
+            "model_sha256": getattr(self._onnx, "model_sha256", None),
+            "heuristic_source_sha256": compute_heuristic_source_sha256(),
         }

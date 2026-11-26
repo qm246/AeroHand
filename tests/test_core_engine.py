@@ -6461,7 +6461,9 @@ def test_sealed_manifest_raises_on_any_invalid_entry(tmp_path: Path):
 
     from aerohand.ml.recording_io import read_sealed_manifest_hashes
 
-    mf = tmp_path / "sealed_manifest.json"
+    sub = tmp_path / "case_invalid"
+    sub.mkdir()
+    mf = sub / "sealed_manifest.json"
     mf.write_text(
         json.dumps(
             {
@@ -6476,7 +6478,7 @@ def test_sealed_manifest_raises_on_any_invalid_entry(tmp_path: Path):
     with pytest.raises(ValueError, match="sealed_manifest.json"):
         read_sealed_manifest_hashes(mf)
 
-    mf2 = tmp_path / "sealed_manifest_nondict.json"
+    mf2 = sub / "sealed_manifest_nondict.json"
     mf2.write_text(
         json.dumps({"files": [{"filename": "ok.json", "sha256": "b" * 64}, "corrupt_string_entry"]}),
         encoding="utf-8",
@@ -6539,3 +6541,200 @@ def test_shadow_would_block_rate_includes_veto_and_swallow():
     rt._cumulative_classifier_counters = g.export_counters()
     htel = rt.classifier_telemetry()
     assert htel["shadow_would_block_rate"] == pytest.approx(round(2 / 3, 4))
+
+
+# ==============================================================================
+# V060-01a: Cued Event Recording (`recording_kind="cued_events"`, `data/recall/`)
+# ==============================================================================
+
+
+def test_cued_session_save_load_roundtrip_preserves_all_cue_fields_and_empty_frames(tmp_path: Path):
+    import json
+
+    from aerohand.ml.recording_io import load_recording_frames
+
+    col = PinchDataCollector(default_subject="minh")
+    st = col.start_cued_session(cues_per_trigger=1, hand="Right", window_ms=600, gap_ms=1000, seed=42, triggers=["left_click"])
+    assert st["active"] is True
+    assert col.is_cued_active is True
+
+    h_r = _make_open_hand(forward_z=-0.25)
+    h_l = _make_open_hand(forward_z=-0.25)
+    # 1. Rest phase (t=0..1000ms) with both hands present + one hand-absent frame + one low-conf frame
+    col.tick_cued(0)
+    col.add_cued_frame([HandInput("Right", h_r, h_r, confidence=0.40, timestamp_ms=0), HandInput("Left", h_l, h_l, confidence=0.95, timestamp_ms=0)], 0)
+    col.tick_cued(500)
+    col.add_cued_frame([], 500)  # Hand-absent frame MUST be preserved for lost-hand reset on replay!
+    # 2. At t=1000ms -> gap >= 1000ms -> issues Cue #1 with cue_ts_ms == 1000
+    col.tick_cued(1000)
+    col.add_cued_frame([HandInput("Right", h_r, h_r, confidence=0.95, timestamp_ms=1000)], 1000)
+    # Autosave draft while active -> must keep recording_kind and cue_events
+    draft_fp = col.autosave_cued_draft(tmp_path)
+    assert draft_fp is not None and draft_fp.is_file()
+    draft_raw = json.loads(draft_fp.read_text(encoding="utf-8"))
+    assert draft_raw["recording_kind"] == "cued_events"
+    assert len(draft_raw["cue_events"]) == 1
+
+    # 3. End cue window at t=1600ms -> finishes session
+    col.tick_cued(1600)
+    assert col.is_cued_active is False
+
+    out_fp = col.save_cued(tmp_path)
+    raw = json.loads(out_fp.read_text(encoding="utf-8"))
+    assert raw["schema"] == "aerohand_pinch_v2"
+    assert raw["recording_kind"] == "cued_events"
+    assert len(raw["cue_events"]) == 1
+    ev = raw["cue_events"][0]
+    for k in ("cue_id", "pose", "expected_trigger", "hand", "cue_ts_ms", "window_ms", "t_start_ms", "t_end_ms"):
+        assert k in ev
+    assert ev["pose"] == PoseName.THUMB_MIDDLE_PINCH.value
+    assert ev["expected_trigger"] == "left_click"
+    assert ev["cue_ts_ms"] == 1000
+    assert ev["t_start_ms"] == 1000
+    assert ev["t_end_ms"] == 1600
+    assert ev["window_ms"] == 600
+    # Low-conf frame (0.40), both hands at t=0, AND hand-absent frame at t=500 must ALL survive (no trim/clean!)
+    assert len(raw["samples"]) == 4
+
+    frames, meta = load_recording_frames(out_fp)
+    assert meta["recording_kind"] == "cued_events"
+    assert meta["cue_events"] == raw["cue_events"]
+    assert any(fr["hand_present"] is False and fr["timestamp_ms"] == 500.0 for fr in frames)
+    assert any(fr["handedness"] == "Left" for fr in frames)
+
+
+def test_cued_events_excluded_from_train_matrix_domain_and_replay(tmp_path: Path, caplog):
+    from aerohand.ml.collector import compute_corpus_condition_matrix
+
+    train_mod = _load_train_tcn_module("train_v060_01a_excl")
+    replay_mod = _load_replay_eval_module("replay_v060_01a_excl")
+    dom_mod = _load_script_module("scripts/domain_check.py", "domain_v060_01a_excl")
+
+    # Isolate tmp_path as its own project root so sibling pytest temp dirs are never scanned
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+    rec_dir = tmp_path / "sessions"
+    rec_dir.mkdir()
+
+    # Save 1 normal session and 1 cued_events session in the same directory
+    h = _make_open_hand(forward_z=-0.25)
+    norm_col = PinchDataCollector(default_subject="minh")
+    norm_col.set_recording(True)
+    norm_col.set_pose(PoseName.IDLE)
+    for i in range(6):
+        norm_col.add_frame(h, h, "Right", 0.95, i * 33)
+    norm_fp = norm_col.save(rec_dir)
+
+    cued_col = PinchDataCollector(default_subject="minh")
+    cued_col.start_cued_session(cues_per_trigger=1, window_ms=500, gap_ms=1000, seed=1, triggers=["left_click"])
+    cued_col.tick_cued(0)
+    cued_col.add_cued_frame([HandInput("Right", h, h, confidence=0.95, timestamp_ms=0)], 0)
+    cued_col.tick_cued(1000)
+    cued_col.add_cued_frame([HandInput("Right", h, h, confidence=0.95, timestamp_ms=1000)], 1000)
+    cued_col.stop_cued_session()
+    cued_fp = cued_col.save_cued(rec_dir)
+
+    with caplog.at_level("INFO"):
+        kept_train, _ = train_mod.collect_training_files([rec_dir], data_root=tmp_path / "no_data")
+    assert norm_fp in kept_train
+    assert cued_fp not in kept_train
+
+    mat = compute_corpus_condition_matrix(rec_dir)
+    assert mat["total_frames"] == 6  # Only normal session counted; cued_events excluded!
+
+    rep = replay_mod.evaluate_recordings(
+        session_paths=[norm_fp, cued_fp],
+        min_exposure_hours_for_claim=0.0,
+        max_ft_per_hour=1e9,
+    )
+    assert norm_fp.name in rep["sessions_evaluated"]
+    assert cued_fp.name not in rep["sessions_evaluated"]
+
+    dom_feats = dom_mod.extract_domain_features([norm_fp, cued_fp])
+    assert len(dom_feats["palm_size"]) == 6
+
+
+def test_cued_session_forces_and_restores_dry_run_on_stop_and_error(tmp_path: Path):
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    rt = AeroHandRuntime(cfg, dry_run=False, collect_dir=tmp_path / "sessions")
+    rt.recall_dir = tmp_path / "recall"
+    assert rt.dry_run is False
+
+    # Simulate held mouse button -> start cued MUST release inputs and force dry_run=True
+    rt._mouse_button_held = True
+    rt.collector_start_cued(cues_per_trigger=1, window_ms=500, gap_ms=1000, seed=7, triggers=["left_click"])
+    assert rt.dry_run is True
+    assert rt.input_ctl.dry_run is True
+    assert rt._mouse_button_held is False
+
+    # Normal stop restores dry_run=False
+    rt.collector_stop_cued()
+    assert rt.dry_run is False
+    assert rt.input_ctl.dry_run is False
+
+    # Error / shutdown path also restores dry_run=False
+    rt.collector_start_cued(cues_per_trigger=1, window_ms=500, gap_ms=1000, seed=7, triggers=["left_click"])
+    assert rt.dry_run is True
+    rt._restore_cued_dry_run()
+    assert rt.dry_run is False
+
+
+def test_cued_session_replays_expected_trigger_and_resets_lost_hand(tmp_path: Path):
+    from aerohand.ml.recording_io import load_recording_frames
+
+    h_open = _make_open_hand(forward_z=-0.25)
+    h_pinch = _pinch_middle_copy(h_open)
+
+    col = PinchDataCollector(default_subject="minh")
+    col.start_cued_session(cues_per_trigger=1, hand="Right", window_ms=1200, gap_ms=1000, seed=3, triggers=["left_click"])
+
+    # Lead-in open frames (0..990ms)
+    for ts in range(0, 1000, 33):
+        col.tick_cued(ts)
+        col.add_cued_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=ts)], ts)
+    # Cue issues at ts=1000 -> open -> pinch (4 frames) -> release (4 frames) -> hand-absent frame
+    ts = 1000
+    col.tick_cued(ts)
+    col.add_cued_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=ts)], ts)
+    for k in range(1, 5):
+        t = ts + k * 33
+        col.tick_cued(t)
+        col.add_cued_frame([HandInput("Right", h_pinch, h_pinch, confidence=0.95, timestamp_ms=t)], t)
+    for k in range(5, 11):
+        t = ts + k * 33
+        col.tick_cued(t)
+        col.add_cued_frame([HandInput("Right", h_open, h_open, confidence=0.95, timestamp_ms=t)], t)
+    # Lost hand frame at t=1400ms
+    col.tick_cued(1400)
+    col.add_cued_frame([], 1400)
+    col.stop_cued_session()
+    fp = col.save_cued(tmp_path)
+
+    frames, meta = load_recording_frames(fp)
+    cue = meta["cue_events"][0]
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    clf = Heuristic3DPinchClassifier((cfg.get("classifier") or {}).get("heuristic_3d"))
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 960.0, 540.0)
+    clicks_in_window = 0
+    lost_hand_reset_seen = False
+    for fr in frames:
+        t = float(fr["timestamp_ms"])
+        if not fr["hand_present"] or not fr["landmarks_2d"]:
+            eng.process_frame([], t, 1920.0, 1080.0)
+            if "Right" not in eng._active_hands:
+                lost_hand_reset_seen = True
+            continue
+        outs = eng.process_frame(
+            [HandInput(fr["handedness"], fr["landmarks_2d"], fr["world_landmarks"], fr["confidence"], int(t))],
+            t,
+            1920.0,
+            1080.0,
+        )
+        if outs and outs[0].pose.is_clicking and cue["t_start_ms"] <= t <= cue["t_end_ms"]:
+            clicks_in_window += 1
+    assert clicks_in_window >= 1
+    assert lost_hand_reset_seen is True

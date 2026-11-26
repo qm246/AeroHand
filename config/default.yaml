@@ -157,6 +157,7 @@ collector:
   countdown_s: 3.0                     # Pre-step countdown for guided protocol
   step_duration_s: 5.0                 # Default capture duration per guided step
   negatives_dir: "data/negatives"      # Hard-negative snapshots saved via "Not intended"
+  recall_dir: "data/recall"            # Cued event-level recall sessions (excluded from train/FT replay)
   negative_window_s: 3.0               # Capture +/- 1.5s around the last false trigger
 
 pose_state_machine:

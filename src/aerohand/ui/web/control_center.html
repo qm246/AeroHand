@@ -624,6 +624,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
           <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px">
             <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
             <button class="btn" id="btn-col-guided" onclick="toggleGuided()">🎬 Quay theo kịch bản hướng dẫn</button>
+            <button class="btn" id="btn-col-cued" onclick="toggleCued()">🎯 Quay phiên kiểm thử Recall (Dry-Run)</button>
+            <button class="btn" id="btn-col-cued-save" onclick="post('collector_cued_save')" style="display:none">💾 Lưu phiên Recall</button>
             <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
             <button class="btn" id="btn-col-undo" onclick="post('collector_undo',{seconds:5})">↩ Hủy 5 giây vừa quay</button>
             <button class="btn" onclick="post('collector_save')" id="btn-col-save">💾 Lưu JSON</button>
@@ -631,6 +633,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             <button class="btn" onclick="post('mark_not_intended')" id="btn-not-intended-ml">🚫 Không phải tôi muốn</button>
             <button class="btn danger" onclick="post('collector_clear')" id="btn-col-clear">🗑 Xóa tạm</button>
           </div>
+          <div id="col-cued-banner" style="font-size:12.5px;font-weight:600;color:var(--amber);margin-bottom:6px;padding:8px 10px;border-radius:8px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.28);display:none"></div>
           <div id="col-guided-banner" style="font-size:12px;color:var(--teal);margin-bottom:6px;display:none"></div>
           <div id="col-quality-banner" style="font-size:11.5px;color:var(--green);margin-bottom:6px"></div>
           <div id="col-hold-hint" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
@@ -714,6 +717,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
   }
 
   let LAST_GUIDED_ACTIVE = false;
+  let LAST_CUED_ACTIVE = false;
   function sendColMeta() {
     post("collector_meta", {
       meta: {
@@ -730,6 +734,11 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
   function toggleGuided() {
     sendColMeta();
     post(LAST_GUIDED_ACTIVE ? "collector_guided_stop" : "collector_guided_start");
+  }
+
+  function toggleCued() {
+    sendColMeta();
+    post(LAST_CUED_ACTIVE ? "collector_cued_stop" : "collector_cued_start");
   }
 
   function copyTrainCmd() {
@@ -1345,6 +1354,45 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       LAST_GUIDED_ACTIVE = !!g.active;
       const gBtn = document.getElementById("btn-col-guided");
       if (gBtn) gBtn.textContent = g.active ? (colI18n.guided_stop || "⏹ Stop") : (colI18n.guided_start || "🎬 Guided");
+      const cued = col.cued || {};
+      LAST_CUED_ACTIVE = !!cued.active;
+      const cuedBtn = document.getElementById("btn-col-cued");
+      if (cuedBtn) cuedBtn.textContent = cued.active ? (colI18n.cued_stop || "⏹ Stop Cued") : (colI18n.cued_start || "🎯 Cued Recall");
+      const cuedSaveBtn = document.getElementById("btn-col-cued-save");
+      if (cuedSaveBtn) {
+        cuedSaveBtn.style.display = (!cued.active && cued.has_unsaved) ? "inline-flex" : "none";
+        cuedSaveBtn.textContent = colI18n.cued_save || "💾 Save Cued Recall";
+      }
+      const cBan = document.getElementById("col-cued-banner");
+      if (cBan) {
+        if (cued.active) {
+          cBan.style.display = "block";
+          if (cued.phase === "cue") {
+            const instr = isVi ? (cued.instruction_vi || cued.instruction_en || "") : (cued.instruction_en || "");
+            cBan.style.color = "var(--amber)";
+            cBan.textContent = (colI18n.cued_prompt || "🎯 [DRY-RUN] Cue {idx}/{total}: {trigger} — {instr} ({sec}s)")
+              .replace("{idx}", String((cued.cue_index || 0) + 1))
+              .replace("{total}", String(cued.total_cues || 0))
+              .replace("{trigger}", String(cued.expected_trigger || ""))
+              .replace("{instr}", instr)
+              .replace("{sec}", String(cued.remaining_s || 0));
+          } else {
+            cBan.style.color = "var(--teal)";
+            cBan.textContent = (colI18n.cued_rest || "⏸ Rest ({sec}s) [{idx}/{total}]")
+              .replace("{idx}", String((cued.cue_index || 0) + 1))
+              .replace("{total}", String(cued.total_cues || 0))
+              .replace("{sec}", String(cued.remaining_s || 0));
+          }
+        } else if (cued.phase === "done" && cued.has_unsaved) {
+          cBan.style.display = "block";
+          cBan.style.color = "var(--green)";
+          cBan.textContent = (colI18n.cued_done || "✓ Done ({cues} cues, {samples} frames)")
+            .replace("{cues}", String(cued.cues_issued || 0))
+            .replace("{samples}", String(cued.samples || 0));
+        } else {
+          cBan.style.display = "none";
+        }
+      }
       const gBan = document.getElementById("col-guided-banner");
       if (gBan) {
         if (g.active && g.pose) {

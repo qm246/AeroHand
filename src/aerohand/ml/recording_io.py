@@ -28,7 +28,37 @@ logger = logging.getLogger(__name__)
 
 POSE_TO_IDX: Dict[str, int] = {p.value: i for i, p in enumerate(ALL_POSE_NAMES)}
 MANIFEST_FILENAMES = frozenset({"manifest.json", "session_manifest.json", "sealed_manifest.json"})
+CUED_EVENTS_KIND = "cued_events"
 _SHA256_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def is_cued_events_recording(path: str | Path) -> bool:
+    """Return True if the JSON recording has top-level `recording_kind == 'cued_events'` (V060-01a)."""
+    fp = Path(path)
+    if not fp.is_file():
+        return False
+    try:
+        raw = json.loads(fp.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return isinstance(raw, dict) and str(raw.get("recording_kind") or "").strip().lower() == CUED_EVENTS_KIND
+
+
+def exclude_cued_events(paths: Sequence[Path]) -> Tuple[List[Path], List[Path]]:
+    """Filter out `cued_events` recall-evaluation recordings from training/domain/FT-replay pipelines."""
+    kept: List[Path] = []
+    excluded: List[Path] = []
+    for fp in paths:
+        if is_cued_events_recording(fp):
+            excluded.append(fp)
+        else:
+            kept.append(fp)
+    if excluded:
+        logger.info(
+            f"[RECORDING IO] Excluded {len(excluded)} cued_events recording(s) from standard pipeline: "
+            + ", ".join(p.name for p in excluded[:5])
+        )
+    return kept, excluded
 
 
 def sha256_file(path: str | Path) -> str:
@@ -452,6 +482,23 @@ def load_recording_frames(
                 raw_2d = s.get("landmarks")
             lms2d = to_landmarks(raw_2d)
             if len(lms2d) < 21:
+                if s.get("hand_present") is False:
+                    frames_out.append(
+                        {
+                            "timestamp_ms": ts_ms,
+                            "label_name": PoseName.IDLE.value,
+                            "label_idx": 0,
+                            "handedness": "Right",
+                            "hand_id": "Right",
+                            "confidence": 0.0,
+                            "landmarks_2d": None,
+                            "world_landmarks": None,
+                            "is_idle_gt": True,
+                            "hand_present": False,
+                            "segment_id": int(s.get("segment_id", 0)),
+                            "scenario": str(s.get("scenario") or scenario),
+                        }
+                    )
                 continue
 
             raw_3d = s.get("world_landmarks")
@@ -501,11 +548,21 @@ def load_recording_frames(
     elif len(raw_timestamps) == 1:
         wall_clock_ms = 33.33
 
+    recording_kind = (
+        str(raw.get("recording_kind") or "").strip() if isinstance(raw, dict) else ""
+    )
+    cue_events = (
+        list(raw.get("cue_events"))
+        if isinstance(raw, dict) and isinstance(raw.get("cue_events"), list)
+        else []
+    )
     meta = {
         "file": fp.name,
         "path": str(fp),
         "scenario": scenario,
         "source": source,
+        "recording_kind": recording_kind or None,
+        "cue_events": cue_events,
         "session_meta": session_meta,
         "wall_clock_ms": wall_clock_ms,
         "raw_frame_count": len(raw_timestamps),

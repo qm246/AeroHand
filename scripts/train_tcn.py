@@ -41,6 +41,7 @@ from aerohand.ml.provenance import compute_onnx_model_hash as _shared_compute_on
 from aerohand.ml.recording_io import (
     assert_not_heldout,
     collect_json_paths,
+    exclude_cued_events,
     exclude_sealed_content,
     load_recording_frames,
     sha256_file,
@@ -1140,11 +1141,12 @@ def collect_training_files(
     data_root: str | Path = "data",
     sealed_root: Optional[str | Path] = None,
 ) -> Tuple[List[Path], List[Path]]:
-    """Collect training JSON files while excluding any file whose SHA-256 is in a sealed held-out manifest (V051-02 / V052-05a)."""
+    """Collect training JSON files while excluding `cued_events` and sealed held-out SHA-256 files (V051-02 / V060-01a)."""
     paths_in = [Path(s) for s in inputs if s]
     for sp in paths_in:
         assert_not_heldout(sp)
     raw_files = collect_json_paths([sp for sp in paths_in if sp.exists()])
+    raw_files, _ = exclude_cued_events(raw_files)
     return exclude_sealed_content(raw_files, data_root=data_root, sealed_root=sealed_root)
 
 

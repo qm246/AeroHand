@@ -21,7 +21,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import cv2
 import numpy as np
@@ -259,6 +259,9 @@ class AeroHandRuntime:
         self.collector_record_hand: str = str(col_cfg.get("record_hand", "primary")).lower()
         neg_raw = str(col_cfg.get("negatives_dir", "data/negatives"))
         self.negatives_dir: Path = Path(neg_raw) if Path(neg_raw).is_absolute() else (repo_root() / neg_raw)
+        recall_raw = str(col_cfg.get("recall_dir", "data/recall"))
+        self.recall_dir: Path = Path(recall_raw) if Path(recall_raw).is_absolute() else (repo_root() / recall_raw)
+        self._cued_saved_dry_run: Optional[bool] = None
         self.negative_window_s: float = max(0.5, min(10.0, float(col_cfg.get("negative_window_s", 3.0))))
         self.frame_ring: FrameRingBuffer = FrameRingBuffer(max_frames=100)
         self._negatives_saved_count: int = 0
@@ -345,13 +348,20 @@ class AeroHandRuntime:
             self._last_action_text = "Tracking resumed"
 
     def set_dry_run(self, dry_run: bool) -> None:
-        self.dry_run = bool(dry_run)
-        self.input_ctl.dry_run = self.dry_run
-        if self.dry_run:
+        target = bool(dry_run)
+        if not target and self.collector.is_cued_active:
+            logger.warning("[COLLECT] Refusing live HID output while cued_events recording is active.")
+            return
+        if target:
+            with self._lerp_lock:
+                self._lerp_active = False
             self._drag_started_ms = None
             self._mouse_button_held = False
             self._is_scroll_held = False
+            # Release any held macOS HID button/modifiers BEFORE silencing input_ctl with dry_run=True
             self.input_ctl.release_all()
+        self.dry_run = target
+        self.input_ctl.dry_run = self.dry_run
         self._last_action_text = "Mode: Dry-Run" if self.dry_run else "Mode: Live Control"
 
     def trigger_recenter(self) -> None:
@@ -672,6 +682,8 @@ class AeroHandRuntime:
         for fp in sessions:
             try:
                 data = _json.loads(fp.read_text(encoding="utf-8"))
+                if isinstance(data, dict) and str(data.get("recording_kind") or "").strip().lower() == "cued_events":
+                    continue
                 cbh = data.get("counts_by_hand")
                 if isinstance(cbh, dict):
                     for pname, hand_map in cbh.items():
@@ -733,6 +745,65 @@ class AeroHandRuntime:
         self.collector.stop_guided()
         self.collector.autosave_draft(self.collect_dir)
         return self.collector_status()
+
+    def _restore_cued_dry_run(self) -> None:
+        """Restore the pre-cued `dry_run` flag safely after stop, completion, error, or shutdown."""
+        if self.collector.is_cued_active:
+            self.collector.stop_cued_session()
+        if self._cued_saved_dry_run is not None:
+            prev = self._cued_saved_dry_run
+            self._cued_saved_dry_run = None
+            self.set_dry_run(prev)
+
+    def collector_start_cued(
+        self,
+        *,
+        cues_per_trigger: int = 10,
+        hand: Optional[str] = None,
+        window_ms: int = 2500,
+        gap_ms: int = 1200,
+        seed: Optional[int] = None,
+        triggers: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Start a cued-event recall session (forces `dry_run=True` after releasing held inputs)."""
+        if self._cued_saved_dry_run is None:
+            self._cued_saved_dry_run = bool(self.dry_run)
+        if self.dictation.is_recording:
+            self.dictation.cancel(reason="cued_recording")
+        # Release any held HID state BEFORE forcing dry_run=True
+        self.set_dry_run(True)
+        eff_hand = hand or str((self.config.get("hand") or {}).get("cursor_hand", "Right"))
+        self.collector.start_cued_session(
+            cues_per_trigger=cues_per_trigger,
+            hand=eff_hand,
+            window_ms=window_ms,
+            gap_ms=gap_ms,
+            seed=seed,
+            triggers=triggers,
+        )
+        self._last_action_text = "Cued recall recording started (Dry-Run)"
+        return self.collector_status()
+
+    def collector_stop_cued(self) -> Dict[str, Any]:
+        self.collector.stop_cued_session()
+        try:
+            self.collector.autosave_cued_draft(self.recall_dir)
+        except Exception:
+            pass
+        self._restore_cued_dry_run()
+        self._last_action_text = "Cued recall recording stopped"
+        return self.collector_status()
+
+    def collector_save_cued(self) -> Dict[str, Any]:
+        if self.collector.is_cued_active:
+            self.collector.stop_cued_session()
+        self._restore_cued_dry_run()
+        out = self.collector.save_cued(self.recall_dir)
+        self._last_action_text = f"Saved cued session: {out.name}"
+        st = self.collector_status()
+        st["saved"] = True
+        st["saved_path"] = str(out)
+        return st
 
     def collector_save(self, *, allow_low_quality: bool = False) -> Dict[str, Any]:
         try:
@@ -811,6 +882,10 @@ class AeroHandRuntime:
             "total": sum(counts.values()),
             "session_meta": self.collector.session_meta,
             "guided": self.collector.guided_status(),
+            "cued": self.collector.cued_status(
+                now_ms=float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
+            ),
+            "recall_dir": str(self.recall_dir),
             "quality": self.collector.evaluate_quality(),
             "quality_gate_mode": self.collector.quality_gate_mode,
             "cleaned_preview": clean_preview,
@@ -881,6 +956,12 @@ class AeroHandRuntime:
                 self.collector.autosave_draft(self.collect_dir)
             except Exception:
                 pass
+        if self.collector._cued_samples or self.collector._cued_events:
+            try:
+                self.collector.autosave_cued_draft(self.recall_dir)
+            except Exception:
+                pass
+        self._restore_cued_dry_run()
         if self._api_server is not None:
             self._api_server.stop()
             self._api_server = None
@@ -973,7 +1054,20 @@ class AeroHandRuntime:
         primary: Optional[HandOutput],
         timestamp_ms: int,
     ) -> None:
-        """Record landmarks for the configured hand (`primary` or `both` with `hand_id`), never `hands[0]` blindly."""
+        """Record landmarks for cued sessions (all hands + hand-absent) or normal collector (`primary`/`both`)."""
+        if self.collector.is_cued_active:
+            self.collector.tick_cued(now_ms=float(timestamp_ms))
+            if self.collector.is_cued_active:
+                self.collector.add_cued_frame(hands, timestamp_ms)
+            else:
+                try:
+                    self.collector.autosave_cued_draft(self.recall_dir)
+                except Exception:
+                    pass
+                self._restore_cued_dry_run()
+                self._last_action_text = "Cued recall session complete — ready to save"
+            return
+
         self.collector.tick_guided(now_ms=float(timestamp_ms))
         if not self.collector.is_recording or not hands:
             return
@@ -1534,7 +1628,7 @@ class AeroHandRuntime:
                         self.apply_live_settings(merged, from_profile=True)
 
                 is_idle = self.idle_throttle_enabled and ((now_wall - last_hand_wall) >= self.idle_timeout_s)
-                if is_idle and not self.collector.is_recording:
+                if is_idle and not self.collector.is_recording and not self.collector.is_cued_active:
                     time.sleep(max(0.01, 1.0 / max(1.0, self.idle_fps) - 0.015))
 
                 cf = camera.read(timeout_s=0.04)
@@ -1803,6 +1897,12 @@ class AeroHandRuntime:
         finally:
             self._processing_thread_id = None
             self._stop_event.set()
+            if self.collector._cued_samples or self.collector._cued_events:
+                try:
+                    self.collector.autosave_cued_draft(self.recall_dir)
+                except Exception:
+                    pass
+            self._restore_cued_dry_run()
             if lerp_thread is not None and lerp_thread.is_alive():
                 lerp_thread.join(timeout=0.5)
             self.dictation.close()

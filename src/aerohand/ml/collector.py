@@ -7,6 +7,8 @@ records raw 2D+3D landmarks, handedness/hand_id, confidence, session metadata, a
 from __future__ import annotations
 
 import json
+import logging
+import random
 import re
 import threading
 import time
@@ -16,6 +18,8 @@ from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
 
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
+
+logger = logging.getLogger(__name__)
 
 POSE_TO_ID: Dict[PoseName, int] = {pose: i for i, pose in enumerate(ALL_POSE_NAMES)}
 
@@ -49,6 +53,113 @@ HARD_NEGATIVE_MIN_PER_GROUP: int = 500
 MIN_ANGLE_SHARE: float = 0.15
 CORPUS_TOTAL_TARGET: int = sum(v["total"] for v in COLLECTOR_CLASS_TARGETS.values())  # 21000
 DEFAULT_COLLECTOR_SUBJECT: str = "minh"
+DEFAULT_CUE_WINDOW_MS: int = 2500
+DEFAULT_CUE_GAP_MS: int = 1200
+MIN_CUE_GAP_MS: int = 1000
+
+
+@dataclass(frozen=True)
+class CuedTriggerSpec:
+    """Canonical pose-to-trigger specification for cued event recall evaluation (V060-01a)."""
+
+    trigger: str
+    pose: PoseName
+    instruction_en: str
+    instruction_vi: str
+
+
+CUED_TRIGGER_SPECS: Dict[str, CuedTriggerSpec] = {
+    "left_click": CuedTriggerSpec(
+        trigger="left_click",
+        pose=PoseName.THUMB_MIDDLE_PINCH,
+        instruction_en="Quick tap Thumb + Middle pinch, then release.",
+        instruction_vi="Chạm thả nhanh Cái + Giữa (Click trái).",
+    ),
+    "right_click": CuedTriggerSpec(
+        trigger="right_click",
+        pose=PoseName.THUMB_RING_PINCH,
+        instruction_en="Pinch Thumb + Ring, keep hand still (< 15 px), then release.",
+        instruction_vi="Chụm Cái + Áp út, giữ tay yên (< 15 px) rồi thả (Chuột phải).",
+    ),
+    "scroll_stroke": CuedTriggerSpec(
+        trigger="scroll_stroke",
+        pose=PoseName.THUMB_RING_PINCH,
+        instruction_en="Pinch Thumb + Ring and slide smoothly (>= 15 px), then release.",
+        instruction_vi="Chụm Cái + Áp út rồi trượt tay mượt (>= 15 px) để cuộn, sau đó thả.",
+    ),
+    "drag_start": CuedTriggerSpec(
+        trigger="drag_start",
+        pose=PoseName.THUMB_INDEX_MIDDLE_PINCH,
+        instruction_en="Pinch Thumb + Index + Middle and hold (> 200 ms) or drag, then release.",
+        instruction_vi="Chụm 3 ngón (Cái + Trỏ + Giữa), giữ (> 200 ms) hoặc kéo rồi thả.",
+    ),
+    "dictation_start": CuedTriggerSpec(
+        trigger="dictation_start",
+        pose=PoseName.THUMB_INDEX_PINCH,
+        instruction_en="Pinch Thumb + Index and hold >= 400 ms, then release.",
+        instruction_vi="Chụm Cái + Trỏ và giữ >= 400 ms (Đọc giọng nói), rồi thả.",
+    ),
+    "window_tile": CuedTriggerSpec(
+        trigger="window_tile",
+        pose=PoseName.THUMB_PINKY_PINCH,
+        instruction_en="Pinch Thumb + Pinky tip, slide >= 20 px along one axis, then RELEASE.",
+        instruction_vi="Chụm đầu Cái + Út, vuốt >= 20 px theo 1 trục rồi THẢ TAY.",
+    ),
+    "spaces_nav": CuedTriggerSpec(
+        trigger="spaces_nav",
+        pose=PoseName.THUMB_PINKY_BASE,
+        instruction_en="Touch Thumb + Pinky base, slide >= 20 px along one axis, then release.",
+        instruction_vi="Chạm gốc Cái + Út, vuốt >= 20 px theo 1 trục rồi thả.",
+    ),
+}
+
+CUED_TRIGGER_ORDER: Tuple[str, ...] = tuple(CUED_TRIGGER_SPECS.keys())
+
+
+def build_cued_schedule(
+    *,
+    cues_per_trigger: int = 10,
+    hand: str = "Right",
+    window_ms: int = DEFAULT_CUE_WINDOW_MS,
+    gap_ms: int = DEFAULT_CUE_GAP_MS,
+    seed: Optional[int] = None,
+    triggers: Optional[Sequence[str]] = None,
+) -> List[Dict[str, Any]]:
+    """Build a randomized cued-event schedule with unique cue IDs and enforced gap >= 1000 ms."""
+    n_per = max(1, int(cues_per_trigger))
+    win = max(250, int(window_ms))
+    gap = int(gap_ms)
+    if gap < MIN_CUE_GAP_MS:
+        raise ValueError(f"gap_ms must be >= {MIN_CUE_GAP_MS} ms to prevent cue overlap (got {gap})")
+    norm_hand = "Left" if str(hand or "Right").strip().lower() == "left" else "Right"
+    chosen = list(triggers) if triggers else list(CUED_TRIGGER_ORDER)
+    unknown = [t for t in chosen if t not in CUED_TRIGGER_SPECS]
+    if unknown:
+        raise ValueError(f"Unknown cued trigger(s): {unknown}. Valid: {list(CUED_TRIGGER_ORDER)}")
+
+    items: List[CuedTriggerSpec] = []
+    for trig in chosen:
+        spec = CUED_TRIGGER_SPECS[trig]
+        items.extend([spec] * n_per)
+
+    rng = random.Random(seed)
+    rng.shuffle(items)
+
+    schedule: List[Dict[str, Any]] = []
+    for idx, spec in enumerate(items, start=1):
+        schedule.append(
+            {
+                "cue_id": f"cue_{idx:04d}",
+                "pose": spec.pose.value,
+                "expected_trigger": spec.trigger,
+                "hand": norm_hand,
+                "window_ms": win,
+                "gap_ms": gap,
+                "instruction_en": spec.instruction_en,
+                "instruction_vi": spec.instruction_vi,
+            }
+        )
+    return schedule
 
 
 class QualityGateError(ValueError):
@@ -158,6 +269,7 @@ def compute_corpus_condition_matrix(
                 by_hard_neg[hng] += 1
             total_frames += 1
 
+    skipped_cued = 0
     for folder, force_idle in ((sessions_dir, False), (negatives_dir, True)):
         if folder is None:
             continue
@@ -169,12 +281,17 @@ def compute_corpus_condition_matrix(
                 data = json.loads(fp.read_text(encoding="utf-8"))
                 if not isinstance(data, dict):
                     continue
+                if str(data.get("recording_kind") or "").strip().lower() == "cued_events":
+                    skipped_cued += 1
+                    continue
                 meta = data.get("session_meta") if isinstance(data.get("session_meta"), dict) else {}
                 samples = data.get("samples")
                 if isinstance(samples, list):
                     _ingest(samples, meta, force_idle=force_idle)
             except Exception:
                 continue
+    if skipped_cued > 0:
+        logger.info(f"[COLLECT] Excluded {skipped_cued} cued_events file(s) from corpus condition matrix.")
 
     if live_samples:
         _ingest(live_samples, live_meta or {}, force_idle=False)
@@ -344,6 +461,26 @@ class PinchDataCollector:
         self._guided_idx: int = 0
         self._guided_phase_start_ms: float = 0.0
 
+        # Cued event recording state (V060-01a — continuous capture, no trim/clean, dry_run enforced by runtime)
+        self._cued_active: bool = False
+        self._cued_phase: str = "idle"  # "idle" | "rest" | "cue" | "done" | "stopped"
+        self._cued_schedule: List[Dict[str, Any]] = []
+        self._cued_idx: int = 0
+        self._cued_phase_start_ms: Optional[float] = None
+        self._cued_gap_ms: int = DEFAULT_CUE_GAP_MS
+        self._cued_window_ms: int = DEFAULT_CUE_WINDOW_MS
+        self._cued_seed: Optional[int] = None
+        self._cued_hand: str = "Right"
+        self._cued_events: List[Dict[str, Any]] = []
+        self._cued_samples: List[Dict[str, Any]] = []
+        self._cued_started_at_iso: str = self._started_at_iso
+        self._cued_draft_id: str = self._draft_id
+        self._cued_last_draft_path: Optional[Path] = None
+
+    @property
+    def is_cued_active(self) -> bool:
+        return self._cued_active
+
     @property
     def is_recording(self) -> bool:
         return self._recording
@@ -506,6 +643,247 @@ class PinchDataCollector:
             "pose": step.pose.value if step is not None else None,
             "condition_note": step.condition_note if step is not None else "",
             "remaining_s": round(rem_s, 1),
+        }
+
+    # ------------------------------------------------------------------
+    # Cued Event Recording (V060-01a — event-level recall evaluation)
+    # ------------------------------------------------------------------
+
+    def start_cued_session(
+        self,
+        *,
+        cues_per_trigger: int = 10,
+        hand: str = "Right",
+        window_ms: int = DEFAULT_CUE_WINDOW_MS,
+        gap_ms: int = DEFAULT_CUE_GAP_MS,
+        seed: Optional[int] = None,
+        triggers: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Any]:
+        """Start a continuous cued-event session (`recording_kind='cued_events'`)."""
+        schedule = build_cued_schedule(
+            cues_per_trigger=cues_per_trigger,
+            hand=hand,
+            window_ms=window_ms,
+            gap_ms=gap_ms,
+            seed=seed,
+            triggers=triggers,
+        )
+        self.stop_guided()
+        self._recording = False
+        self._cued_schedule = schedule
+        self._cued_idx = 0
+        self._cued_active = True
+        self._cued_phase = "rest"
+        self._cued_phase_start_ms = None
+        self._cued_gap_ms = int(gap_ms)
+        self._cued_window_ms = int(window_ms)
+        self._cued_seed = seed
+        self._cued_hand = "Left" if str(hand or "Right").strip().lower() == "left" else "Right"
+        self._cued_events = []
+        self._cued_samples = []
+        self._cued_started_at_iso = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self._cued_draft_id = time.strftime("%Y%m%d_%H%M%S")
+        self._cued_last_draft_path = None
+        return self.cued_status()
+
+    def stop_cued_session(self) -> Dict[str, Any]:
+        """Stop an in-progress cued-event session without discarding recorded samples/cues."""
+        self._cued_active = False
+        if self._cued_phase not in ("done", "idle"):
+            self._cued_phase = "stopped"
+        return self.cued_status()
+
+    def tick_cued(self, now_ms: float) -> Dict[str, Any]:
+        """Advance cued-event state machine using the exact camera `timestamp_ms` clock."""
+        t = float(now_ms)
+        if not self._cued_active or self._cued_idx >= len(self._cued_schedule):
+            return self.cued_status(now_ms=t)
+
+        if self._cued_phase_start_ms is None:
+            self._cued_phase_start_ms = t
+            return self.cued_status(now_ms=t)
+
+        elapsed_ms = t - self._cued_phase_start_ms
+        item = self._cued_schedule[self._cued_idx]
+
+        if self._cued_phase == "rest":
+            if elapsed_ms >= float(self._cued_gap_ms):
+                cue_ts = int(round(t))
+                win_ms = int(item["window_ms"])
+                ev = {
+                    "cue_id": item["cue_id"],
+                    "pose": item["pose"],
+                    "expected_trigger": item["expected_trigger"],
+                    "hand": item["hand"],
+                    "cue_ts_ms": cue_ts,
+                    "window_ms": win_ms,
+                    "t_start_ms": cue_ts,
+                    "t_end_ms": cue_ts + win_ms,
+                }
+                self._cued_events.append(ev)
+                self._cued_phase = "cue"
+                self._cued_phase_start_ms = t
+        elif self._cued_phase == "cue":
+            if elapsed_ms >= float(item["window_ms"]):
+                self._cued_idx += 1
+                if self._cued_idx >= len(self._cued_schedule):
+                    self._cued_active = False
+                    self._cued_phase = "done"
+                else:
+                    self._cued_phase = "rest"
+                    self._cued_phase_start_ms = t
+
+        return self.cued_status(now_ms=t)
+
+    def add_cued_frame(self, hands: Sequence[Any], timestamp_ms: int) -> None:
+        """
+        Record ALL detected hands continuously (no trim/clean/quality drop, ignoring `record_hand`),
+        and emit an explicit `hand_present=False` marker when `hands` is empty so offline replay
+        preserves exact lost-hand resets.
+        """
+        if not self._cued_active:
+            return
+        active_cue_id = (
+            self._cued_events[-1]["cue_id"]
+            if (self._cued_phase == "cue" and self._cued_events)
+            else None
+        )
+        added = 0
+        for h_inp in hands:
+            lms2d = getattr(h_inp, "landmarks", None)
+            if lms2d is None or len(lms2d) < 21:
+                continue
+            lms3d = getattr(h_inp, "world_landmarks", None)
+            flat_2d = [c for lm in lms2d[:21] for c in (lm.x, lm.y, lm.z)]
+            flat_3d = (
+                [c for lm in lms3d[:21] for c in (lm.x, lm.y, lm.z)]
+                if (lms3d is not None and len(lms3d) >= 21)
+                else []
+            )
+            handed: Handedness = "Left" if str(getattr(h_inp, "handedness", "Right")) == "Left" else "Right"
+            conf = float(getattr(h_inp, "confidence", 1.0))
+            sample: Dict[str, Any] = {
+                "timestamp_ms": int(timestamp_ms),
+                "hand_present": True,
+                "label": 0,
+                "label_name": PoseName.IDLE.value,
+                "handedness": handed,
+                "hand_id": handed,
+                "confidence": round(conf, 4),
+                "landmarks_2d": flat_2d,
+                "world_landmarks": flat_3d,
+            }
+            if active_cue_id is not None:
+                sample["cue_id"] = active_cue_id
+            self._cued_samples.append(sample)
+            added += 1
+
+        if added == 0:
+            marker: Dict[str, Any] = {
+                "timestamp_ms": int(timestamp_ms),
+                "hand_present": False,
+                "label": 0,
+                "label_name": PoseName.IDLE.value,
+                "handedness": "Right",
+                "hand_id": "Right",
+                "confidence": 0.0,
+                "landmarks_2d": [],
+                "world_landmarks": [],
+            }
+            if active_cue_id is not None:
+                marker["cue_id"] = active_cue_id
+            self._cued_samples.append(marker)
+
+    def _build_cued_payload(self, *, is_draft: bool = False) -> Dict[str, Any]:
+        meta = dict(self._session_meta)
+        meta["subject"] = str(meta.get("subject") or "").strip() or self._default_subject
+        meta["hand"] = self._cued_hand
+        meta["condition_id"] = compute_condition_id(meta)
+        meta["cued_window_ms"] = int(self._cued_window_ms)
+        meta["cued_gap_ms"] = int(self._cued_gap_ms)
+        if self._cued_seed is not None:
+            meta["cued_seed"] = int(self._cued_seed)
+        payload: Dict[str, Any] = {
+            "schema": "aerohand_pinch_v2",
+            "schema_version": 2,
+            "recording_kind": "cued_events",
+            "collected_at": self._cued_started_at_iso,
+            "session_meta": meta,
+            "cue_events": list(self._cued_events),
+            "total_cues": len(self._cued_events),
+            "total_samples": len(self._cued_samples),
+            "samples": list(self._cued_samples),
+        }
+        if is_draft:
+            payload["is_draft"] = True
+        return payload
+
+    def autosave_cued_draft(self, recall_dir: str | Path) -> Optional[Path]:
+        """Atomically persist unsaved cued-event samples & cues under `<recall_dir>/_drafts/`."""
+        if not self._cued_samples and not self._cued_events:
+            return None
+        drafts_dir = Path(recall_dir) / "_drafts"
+        drafts_dir.mkdir(parents=True, exist_ok=True)
+        payload = self._build_cued_payload(is_draft=True)
+        subj = _slugify(payload["session_meta"]["subject"], self._default_subject)
+        draft_fp = drafts_dir / f"cued_draft_{subj}_{self._cued_draft_id}.json"
+        tmp_fp = draft_fp.with_suffix(".json.tmp")
+        tmp_fp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp_fp.replace(draft_fp)
+        self._cued_last_draft_path = draft_fp
+        return draft_fp
+
+    def save_cued(self, recall_dir: str | Path) -> Path:
+        """Save cued-event session (`recording_kind='cued_events'`) to `recall_dir` with zero trimming/cleaning."""
+        out_root = Path(recall_dir)
+        out_root.mkdir(parents=True, exist_ok=True)
+        payload = self._build_cued_payload(is_draft=False)
+        meta = payload["session_meta"]
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        subj = _slugify(meta.get("subject", self._default_subject), self._default_subject)
+        hand = _slugify(meta.get("hand", "Right"), "Right")
+        angle = _slugify(meta.get("wrist_angle", "0"), "0")
+        dist = _slugify(meta.get("distance", "mid"), "mid")
+        light = _slugify(meta.get("lighting", "bright"), "bright")
+        out_fp = out_root / f"aerohand_cued_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}.json"
+        if out_fp.exists():
+            out_fp = out_root / (
+                f"aerohand_cued_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}_{int(time.time() * 1000) % 1000:03d}.json"
+            )
+        out_fp.write_text(json.dumps(payload), encoding="utf-8")
+        if self._cued_last_draft_path is not None:
+            try:
+                self._cued_last_draft_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self._cued_last_draft_path = None
+        return out_fp
+
+    def cued_status(self, now_ms: Optional[float] = None) -> Dict[str, Any]:
+        item = (
+            self._cued_schedule[self._cued_idx]
+            if self._cued_idx < len(self._cued_schedule)
+            else None
+        )
+        rem_s = 0.0
+        if self._cued_active and item is not None and self._cued_phase_start_ms is not None and now_ms is not None:
+            target_ms = float(self._cued_gap_ms if self._cued_phase == "rest" else item["window_ms"])
+            rem_s = max(0.0, (target_ms - (float(now_ms) - self._cued_phase_start_ms)) / 1000.0)
+        return {
+            "active": self._cued_active,
+            "phase": self._cued_phase,
+            "cue_index": self._cued_idx,
+            "cues_issued": len(self._cued_events),
+            "total_cues": len(self._cued_schedule),
+            "samples": len(self._cued_samples),
+            "hand": self._cued_hand,
+            "pose": item["pose"] if (self._cued_phase == "cue" and item is not None) else None,
+            "expected_trigger": item["expected_trigger"] if (self._cued_phase == "cue" and item is not None) else None,
+            "instruction_en": item["instruction_en"] if (self._cued_phase == "cue" and item is not None) else "",
+            "instruction_vi": item["instruction_vi"] if (self._cued_phase == "cue" and item is not None) else "",
+            "remaining_s": round(rem_s, 1),
+            "has_unsaved": len(self._cued_samples) > 0,
+            "draft_path": str(self._cued_last_draft_path) if self._cued_last_draft_path else None,
         }
 
     # ------------------------------------------------------------------

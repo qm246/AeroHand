@@ -43,6 +43,7 @@ from aerohand.ml.recording_io import (
     POSE_TO_IDX,
     assert_not_heldout,
     collect_json_paths,
+    exclude_cued_events,
     exclude_sealed_content,
     load_recording_frames,
     sha256_file,
@@ -203,8 +204,10 @@ def evaluate_recordings(
     wall_clock_ms = 0.0
     evaluated_files: List[str] = []
 
-    work_items: List[Tuple[Path, bool]] = [(p, False) for p in session_paths] + [
-        (p, True) for p in negative_paths
+    sess_filtered, _ = exclude_cued_events(session_paths)
+    neg_filtered, _ = exclude_cued_events(negative_paths)
+    work_items: List[Tuple[Path, bool]] = [(p, False) for p in sess_filtered] + [
+        (p, True) for p in neg_filtered
     ]
 
     for fp, is_neg in work_items:
@@ -212,6 +215,8 @@ def evaluate_recordings(
         frames, rec_meta = load_recording_frames(
             fp, force_idle=is_neg, allow_sealed_aerohand=allow_sealed_aerohand
         )
+        if str(rec_meta.get("recording_kind") or "").strip().lower() == "cued_events":
+            continue
         if not frames:
             continue
         evaluated_files.append(fp.name)
@@ -758,6 +763,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         negative_paths, excl_n = exclude_sealed_content(
             _collect_json_paths(args.negatives), sealed_root=args.sealed_root
         )
+        session_paths, excl_cs = exclude_cued_events(session_paths)
+        negative_paths, excl_cn = exclude_cued_events(negative_paths)
+        if excl_cs or excl_cn:
+            print(
+                f"[INFO] Excluded {len(excl_cs) + len(excl_cn)} cued_events recording(s) from replay_eval.",
+                file=sys.stderr,
+            )
         if excl_s or excl_n:
             print(
                 f"[WARN] Excluded {len(excl_s) + len(excl_n)} file(s) matching sealed_manifest.json SHA-256.",

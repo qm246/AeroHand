@@ -1013,6 +1013,21 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "collector_guided_stop":
             if self.runtime is not None:
                 self.runtime.collector_stop_guided()
+        elif act == "collector_cued_start":
+            if self.runtime is not None:
+                self.runtime.collector_start_cued(
+                    cues_per_trigger=int(msg.get("cues_per_trigger", 10)),
+                    hand=msg.get("hand"),
+                    window_ms=int(msg.get("window_ms", 2500)),
+                    gap_ms=int(msg.get("gap_ms", 1200)),
+                    seed=msg.get("seed"),
+                )
+        elif act == "collector_cued_stop":
+            if self.runtime is not None:
+                self.runtime.collector_stop_cued()
+        elif act == "collector_cued_save":
+            if self.runtime is not None:
+                self.runtime.collector_save_cued()
         elif act == "collector_save":
             if self.runtime is not None:
                 self.runtime.collector_save(allow_low_quality=bool(msg.get("allow_low_quality", False)))

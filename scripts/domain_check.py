@@ -20,6 +20,7 @@ import numpy as np
 from aerohand.core.palm_frame import INDEX_TIP, THUMB_TIP, compute_palm_frame
 from aerohand.ml.recording_io import (
     collect_json_paths,
+    exclude_cued_events,
     exclude_sealed_content,
     load_recording_frames,
 )
@@ -54,12 +55,13 @@ def ks_2samp_stat_and_pvalue(a: Sequence[float], b: Sequence[float]) -> Tuple[fl
 
 
 def extract_domain_features(paths: Sequence[Path]) -> Dict[str, List[float]]:
-    """Extract `palm_size`, `thumb_index_dist_3d`, and `wrist_speed` across recordings."""
+    """Extract `palm_size`, `thumb_index_dist_3d`, and `wrist_speed` across recordings (excluding `cued_events`)."""
     palm_sizes: List[float] = []
     ti_dists: List[float] = []
     wrist_speeds: List[float] = []
 
-    for fp in paths:
+    kept_paths, _ = exclude_cued_events(paths)
+    for fp in kept_paths:
         frames, _ = load_recording_frames(fp)
         prev_wrist: Optional[Tuple[float, float, float]] = None
         prev_ts: Optional[float] = None
@@ -145,6 +147,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
     conv_paths, _ = exclude_sealed_content(collect_json_paths(args.converted), sealed_root=args.sealed_root)
     aero_paths, _ = exclude_sealed_content(collect_json_paths(args.aerohand), sealed_root=args.sealed_root)
+    conv_paths, _ = exclude_cued_events(conv_paths)
+    aero_paths, _ = exclude_cued_events(aero_paths)
     report = compare_domains(conv_paths, aero_paths)
     print(json.dumps(report, indent=2))
 

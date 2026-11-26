@@ -625,6 +625,17 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             <button class="btn primary" id="btn-col-rec" onclick="post('collector_toggle')">⏺ Bắt đầu ghi mẫu</button>
             <button class="btn" id="btn-col-guided" onclick="toggleGuided()">🎬 Quay theo kịch bản hướng dẫn</button>
             <button class="btn" id="btn-col-cued" onclick="toggleCued()">🎯 Quay phiên kiểm thử Recall (Dry-Run)</button>
+            <select id="col-cued-pace" title="Nhịp lệnh Recall">
+              <option value="4500:2200">Thoải mái (4.5s / nghỉ 2.2s)</option>
+              <option value="3500:1800" selected>Vừa (3.5s / nghỉ 1.8s)</option>
+              <option value="2500:1200">Nhanh (2.5s / nghỉ 1.2s)</option>
+            </select>
+            <select id="col-cued-count" title="Số lệnh mỗi cử chỉ">
+              <option value="5">5 lệnh/cử chỉ (35)</option>
+              <option value="10" selected>10 lệnh/cử chỉ (70)</option>
+              <option value="15">15 lệnh/cử chỉ (105)</option>
+              <option value="25">25 lệnh/cử chỉ (175)</option>
+            </select>
             <button class="btn" id="btn-col-cued-save" onclick="post('collector_cued_save')" style="display:none">💾 Lưu phiên Recall</button>
             <select id="col-pose-sel" onchange="post('collector_pose',{pose:this.value})"></select>
             <button class="btn" id="btn-col-undo" onclick="post('collector_undo',{seconds:5})">↩ Hủy 5 giây vừa quay</button>
@@ -738,7 +749,18 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
 
   function toggleCued() {
     sendColMeta();
-    post(LAST_CUED_ACTIVE ? "collector_cued_stop" : "collector_cued_start");
+    if (LAST_CUED_ACTIVE) {
+      post("collector_cued_stop");
+      return;
+    }
+    const paceVal = String((document.getElementById("col-cued-pace") || {}).value || "3500:1800");
+    const [wStr, gStr] = paceVal.split(":");
+    const cntVal = parseInt((document.getElementById("col-cued-count") || {}).value || "10", 10) || 10;
+    post("collector_cued_start", {
+      cues_per_trigger: cntVal,
+      window_ms: parseInt(wStr, 10) || 3500,
+      gap_ms: parseInt(gStr, 10) || 1800,
+    });
   }
 
   function copyTrainCmd() {

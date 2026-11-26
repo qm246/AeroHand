@@ -777,8 +777,8 @@ class AeroHandRuntime:
         *,
         cues_per_trigger: int = 10,
         hand: Optional[str] = None,
-        window_ms: int = 2500,
-        gap_ms: int = 1200,
+        window_ms: int = 3500,
+        gap_ms: int = 1800,
         seed: Optional[int] = None,
         triggers: Optional[Sequence[str]] = None,
     ) -> Dict[str, Any]:
@@ -1097,7 +1097,13 @@ class AeroHandRuntime:
     ) -> None:
         """Record landmarks for cued sessions (all hands + hand-absent) or normal collector (`primary`/`both`)."""
         if self.collector.is_cued_active:
+            prev_issued = len(self.collector._cued_events)
             self.collector.tick_cued(now_ms=float(timestamp_ms))
+            if len(self.collector._cued_events) > prev_issued:
+                try:
+                    self.audio.play_wheel_tick()
+                except Exception:
+                    pass
             if self.collector.is_cued_active:
                 self.collector.add_cued_frame(hands, timestamp_ms)
             else:

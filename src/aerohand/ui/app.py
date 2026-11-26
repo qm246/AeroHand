@@ -1024,8 +1024,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 self.runtime.collector_start_cued(
                     cues_per_trigger=int(msg.get("cues_per_trigger", 10)),
                     hand=msg.get("hand"),
-                    window_ms=int(msg.get("window_ms", 2500)),
-                    gap_ms=int(msg.get("gap_ms", 1200)),
+                    window_ms=int(msg.get("window_ms", 3500)),
+                    gap_ms=int(msg.get("gap_ms", 1800)),
                     seed=msg.get("seed"),
                 )
         elif act == "collector_cued_stop":

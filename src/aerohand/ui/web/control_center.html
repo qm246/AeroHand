@@ -589,7 +589,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
           <div class="card-title"><span id="t-col-hdr">STUDIO THU THẬP DỮ LIỆU HUẤN LUYỆN TCN (TRONG APP)</span><span class="pill-tag" id="col-total">0 mẫu</span></div>
           <div class="grid-3" style="margin-bottom:8px">
             <div class="row"><div class="row-label"><strong id="lbl-col-subj">Người quay</strong></div>
-              <input type="text" id="col-meta-subj" value="user" style="width:110px" onchange="sendColMeta()" />
+              <input type="text" id="col-meta-subj" value="minh" required style="width:110px" onchange="setKey('collector.subject', this.value.trim() || 'minh'); sendColMeta();" />
             </div>
             <div class="row"><div class="row-label"><strong id="lbl-col-hand">Tay ghi</strong></div>
               <select id="col-rec-hand" onchange="setKey('collector.record_hand', this.value); sendColMeta();">
@@ -714,7 +714,7 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
   function sendColMeta() {
     post("collector_meta", {
       meta: {
-        subject: (document.getElementById("col-meta-subj") || {}).value || "user",
+        subject: (document.getElementById("col-meta-subj") || {}).value || getPath(STATE.cfg, "collector.subject", "minh") || "minh",
         hand: (document.getElementById("col-rec-hand") || {}).value === "both" ? "Both" : getPath(STATE.cfg, "hand.cursor_hand", "Right"),
         wrist_angle: (document.getElementById("col-meta-angle") || {}).value || "0",
         distance: (document.getElementById("col-meta-dist") || {}).value || "mid",
@@ -1128,6 +1128,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     }
     const delSel = document.getElementById("cfg-trk-del");
     if (delSel) delSel.value = getPath(c, "tracker.delegate", "CPU");
+    const subjInp = document.getElementById("col-meta-subj");
+    if (subjInp) subjInp.value = String(getPath(c, "collector.subject", "minh") || "minh");
     const recHandSel = document.getElementById("col-rec-hand");
     if (recHandSel) recHandSel.value = getPath(c, "collector.record_hand", "primary");
     const colI18n = i18n.collector || {};

@@ -141,6 +141,7 @@ classifier:
     grip_loose_ratio: 1.05
 
 collector:
+  subject: "minh"                      # Default collector subject ID (matches converted corpus & primary_subject)
   record_hand: "primary"               # "primary" | "both"
   quality_gate_mode: "clean"           # "clean" (drop bad frames, split gaps, always save) | "strict"
   trim_edge_ms: 300                    # Trim first/last 300 ms of guided recording segments

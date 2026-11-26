@@ -243,6 +243,7 @@ class AeroHandRuntime:
         )
         self.vitals_mon = SystemVitalsMonitor()
         col_cfg = config.get("collector") or {}
+        self.collector_subject: str = str(col_cfg.get("subject", "minh")).strip() or "minh"
         self.collector_record_hand: str = str(col_cfg.get("record_hand", "primary")).lower()
         neg_raw = str(col_cfg.get("negatives_dir", "data/negatives"))
         self.negatives_dir: Path = Path(neg_raw) if Path(neg_raw).is_absolute() else (repo_root() / neg_raw)
@@ -255,6 +256,7 @@ class AeroHandRuntime:
             countdown_s=float(col_cfg.get("countdown_s", 3.0)),
             step_duration_s=float(col_cfg.get("step_duration_s", 5.0)),
             quality_gate_mode=str(col_cfg.get("quality_gate_mode", "clean")),
+            default_subject=self.collector_subject,
         )
         self.calibration: PinchCalibrationWizard = PinchCalibrationWizard()
         self._cached_saved_sessions: Optional[List[str]] = None
@@ -453,6 +455,10 @@ class AeroHandRuntime:
         self.input_ctl.mouse_guard_s = float(tg.get("mouse_ms", 1000)) / 1000.0
 
         col_cfg = effective.get("collector") or {}
+        new_subj = str(col_cfg.get("subject", self.collector_subject)).strip() or "minh"
+        if new_subj != self.collector_subject:
+            self.collector_subject = new_subj
+            self.collector.set_session_meta({"subject": new_subj})
         self.collector_record_hand = str(col_cfg.get("record_hand", "primary")).lower()
 
         self.audio.update_config(effective.get("audio"))

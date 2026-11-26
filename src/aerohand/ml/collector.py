@@ -48,6 +48,7 @@ LIGHTING_BUCKETS: Tuple[str, ...] = ("bright", "backlit", "dim")
 HARD_NEGATIVE_MIN_PER_GROUP: int = 500
 MIN_ANGLE_SHARE: float = 0.15
 CORPUS_TOTAL_TARGET: int = sum(v["total"] for v in COLLECTOR_CLASS_TARGETS.values())  # 21000
+DEFAULT_COLLECTOR_SUBJECT: str = "minh"
 
 
 class QualityGateError(ValueError):
@@ -309,6 +310,7 @@ class PinchDataCollector:
         countdown_s: float = 3.0,
         step_duration_s: float = 5.0,
         quality_gate_mode: str = "clean",
+        default_subject: str = DEFAULT_COLLECTOR_SUBJECT,
     ) -> None:
         self._samples: List[Dict[str, Any]] = []
         self._segment_buf: List[Dict[str, Any]] = []
@@ -320,11 +322,12 @@ class PinchDataCollector:
         self._step_duration_s: float = max(1.0, float(step_duration_s))
         mode = str(quality_gate_mode or "clean").strip().lower()
         self.quality_gate_mode: str = mode if mode in ("clean", "strict") else "clean"
+        self._default_subject: str = str(default_subject or "").strip() or DEFAULT_COLLECTOR_SUBJECT
         self._draft_id: str = time.strftime("%Y%m%d_%H%M%S")
         self._last_draft_path: Optional[Path] = None
 
         self._session_meta: Dict[str, Any] = {
-            "subject": "user",
+            "subject": self._default_subject,
             "hand": "Right",
             "wrist_angle": "0",
             "distance": "mid",
@@ -393,9 +396,9 @@ class PinchDataCollector:
         drafts_dir = Path(sessions_dir) / "_drafts"
         drafts_dir.mkdir(parents=True, exist_ok=True)
         meta = dict(self._session_meta)
-        meta["subject"] = str(meta.get("subject") or "").strip() or "user"
+        meta["subject"] = str(meta.get("subject") or "").strip() or self._default_subject
         meta["condition_id"] = compute_condition_id(meta)
-        draft_fp = drafts_dir / f"draft_{_slugify(meta['subject'], 'user')}_{self._draft_id}.json"
+        draft_fp = drafts_dir / f"draft_{_slugify(meta['subject'], self._default_subject)}_{self._draft_id}.json"
         cleaned, clean_report = clean_recording_samples(all_samples)
         payload = {
             "schema": "aerohand_pinch_v2",
@@ -643,13 +646,13 @@ class PinchDataCollector:
             }
 
         meta = dict(self._session_meta)
-        meta["subject"] = str(meta.get("subject") or "").strip() or "user"
+        meta["subject"] = str(meta.get("subject") or "").strip() or self._default_subject
         meta["condition_id"] = compute_condition_id(meta)
 
         out_root = Path(out_dir)
         out_root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d_%H%M%S")
-        subj = _slugify(meta.get("subject", "user"), "user")
+        subj = _slugify(meta.get("subject", self._default_subject), self._default_subject)
         hand = _slugify(meta.get("hand", "Right"), "Right")
         angle = _slugify(meta.get("wrist_angle", "0"), "0")
         dist = _slugify(meta.get("distance", "mid"), "mid")
@@ -831,7 +834,7 @@ class FrameRingBuffer:
         trig_slug = _slugify(info["trigger_type"], "manual")
         hand_slug = _slugify(info["hand"], "Right")
         meta = dict(session_meta or {})
-        meta.setdefault("subject", "user")
+        meta.setdefault("subject", DEFAULT_COLLECTOR_SUBJECT)
         meta["hand"] = info["hand"]
         meta["source"] = "hard_negative_mine"
         meta["trigger_type"] = info["trigger_type"]

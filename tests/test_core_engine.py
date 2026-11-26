@@ -3855,3 +3855,63 @@ def test_promotion_check_script_rejects_insufficient_exposure():
     )
     assert res_weak["passed"] is False
     assert res_weak["criteria"]["subject_heldout_recall"]["passed"] is False
+
+
+
+def test_primary_subject_zero_bundles_aborts():
+    mod = _load_train_tcn_module("train_tcn_v051_01_zero")
+    h = _make_open_hand()
+    wins = [[mod.ParsedSample(0, h, h, "Right", "Right", 0.0)] * 5] * 4
+    b_other = mod.SessionBundle(
+        "other.json", "other::c1", wins, np.zeros(4, dtype=np.int64), scenario="s1", subject="alice"
+    )
+    dev_b, ho_b = mod.split_subject_heldout([b_other], primary_subject="minh")
+    assert dev_b == [] and len(ho_b) == 1
+    with pytest.raises(ValueError, match="matched 0 bundles"):
+        mod.validate_subject_split([b_other], dev_b, ho_b, primary_subject="minh")
+
+
+def test_collector_default_subject_from_config(tmp_path: Path):
+    import json
+
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    assert cfg["collector"]["subject"] == "minh"
+    cfg["audio"]["enabled"] = False
+    cfg["collector"]["subject"] = "minh_custom"
+    rt = AeroHandRuntime(cfg, dry_run=True, collect_dir=tmp_path)
+    assert rt.collector.session_meta["subject"] == "minh_custom"
+
+    h = _make_open_hand()
+    rt.collector.set_recording(True)
+    rt.collector.set_pose(PoseName.IDLE)
+    rt.collector.add_frame(h, h, "Right", 0.95, 1000)
+    rt.collector.add_frame(h, h, "Right", 0.95, 1033)
+    saved_fp = rt.collector.save(tmp_path)
+    data = json.loads(saved_fp.read_text(encoding="utf-8"))
+    assert data["session_meta"]["subject"] == "minh_custom"
+
+
+def test_split_subject_heldout_warns_on_default_subject_names():
+    mod = _load_train_tcn_module("train_tcn_v051_01_warn")
+    h = _make_open_hand()
+    wins = [[mod.ParsedSample(0, h, h, "Right", "Right", 0.0)] * 5] * 4
+    b_minh = mod.SessionBundle(
+        "minh.json", "minh::c1", wins, np.zeros(4, dtype=np.int64), scenario="s1", subject="minh"
+    )
+    b_user = mod.SessionBundle(
+        "ui.json", "user::c1", wins, np.zeros(4, dtype=np.int64), scenario="s2", subject="user"
+    )
+    dev_b, ho_b = mod.split_subject_heldout([b_minh, b_user], primary_subject="minh")
+    assert len(dev_b) == 1 and len(ho_b) == 1
+    with pytest.raises(ValueError, match="placeholder subject"):
+        mod.validate_subject_split([b_minh, b_user], dev_b, ho_b, primary_subject="minh")
+
+    # Named volunteer subject passes cleanly
+    b_vol = mod.SessionBundle(
+        "vol.json", "linh::c1", wins, np.zeros(4, dtype=np.int64), scenario="s3", subject="linh"
+    )
+    dev2, ho2 = mod.split_subject_heldout([b_minh, b_vol], primary_subject="minh")
+    res = mod.validate_subject_split([b_minh, b_vol], dev2, ho2, primary_subject="minh")
+    assert res["dev_bundles"] == 1 and res["heldout_bundles"] == 1

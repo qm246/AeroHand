@@ -378,6 +378,20 @@ def load_session_bundle(
     )
 
 
+DEFAULT_UNASSIGNED_SUBJECTS = frozenset({"", "user", "anon", "default", "unknown"})
+
+
+def summarize_bundles_by_subject(bundles: Sequence[SessionBundle]) -> Dict[str, Dict[str, int]]:
+    """Return `{subject: {"bundles": n_files, "windows": n_windows}}` summary table."""
+    table: Dict[str, Dict[str, int]] = {}
+    for b in bundles:
+        subj = (b.subject or "anon").strip() or "anon"
+        entry = table.setdefault(subj, {"bundles": 0, "windows": 0})
+        entry["bundles"] += 1
+        entry["windows"] += len(b.windows)
+    return dict(sorted(table.items()))
+
+
 def split_subject_heldout(
     bundles: Sequence[SessionBundle],
     *,
@@ -403,6 +417,51 @@ def split_subject_heldout(
         else:
             dev_bundles.append(b)
     return dev_bundles, ho_bundles
+
+
+def validate_subject_split(
+    all_bundles: Sequence[SessionBundle],
+    dev_bundles: Sequence[SessionBundle],
+    ho_bundles: Sequence[SessionBundle],
+    *,
+    primary_subject: str = "",
+    heldout_subjects: Sequence[str] = (),
+) -> Dict[str, Any]:
+    """
+    Guard against silent data exclusion when `--primary-subject` mismatches collector subject
+    names (V051-01). Raises `ValueError` if primary subject matches 0 bundles OR if
+    placeholder/default subject names (`user`/`anon`) are silently demoted into held-out.
+    """
+    summary = summarize_bundles_by_subject(all_bundles)
+    primary_norm = primary_subject.strip().lower()
+    explicit_ho = {s.strip().lower() for s in heldout_subjects if s and s.strip()}
+    if primary_norm and not dev_bundles:
+        raise ValueError(
+            f"Primary subject '{primary_subject}' matched 0 bundles! "
+            f"Available subjects: {summary}. "
+            "Set `collector.subject` or fix `session_meta.subject` before training."
+        )
+    demoted_defaults = sorted(
+        {
+            b.subject
+            for b in ho_bundles
+            if b.subject.strip().lower() in DEFAULT_UNASSIGNED_SUBJECTS
+            and b.subject.strip().lower() not in explicit_ho
+        }
+    )
+    if primary_norm and demoted_defaults:
+        raise ValueError(
+            f"Refusing silent subject exclusion: bundles with placeholder subject {demoted_defaults} "
+            f"would be pushed out of primary '{primary_subject}' into subject-held-out! "
+            f"Subject summary: {summary}. Update `collector.subject` / `session_meta.subject` "
+            "(or pass `--heldout-subjects` explicitly if intended)."
+        )
+    return {
+        "by_subject": summary,
+        "dev_bundles": len(dev_bundles),
+        "heldout_bundles": len(ho_bundles),
+        "demoted_default_subjects": demoted_defaults,
+    }
 
 
 def balance_scenario_samples(
@@ -1004,13 +1063,26 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     if not bundles:
         raise SystemExit("Loaded 0 valid sequences across all session files.")
 
-    # Separate non-primary / volunteer subjects strictly out of dev training (V050-02)
+    # Separate non-primary / volunteer subjects strictly out of dev training (V050-02 / V051-01)
     ho_subjs = [s.strip() for s in str(getattr(args, "heldout_subjects", "") or "").split(",") if s.strip()]
+    primary_subj = str(getattr(args, "primary_subject", "") or "")
     dev_bundles, subject_ho_bundles = split_subject_heldout(
         bundles,
-        primary_subject=str(getattr(args, "primary_subject", "") or ""),
+        primary_subject=primary_subj,
         heldout_subjects=ho_subjs,
     )
+    subj_summary = summarize_bundles_by_subject(bundles)
+    print(f"[DATA] Bundles/windows by subject: {subj_summary}")
+    try:
+        validate_subject_split(
+            bundles,
+            dev_bundles,
+            subject_ho_bundles,
+            primary_subject=primary_subj,
+            heldout_subjects=ho_subjs,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"Aborting: {exc}") from None
     if subject_ho_bundles:
         ho_names = sorted({b.subject for b in subject_ho_bundles})
         print(f"[DATA] Held out volunteer subjects for out-of-subject eval: {ho_names} ({len(subject_ho_bundles)} files)")

@@ -26,8 +26,10 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -585,15 +587,41 @@ def balance_scenario_samples(
     }
 
 
+def _get_git_commit() -> str:
+    """Return current short git HEAD commit hash (or 'unknown' outside a git worktree)."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        out = (res.stdout or "").strip()
+        return out if out else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def compute_onnx_model_hash(onnx_path: str | Path, normalizer_path: str | Path) -> str:
+    """Compute 24-hex fingerprint identical to `replay_eval.compute_eval_model_hash('onnx_tcn', ...)`."""
+    h = hashlib.sha256()
+    h.update(b"onnx_tcn")
+    h.update(Path(onnx_path).read_bytes())
+    h.update(Path(normalizer_path).read_bytes())
+    return h.hexdigest()[:24]
+
+
 def augment_window(
     window: Sequence[ParsedSample],
     rng: np.random.Generator,
 ) -> List[ParsedSample]:
     """
-    Apply landmark-level augmentations BEFORE feature extraction:
+    Apply landmark-level augmentations BEFORE feature extraction (V051-10):
       - Z-rotation +/-15 deg around wrist
       - Uniform scale 0.85..1.15
-      - Gaussian noise sigma=0.003 on normalized coordinates
+      - Palm-width-scaled Gaussian noise: shared per-window jitter `sigma = 0.01 * palm_width`
+        plus smaller independent per-frame jitter `sigma = 0.002 * palm_width` (avoids artificial velocity)
       - 1-frame drop/duplicate temporal jitter (preserves exact sequence length & final label)
       - Random 50% Left<->Right X-mirror matching AeroHand handedness convention
     """
@@ -614,6 +642,11 @@ def augment_window(
         dup_i = max(0, min(seq_len - 1, drop_i + (1 if rng.random() < 0.5 else -1)))
         indices[drop_i] = dup_i
 
+    # Shared per-window unit noise (scaled per frame by palm_width ||LM5 - LM17||)
+    n_pts = len(window[0].lms2d)
+    win_noise_unit_2d = rng.normal(0.0, 0.01, size=(n_pts, 3))
+    win_noise_unit_3d = rng.normal(0.0, 0.01, size=(n_pts, 3))
+
     def _xform_landmarks(lms: List[Landmark], *, is_world: bool) -> List[Landmark]:
         arr = np.array([[p.x, p.y, p.z] for p in lms], dtype=np.float64)
         anchor = arr[0].copy()
@@ -623,7 +656,17 @@ def augment_window(
         rel[:, 0] = rx
         rel[:, 1] = ry
         out_arr = rel + anchor
-        out_arr += rng.normal(0.0, 0.003, size=out_arr.shape)
+        if len(rel) >= 18:
+            pw = float(np.linalg.norm(rel[5] - rel[17]))
+        else:
+            pw = 0.0
+        if not math.isfinite(pw) or pw < 1e-5:
+            pw = 0.08 if is_world else 0.12
+        shared_unit = win_noise_unit_3d if is_world else win_noise_unit_2d
+        if shared_unit.shape[0] != out_arr.shape[0]:
+            shared_unit = rng.normal(0.0, 0.01, size=out_arr.shape)
+        out_arr += shared_unit * pw
+        out_arr += rng.normal(0.0, 0.002 * pw, size=out_arr.shape)
         if do_mirror:
             if is_world:
                 out_arr[:, 0] = -out_arr[:, 0]
@@ -651,6 +694,63 @@ def augment_window(
     return aug_out
 
 
+def split_dev_test_groups(
+    bundles: Sequence[SessionBundle],
+    *,
+    test_ratio: float = 0.15,
+    min_groups_for_dev_test: int = 4,
+    num_classes: int = NUM_CLASSES,
+) -> Tuple[List[SessionBundle], List[SessionBundle]]:
+    """
+    Carve out a disjoint `dev_test` group split when `>= min_groups_for_dev_test` distinct
+    groups exist (V051-10). Never used for epoch selection or temperature calibration.
+    Guarantees every class present in `bundles` keeps at least 2 groups in `dev_train_val`.
+    """
+    grouped: Dict[str, List[SessionBundle]] = {}
+    for b in bundles:
+        grouped.setdefault(b.group_key, []).append(b)
+
+    group_keys = sorted(grouped.keys())
+    if len(group_keys) < max(3, int(min_groups_for_dev_test)):
+        return list(bundles), []
+
+    group_classes: Dict[str, set[int]] = {}
+    class_group_counts: Dict[int, int] = {}
+    for gk in group_keys:
+        cls_set: set[int] = set()
+        for b in grouped[gk]:
+            cls_set.update(int(x) for x in b.labels.tolist())
+        group_classes[gk] = cls_set
+        for c in cls_set:
+            class_group_counts[c] = class_group_counts.get(c, 0) + 1
+
+    target_test = max(1, int(round(len(group_keys) * max(0.05, min(0.4, float(test_ratio))))))
+    test_keys: List[str] = []
+    remaining = list(group_keys)
+    covered: set[int] = set()
+
+    while remaining and len(test_keys) < target_test and len(remaining) > 3:
+        eligible = [
+            gk for gk in remaining if all(class_group_counts[c] >= 3 for c in group_classes[gk])
+        ]
+        if not eligible:
+            break
+        best_gk = max(eligible, key=lambda gk: (len(group_classes[gk] - covered), gk))
+        test_keys.append(best_gk)
+        covered.update(group_classes[best_gk])
+        for c in group_classes[best_gk]:
+            class_group_counts[c] -= 1
+        remaining.remove(best_gk)
+
+    if not test_keys:
+        return list(bundles), []
+
+    test_key_set = set(test_keys)
+    train_val_bundles = [b for gk in group_keys if gk not in test_key_set for b in grouped[gk]]
+    dev_test_bundles = [b for gk in group_keys if gk in test_key_set for b in grouped[gk]]
+    return train_val_bundles, dev_test_bundles
+
+
 def split_session_groups(
     bundles: Sequence[SessionBundle],
     *,
@@ -658,52 +758,84 @@ def split_session_groups(
     num_classes: int = NUM_CLASSES,
 ) -> Tuple[List[SessionBundle], List[SessionBundle], List[str]]:
     """
-    Group-stratified split by `group_key` (`(subject, condition_id)` or file).
-    Ensures zero frame leakage across groups and maximizes validation class coverage.
+    Group-stratified split by `group_key` (`(subject, condition_id)` or file) (V051-10).
+    Ensures zero frame leakage across groups, NEVER leaves any class without training windows,
+    and falls back to a class-stratified temporal block cut (with 5-window gap) for single-group data.
     Returns `(train_bundles, val_bundles, missing_val_class_names)`.
     """
-    # Merge bundles sharing the exact same group_key so no condition leaks across train & val
     grouped: Dict[str, List[SessionBundle]] = {}
     for b in bundles:
         grouped.setdefault(b.group_key, []).append(b)
 
     group_keys = sorted(grouped.keys())
     if len(group_keys) < 2:
-        # Single-group fallback: non-overlapping temporal cut with seq_len gap
+        # Single-group fallback: class-stratified chronological block cut with 5-window gap per class
         merged_wins = [w for b in bundles for w in b.windows]
         merged_ys = np.concatenate([b.labels for b in bundles], axis=0) if bundles else np.zeros((0,), dtype=np.int64)
-        cut = max(1, int(len(merged_wins) * (1.0 - val_ratio)))
         gap = 5
-        tr_b = SessionBundle("single:train", "single:train", merged_wins[:cut], merged_ys[:cut])
-        va_start = min(len(merged_wins), cut + gap)
-        va_b = SessionBundle("single:val", "single:val", merged_wins[va_start:], merged_ys[va_start:])
+        tr_idxs: List[int] = []
+        va_idxs: List[int] = []
+        by_class: Dict[int, List[int]] = {}
+        for idx, lbl in enumerate(merged_ys.tolist()):
+            by_class.setdefault(int(lbl), []).append(idx)
+        for _cls, idxs in sorted(by_class.items()):
+            n = len(idxs)
+            if n <= 1:
+                tr_idxs.extend(idxs)
+                continue
+            val_n = max(1, int(round(n * val_ratio)))
+            if val_n >= n:
+                val_n = max(1, n - 1)
+            eff_gap = min(gap, max(0, n - val_n - 1))
+            tr_end = max(1, n - val_n - eff_gap)
+            va_start = min(n, tr_end + eff_gap)
+            tr_idxs.extend(idxs[:tr_end])
+            va_idxs.extend(idxs[va_start:])
+        tr_idxs.sort()
+        va_idxs.sort()
+        tr_wins = [merged_wins[i] for i in tr_idxs]
+        tr_ys = np.asarray([int(merged_ys[i]) for i in tr_idxs], dtype=np.int64)
+        va_wins = [merged_wins[i] for i in va_idxs]
+        va_ys = np.asarray([int(merged_ys[i]) for i in va_idxs], dtype=np.int64)
+        tr_b = SessionBundle("single:train", "single:train", tr_wins, tr_ys)
+        va_b = SessionBundle("single:val", "single:val", va_wins, va_ys)
         val_present = set(int(x) for x in va_b.labels.tolist())
         missing = [ALL_POSE_NAMES[i].value for i in range(num_classes) if i not in val_present]
         return [tr_b], [va_b], missing
 
     target_val_groups = max(1, int(round(len(group_keys) * val_ratio)))
+    min_train_groups = 2 if len(group_keys) >= 3 else 1
     group_classes: Dict[str, set[int]] = {}
+    train_class_counts: Dict[int, int] = {}
     for gk in group_keys:
         cls_set: set[int] = set()
         for b in grouped[gk]:
             cls_set.update(int(x) for x in b.labels.tolist())
         group_classes[gk] = cls_set
+        for c in cls_set:
+            train_class_counts[c] = train_class_counts.get(c, 0) + 1
 
-    # Greedy selection: prioritize groups that add uncovered classes to val while leaving >= 1 group for train
+    # Greedy selection: NEVER remove the last remaining group containing any class from train!
     val_keys: List[str] = []
     covered: set[int] = set()
     remaining = list(group_keys)
 
     while remaining and (len(val_keys) < target_val_groups or len(covered) < num_classes):
-        if len(remaining) <= 1:
+        if len(remaining) <= min_train_groups:
             break
-        # Score by newly covered classes, tie-break by later group name for deterministic reproducibility
-        best_gk = max(remaining, key=lambda gk: (len(group_classes[gk] - covered), gk))
+        eligible = [
+            gk for gk in remaining if all(train_class_counts[c] > 1 for c in group_classes[gk])
+        ]
+        if not eligible:
+            break
+        best_gk = max(eligible, key=lambda gk: (len(group_classes[gk] - covered), gk))
         gain = len(group_classes[best_gk] - covered)
         if len(val_keys) >= target_val_groups and gain == 0:
             break
         val_keys.append(best_gk)
         covered.update(group_classes[best_gk])
+        for c in group_classes[best_gk]:
+            train_class_counts[c] -= 1
         remaining.remove(best_gk)
 
     val_key_set = set(val_keys)
@@ -715,6 +847,39 @@ def split_session_groups(
         val_present.update(int(x) for x in b.labels.tolist())
     missing = [ALL_POSE_NAMES[i].value for i in range(num_classes) if i not in val_present]
     return train_bundles, val_bundles, missing
+
+
+def validate_train_classes(
+    train_bundles: Sequence[SessionBundle],
+    *,
+    min_windows: int = 300,
+    allow_low_count: bool = False,
+    allow_missing: bool = False,
+    num_classes: int = NUM_CLASSES,
+) -> Dict[str, int]:
+    """
+    Verify that every canonical class has training windows (`>= min_windows` unless `allow_low_count=True`)
+    so training never silently proceeds with a missing or severely starved class (V051-10).
+    """
+    counts_arr = np.zeros((num_classes,), dtype=np.int64)
+    for b in train_bundles:
+        if len(b.labels):
+            counts_arr += np.bincount(b.labels, minlength=num_classes)[:num_classes]
+    counts_map = {ALL_POSE_NAMES[i].value: int(counts_arr[i]) for i in range(num_classes)}
+    missing = [k for k, v in counts_map.items() if v <= 0]
+    if missing and not allow_missing:
+        raise ValueError(
+            f"Training split has 0 windows for canonical class(es): {missing}. "
+            f"Counts: {counts_map}."
+        )
+    if not allow_low_count and min_windows > 0:
+        low = {k: v for k, v in counts_map.items() if (v < int(min_windows)) and (not allow_missing or v > 0)}
+        if low:
+            raise ValueError(
+                f"Training split has < {min_windows} windows for class(es): {low}. "
+                "Record more samples (or pass --allow-low-train-counts / --min-train-windows for smoke runs)."
+            )
+    return counts_map
 
 
 def validate_validation_classes(
@@ -1010,6 +1175,102 @@ def validate_disjoint_ab_negatives(
         )
 
 
+def write_training_artifacts(
+    *,
+    out_dir: str | Path,
+    name: str,
+    onnx_path: str | Path,
+    feature_set: str,
+    feat_dim: int,
+    seq_len: int,
+    hidden: int,
+    loss: str,
+    augmented: bool,
+    mean: np.ndarray,
+    scale: np.ndarray,
+    temperature: float,
+    train_sequences: int,
+    val_sequences: int,
+    best_metrics: Dict[str, Any],
+    balance_stats: Dict[str, Any],
+    dev_test_metrics: Optional[Dict[str, Any]],
+    subject_ho_metrics: Optional[Dict[str, Any]],
+    onnx_parity_samples: int,
+    onnx_max_diff: float,
+    seed: int,
+    data_files_sha256_list: Sequence[Dict[str, str]],
+    torch_version: str = "unknown",
+    git_commit: Optional[str] = None,
+    set_latest: bool = False,
+) -> Tuple[Path, Path, Dict[str, Any]]:
+    """
+    Write normalizer JSON and metrics JSON with cryptographic provenance (`model_sha256`,
+    `normalizer_sha256`, 24-hex `model_hash`, `git_commit`, `seed`, `data_files_sha256_list`,
+    `torch_version`). Only overwrites `metrics.json` when `set_latest=True` (V051-10).
+    """
+    out_p = Path(out_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+    onnx_fp = Path(onnx_path)
+    norm_fp = out_p / f"{name}_normalizer.json"
+    metrics_fp = out_p / f"{name}_metrics.json"
+    latest_metrics_fp = out_p / "metrics.json"
+
+    eff_commit = git_commit if git_commit is not None else _get_git_commit()
+    model_sha256 = sha256_file(onnx_fp)
+
+    norm_payload = {
+        "feature_set": feature_set,
+        "feature_dim": int(feat_dim),
+        "sequence_length": int(seq_len),
+        "classes": [p.value for p in ALL_POSE_NAMES],
+        "mean": np.asarray(mean, dtype=np.float32).tolist(),
+        "scale": np.asarray(scale, dtype=np.float32).tolist(),
+        "temperature": float(temperature),
+        "val_accuracy": best_metrics.get("val_accuracy", 0.0),
+        "macro_f1": best_metrics.get("macro_f1", 0.0),
+        "idle_fp_rate": best_metrics.get("idle_fp_rate", 0.0),
+        "model_sha256": model_sha256,
+        "git_commit": eff_commit,
+        "seed": int(seed),
+        "torch_version": str(torch_version),
+    }
+    norm_fp.write_text(json.dumps(norm_payload, indent=2), encoding="utf-8")
+    normalizer_sha256 = sha256_file(norm_fp)
+    model_hash = compute_onnx_model_hash(onnx_fp, norm_fp)
+
+    metrics_payload = {
+        "model_name": name,
+        "model_sha256": model_sha256,
+        "normalizer_sha256": normalizer_sha256,
+        "model_hash": model_hash,
+        "git_commit": eff_commit,
+        "seed": int(seed),
+        "torch_version": str(torch_version),
+        "data_files_sha256_list": list(data_files_sha256_list),
+        "feature_set": feature_set,
+        "feature_dim": int(feat_dim),
+        "seq_len": int(seq_len),
+        "hidden": int(hidden),
+        "loss": loss,
+        "augmented": bool(augmented),
+        "temperature": float(temperature),
+        "train_sequences": int(train_sequences),
+        "val_sequences": int(val_sequences),
+        "idle_scenario_balance": balance_stats,
+        "dev_test_metrics": dev_test_metrics,
+        "subject_heldout_metrics": subject_ho_metrics,
+        "onnx_parity_samples": int(onnx_parity_samples),
+        "onnx_max_diff": round(float(onnx_max_diff), 8),
+        "classes": [p.value for p in ALL_POSE_NAMES],
+        **best_metrics,
+    }
+    metrics_json = json.dumps(metrics_payload, indent=2)
+    metrics_fp.write_text(metrics_json, encoding="utf-8")
+    if set_latest:
+        latest_metrics_fp.write_text(metrics_json, encoding="utf-8")
+    return norm_fp, metrics_fp, metrics_payload
+
+
 def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         import onnxruntime as ort
@@ -1080,6 +1341,7 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
 
     skip_stats: Dict[str, int] = {}
     bundles: List[SessionBundle] = []
+    input_files: List[Path] = list(files)
     for fp in files:
         b = load_session_bundle(fp, seq_len=args.seq_len, max_gap_ms=args.max_gap_ms, skip_stats=skip_stats)
         if b.windows:
@@ -1094,12 +1356,19 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
         neg_files, excl_n = collect_training_files(raw_negs, data_root=data_root)
         if excl_n:
             print(f"[WARN] Excluded {len(excl_n)} negative file(s) whose SHA-256 matches sealed_manifest.json.")
+        input_files.extend(neg_files)
         for fp in neg_files:
             b = load_session_bundle(
                 fp, seq_len=args.seq_len, force_idle=True, max_gap_ms=args.max_gap_ms, skip_stats=skip_stats
             )
             if b.windows:
                 bundles.append(b)
+
+    data_files_sha256_list = [
+        {"file": fp.name, "sha256": sha256_file(fp)}
+        for fp in sorted(set(input_files))
+        if fp.is_file()
+    ]
 
     if skip_stats:
         print(f"[DATA] Skipped samples by reason: {skip_stats}")
@@ -1132,10 +1401,21 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     if not dev_bundles:
         raise SystemExit("No development bundles remain after subject-held-out filtering.")
 
-    train_bundles, val_bundles, _ = split_session_groups(dev_bundles, val_ratio=args.val_ratio)
+    # Carve out a disjoint dev_test group split when >= 4 distinct groups exist (V051-10)
+    dev_train_val_bundles, dev_test_bundles = split_dev_test_groups(dev_bundles)
+    train_bundles, val_bundles, _ = split_session_groups(dev_train_val_bundles, val_ratio=args.val_ratio)
     try:
         missing_val = validate_validation_classes(
             val_bundles, allow_missing=bool(args.allow_missing_val_classes)
+        )
+        validate_train_classes(
+            train_bundles,
+            min_windows=int(getattr(args, "min_train_windows", 300)),
+            allow_low_count=bool(
+                getattr(args, "allow_low_train_counts", False)
+                or getattr(args, "allow_missing_val_classes", False)
+            ),
+            allow_missing=bool(getattr(args, "allow_missing_val_classes", False)),
         )
     except ValueError as exc:
         raise SystemExit(f"Aborting: {exc}") from None
@@ -1261,9 +1541,6 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     onnx_fp = out_dir / f"{args.name}.onnx"
-    norm_fp = out_dir / f"{args.name}_normalizer.json"
-    metrics_fp = out_dir / f"{args.name}_metrics.json"
-    latest_metrics_fp = out_dir / "metrics.json"
 
     dummy = torch.zeros(1, args.seq_len, feat_dim, dtype=torch.float32)
     torch.onnx.export(
@@ -1275,28 +1552,42 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
         opset_version=17,
     )
 
-    norm_payload = {
-        "feature_set": args.feature_set,
-        "feature_dim": feat_dim,
-        "sequence_length": args.seq_len,
-        "classes": [p.value for p in ALL_POSE_NAMES],
-        "mean": mean.tolist(),
-        "scale": scale.tolist(),
-        "temperature": temperature,
-        "val_accuracy": best_metrics.get("val_accuracy", 0.0),
-        "macro_f1": best_metrics.get("macro_f1", 0.0),
-        "idle_fp_rate": best_metrics.get("idle_fp_rate", 0.0),
-    }
-    norm_fp.write_text(json.dumps(norm_payload, indent=2), encoding="utf-8")
-
-    # Verify ONNX Runtime parity (intra_op_num_threads=1)
+    # Verify ONNX Runtime parity across up to 256 validation samples (V051-10)
     opts = ort.SessionOptions()
     opts.intra_op_num_threads = 1
     sess = ort.InferenceSession(str(onnx_fp), sess_options=opts, providers=["CPUExecutionProvider"])
-    sample_x = X_val_n[:1] if len(X_val_n) else np.zeros((1, args.seq_len, feat_dim), dtype=np.float32)
-    pt_out = model(torch.from_numpy(sample_x)).detach().numpy()
-    ort_out = sess.run(None, {"input": sample_x})[0]
-    max_diff = float(np.max(np.abs(pt_out - ort_out)))
+    n_parity = min(256, len(X_val_n))
+    max_diff = 0.0
+    if n_parity > 0:
+        for i in range(n_parity):
+            sample_x = X_val_n[i : i + 1]
+            pt_out = model(torch.from_numpy(sample_x)).detach().numpy()
+            ort_out = sess.run(None, {"input": sample_x})[0]
+            diff = float(np.max(np.abs(pt_out - ort_out)))
+            if diff > max_diff:
+                max_diff = diff
+    else:
+        sample_x = np.zeros((1, args.seq_len, feat_dim), dtype=np.float32)
+        pt_out = model(torch.from_numpy(sample_x)).detach().numpy()
+        ort_out = sess.run(None, {"input": sample_x})[0]
+        max_diff = float(np.max(np.abs(pt_out - ort_out)))
+    if max_diff >= 1e-4:
+        raise RuntimeError(f"ONNX export parity check failed: max_diff={max_diff:.6e} >= 1e-4 over {n_parity} samples")
+
+    dev_test_metrics: Optional[Dict[str, Any]] = None
+    if dev_test_bundles:
+        dt_windows = [w for b in dev_test_bundles for w in b.windows]
+        X_dt, y_dt = _featurize_windows(
+            dt_windows, feature_set=args.feature_set, seq_len=args.seq_len, skip_stats=skip_stats
+        )
+        if len(X_dt) > 0:
+            X_dt_n = (X_dt - mean) / scale
+            with torch.no_grad():
+                dt_logits = model(torch.from_numpy(X_dt_n)).detach().numpy()
+                dt_preds = np.argmax(dt_logits, axis=1)
+            dev_test_metrics = compute_classification_metrics(y_dt, dt_preds)
+            dev_test_metrics["groups"] = sorted({b.group_key for b in dev_test_bundles})
+            dev_test_metrics["sequences"] = int(len(X_dt))
 
     subject_ho_metrics: Optional[Dict[str, Any]] = None
     if subject_ho_bundles:
@@ -1313,26 +1604,32 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             subject_ho_metrics["subjects"] = sorted({b.subject for b in subject_ho_bundles})
             subject_ho_metrics["sequences"] = int(len(X_ho))
 
-    metrics_payload = {
-        "model_name": args.name,
-        "feature_set": args.feature_set,
-        "feature_dim": feat_dim,
-        "seq_len": args.seq_len,
-        "hidden": args.hidden,
-        "loss": args.loss,
-        "augmented": bool(args.augment),
-        "temperature": temperature,
-        "train_sequences": int(len(X_train)),
-        "val_sequences": int(len(X_val)),
-        "idle_scenario_balance": balance_stats,
-        "subject_heldout_metrics": subject_ho_metrics,
-        "onnx_max_diff": round(max_diff, 8),
-        "classes": [p.value for p in ALL_POSE_NAMES],
-        **best_metrics,
-    }
-    metrics_json = json.dumps(metrics_payload, indent=2)
-    metrics_fp.write_text(metrics_json, encoding="utf-8")
-    latest_metrics_fp.write_text(metrics_json, encoding="utf-8")
+    norm_fp, metrics_fp, metrics_payload = write_training_artifacts(
+        out_dir=out_dir,
+        name=args.name,
+        onnx_path=onnx_fp,
+        feature_set=args.feature_set,
+        feat_dim=feat_dim,
+        seq_len=args.seq_len,
+        hidden=args.hidden,
+        loss=args.loss,
+        augmented=bool(args.augment),
+        mean=mean,
+        scale=scale,
+        temperature=temperature,
+        train_sequences=len(X_train),
+        val_sequences=len(X_val),
+        best_metrics=best_metrics,
+        balance_stats=balance_stats,
+        dev_test_metrics=dev_test_metrics,
+        subject_ho_metrics=subject_ho_metrics,
+        onnx_parity_samples=n_parity,
+        onnx_max_diff=max_diff,
+        seed=int(args.seed),
+        data_files_sha256_list=data_files_sha256_list,
+        torch_version=str(getattr(torch, "__version__", "unknown")),
+        set_latest=bool(getattr(args, "set_latest", False)),
+    )
 
     print(
         f"[EXPORT] Saved {onnx_fp}, {norm_fp}, {metrics_fp} | "
@@ -1381,6 +1678,7 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
             run_args.feature_set = fs
             run_args.seed = sd
             run_args.name = f"{args.name}_{fs}_s{sd}"
+            run_args.set_latest = False
             m = train_and_export(run_args)
             m["seed"] = sd
             if replay_mod is not None and eval_neg_paths:
@@ -1467,6 +1765,9 @@ def main() -> None:
     )
     p.add_argument("--val-ratio", type=float, default=0.2)
     p.add_argument("--allow-missing-val-classes", action="store_true", help="Allow smoke training even if val lacks some classes")
+    p.add_argument("--min-train-windows", type=int, default=300, help="Minimum required training windows per canonical class (default 300)")
+    p.add_argument("--allow-low-train-counts", action="store_true", help="Allow smoke training with fewer than --min-train-windows per class")
+    p.add_argument("--set-latest", action="store_true", help="Also overwrite models/metrics.json with this run's metrics")
     p.add_argument("--seq-len", type=int, default=5)
     p.add_argument("--hidden", type=int, default=96)
     p.add_argument("--epochs", type=int, default=35)

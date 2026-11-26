@@ -376,12 +376,13 @@ class WebBridgeHandler(AppKit.NSObject):
         return self
 
     def userContentController_didReceiveScriptMessage_(self, _controller, message) -> None:
-        try:
-            body = _to_py(message.body())
-            if isinstance(body, dict):
-                self._callback(body)
-        except Exception as exc:
-            logger.debug(f"[BRIDGE] Failed handling JS message: {exc}")
+        with objc.autorelease_pool():
+            try:
+                body = _to_py(message.body())
+                if isinstance(body, dict):
+                    self._callback(body)
+            except Exception as exc:
+                logger.debug(f"[BRIDGE] Failed handling JS message: {exc}")
 
 
 class OverlayNavigationDelegate(AppKit.NSObject):
@@ -796,31 +797,32 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 break
 
     def onScreenParametersChanged_(self, _notification) -> None:
-        screens = list(AppKit.NSScreen.screens() or [])
-        cur_sig = screen_frames_signature(
-            [
-                (
-                    float(sc.frame().origin.x),
-                    float(sc.frame().origin.y),
-                    float(sc.frame().size.width),
-                    float(sc.frame().size.height),
-                )
-                for sc in screens
-            ]
-        )
-        if cur_sig and cur_sig == self._overlay_screen_signature:
-            # Dock/menu bar/Space change without display topology change — keep existing WebViews alive!
+        with objc.autorelease_pool():
+            screens = list(AppKit.NSScreen.screens() or [])
+            cur_sig = screen_frames_signature(
+                [
+                    (
+                        float(sc.frame().origin.x),
+                        float(sc.frame().origin.y),
+                        float(sc.frame().size.width),
+                        float(sc.frame().size.height),
+                    )
+                    for sc in screens
+                ]
+            )
+            if cur_sig and cur_sig == self._overlay_screen_signature:
+                # Dock/menu bar/Space change without display topology change — keep existing WebViews alive!
+                self._apply_camera_hud_layout()
+                if self.runtime is not None:
+                    self.runtime._refresh_display_bounds()
+                return
+            logger.info("[UI] Display geometry changed; rebuilding per-display click-through overlays.")
+            self._build_screen_overlay()
+            for entry in self._overlay_entries:
+                entry["panel"].orderFront_(None)
             self._apply_camera_hud_layout()
             if self.runtime is not None:
                 self.runtime._refresh_display_bounds()
-            return
-        logger.info("[UI] Display geometry changed; rebuilding per-display click-through overlays.")
-        self._build_screen_overlay()
-        for entry in self._overlay_entries:
-            entry["panel"].orderFront_(None)
-        self._apply_camera_hud_layout()
-        if self.runtime is not None:
-            self.runtime._refresh_display_bounds()
 
     @staticmethod
     def _rect_contains(rect: tuple[float, float, float, float], x: float, y: float) -> bool:

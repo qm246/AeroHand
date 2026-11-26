@@ -156,7 +156,12 @@ def collect_json_paths(
     allow_sealed_aerohand: bool = False,
     skip_manifests: bool = True,
 ) -> List[Path]:
-    """Resolve JSON files from files/directories while strictly enforcing `assert_not_heldout`."""
+    """
+    Resolve JSON files from files/directories while enforcing held-out hygiene (V051-12):
+      - Passing an explicit held-out file or directory directly raises `ValueError`.
+      - Scanning a parent directory (`p.is_dir()`) skips any nested `heldout` subdirectory/file
+        with a warning instead of aborting the scan of legitimate sibling directories.
+    """
     out: List[Path] = []
     for item in inputs:
         p = Path(item)
@@ -171,7 +176,11 @@ def collect_json_paths(
                     continue
                 if "_drafts" in fp.parts:
                     continue
-                assert_not_heldout(fp, allow_sealed_aerohand=allow_sealed_aerohand)
+                try:
+                    assert_not_heldout(fp, allow_sealed_aerohand=allow_sealed_aerohand)
+                except ValueError:
+                    logger.warning(f"[HELD-OUT GUARD] Skipping held-out path during directory scan: {fp}")
+                    continue
                 out.append(fp)
     return sorted(set(out))
 

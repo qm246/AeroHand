@@ -149,6 +149,19 @@ def poisson_upper_bound_rate(count: int, exposure_hours: float, ci_level: float 
     return round(poisson_upper_bound_count(count, ci_level=ci_level) / float(exposure_hours), 3)
 
 
+def required_exposure_hours(k_allowed: int, max_ucb: float = 2.0, ci_level: float = 0.95) -> float:
+    """
+    Minimum hand-present idle exposure (hours) required to certify 95% Garwood Poisson UCB <= `max_ucb`
+    given `k_allowed` observed false triggers (V051-11):
+      - k=0 -> 1.4979h (~1.50h)
+      - k=1 -> 2.3719h (~2.37h)
+      - k=2 -> 3.1479h (~3.15h)
+    """
+    if max_ucb <= 0.0:
+        raise ValueError("max_ucb must be strictly positive")
+    return round(poisson_upper_bound_count(int(k_allowed), ci_level=ci_level) / float(max_ucb), 4)
+
+
 def evaluate_recordings(
     *,
     session_paths: Sequence[Path] = (),

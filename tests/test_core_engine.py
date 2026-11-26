@@ -3806,12 +3806,15 @@ def test_promotion_check_script_rejects_insufficient_exposure():
         p.value: {"precision": 0.99, "recall": 0.985, "f1": 0.987, "support": 500}
         for p in ALL_POSE_NAMES
     }
-    good_metrics = {"subject_heldout_metrics": {"per_class": all_high_per_class}}
+    good_metrics = {
+        "model_hash": "a" * 24,
+        "subject_heldout_metrics": {"per_class": all_high_per_class},
+    }
     cfg = load_config()
 
     # Case 1: Insufficient sealed exposure (0.41h < 1.5h) -> MUST fail!
     short_sealed = {
-        "heldout_audit": {"touched": 1, "model_hash": "abc"},
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
         "false_triggers": {
             "hand_present_idle_hours": 0.41,
             "total_upper_bound_per_hour": 7.31,
@@ -3829,9 +3832,9 @@ def test_promotion_check_script_rejects_insufficient_exposure():
     assert res_fail["criteria"]["cpu_latency_p95_ms"]["passed"] is True
     assert res_fail["criteria"]["runtime_guard_active"]["passed"] is True
 
-    # Case 2: All 4 criteria satisfied -> MUST pass!
+    # Case 2: All criteria satisfied -> MUST pass!
     good_sealed = {
-        "heldout_audit": {"touched": 1, "model_hash": "abc"},
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24},
         "false_triggers": {
             "hand_present_idle_hours": 1.60,
             "total_upper_bound_per_hour": 1.87,
@@ -3850,7 +3853,7 @@ def test_promotion_check_script_rejects_insufficient_exposure():
     weak_cls = dict(all_high_per_class)
     weak_cls["thumb_pinky_base"] = {"precision": 0.96, "recall": 0.94, "f1": 0.95, "support": 200}
     res_weak = promo_mod.check_onnx_promotion(
-        metrics_report={"subject_heldout_metrics": {"per_class": weak_cls}},
+        metrics_report={"model_hash": "a" * 24, "subject_heldout_metrics": {"per_class": weak_cls}},
         sealed_eval_report=good_sealed,
         latency_p95_ms=1.4,
         config=cfg,
@@ -4836,3 +4839,445 @@ def test_ft_jsonl_contains_gate_debug(tmp_path: Path):
     assert isinstance(gd, dict)
     for k in ("latched", "blocked_by", "blocked_reasons", "eff_speed_pw", "eff_ang_deg_s", "palm_width_2d", "open_dist"):
         assert k in gd
+
+
+# ==============================================================================
+# V051-10: Hardened train_tcn Split, Augmentation & Provenance
+# ==============================================================================
+
+
+def _mk_tcn_bundle(mod, name: str, group_key: str, class_ids: List[int]):
+    h = _make_open_hand()
+    wins = [[mod.ParsedSample(cid, h, h, "Right", "Right", float(i * 33)) for i in range(5)] for cid in class_ids]
+    return mod.SessionBundle(name=name, group_key=group_key, windows=wins, labels=np.array(class_ids, dtype=np.int64))
+
+
+def test_split_never_leaves_class_without_train_windows():
+    mod = _load_train_tcn_module("train_tcn_v051_10_split")
+    # Class 5 appears ONLY in group g2; class 6 appears ONLY in g3 -> greedy val MUST NOT steal g2 or g3!
+    b1 = _mk_tcn_bundle(mod, "s1.json", "minh::g1", [0, 1, 2, 3, 4])
+    b2 = _mk_tcn_bundle(mod, "s2.json", "minh::g2", [0, 1, 2, 3, 4, 5])
+    b3 = _mk_tcn_bundle(mod, "s3.json", "minh::g3", [0, 1, 2, 3, 4, 6])
+    b4 = _mk_tcn_bundle(mod, "s4.json", "minh::g4", [0, 1, 2, 3, 4])
+
+    tr, va, _missing = mod.split_session_groups([b1, b2, b3, b4], val_ratio=0.25)
+    tr_classes = {int(c) for b in tr for c in b.labels.tolist()}
+    # Every class present anywhere in input MUST still be represented in train!
+    assert {0, 1, 2, 3, 4, 5, 6}.issubset(tr_classes)
+    assert set(b.group_key for b in tr).isdisjoint(set(b.group_key for b in va))
+
+
+def test_single_group_fallback_is_class_stratified():
+    mod = _load_train_tcn_module("train_tcn_v051_10_single")
+    # Single group recorded sequentially class-by-class: 0,0..0, 1,1..1, ..., 6,6..6
+    seq_labels: List[int] = []
+    for cid in range(7):
+        seq_labels.extend([cid] * 25)
+    b = _mk_tcn_bundle(mod, "single.json", "minh::only_group", seq_labels)
+
+    tr, va, missing = mod.split_session_groups([b], val_ratio=0.2)
+    assert missing == []
+    tr_classes = {int(c) for c in tr[0].labels.tolist()}
+    va_classes = {int(c) for c in va[0].labels.tolist()}
+    assert tr_classes == set(range(7))
+    assert va_classes == set(range(7))
+    # Verify 5-window temporal gap dropped per class: 25 * 7 = 175 total -> 7 * 5 = 35 gap windows dropped
+    assert len(tr[0].labels) + len(va[0].labels) <= 175 - 7 * 5
+
+
+def test_validate_train_classes_min_windows():
+    mod = _load_train_tcn_module("train_tcn_v051_10_minwin")
+    # Missing class 6 -> raises even when allow_low_count=True
+    b_miss = _mk_tcn_bundle(mod, "miss.json", "minh::g1", [0, 1, 2, 3, 4, 5] * 60)
+    with pytest.raises(ValueError, match="0 windows"):
+        mod.validate_train_classes([b_miss], min_windows=10, allow_low_count=True)
+
+    # All 7 classes present, but class 6 has only 50 < 300 -> raises when allow_low_count=False
+    labels = [c for c in range(6) for _ in range(320)] + [6] * 50
+    b_low = _mk_tcn_bundle(mod, "low.json", "minh::g2", labels)
+    with pytest.raises(ValueError, match="< 300"):
+        mod.validate_train_classes([b_low], min_windows=300, allow_low_count=False)
+
+    # All 7 classes >= 300 -> passes cleanly
+    labels_ok = [c for c in range(7) for _ in range(305)]
+    b_ok = _mk_tcn_bundle(mod, "ok.json", "minh::g3", labels_ok)
+    counts = mod.validate_train_classes([b_ok], min_windows=300, allow_low_count=False)
+    assert all(v == 305 for v in counts.values())
+
+
+def test_dev_test_split_disjoint_from_train_val_by_group():
+    mod = _load_train_tcn_module("train_tcn_v051_10_devtest")
+    all_7 = list(range(7))
+    bundles = [_mk_tcn_bundle(mod, f"s{i}.json", f"minh::cond_{i}", all_7) for i in range(5)]
+
+    tv, dev_test = mod.split_dev_test_groups(bundles, test_ratio=0.2)
+    assert len(dev_test) >= 1
+    tr, va, missing = mod.split_session_groups(tv, val_ratio=0.25)
+    assert missing == []
+
+    g_tr = {b.group_key for b in tr}
+    g_va = {b.group_key for b in va}
+    g_dt = {b.group_key for b in dev_test}
+    assert g_tr.isdisjoint(g_va)
+    assert g_tr.isdisjoint(g_dt)
+    assert g_va.isdisjoint(g_dt)
+
+
+def test_augment_noise_scales_with_palm_width():
+    mod = _load_train_tcn_module("train_tcn_v051_10_augscale")
+    # Compare frame-to-frame jitter std on small hand (scale=0.35) vs large hand (scale=2.0)
+    # Using a static window so frame-to-frame diff isolates ONLY per-frame noise!
+    small_h = _make_scaled_shifted_hand(0.35)
+    large_h = _make_scaled_shifted_hand(2.00)
+    win_small = [mod.ParsedSample(1, small_h, small_h, "Right", "Right", float(i * 33)) for i in range(5)]
+    win_large = [mod.ParsedSample(1, large_h, large_h, "Right", "Right", float(i * 33)) for i in range(5)]
+
+    def _mean_frame_jitter(win):
+        rng = np.random.default_rng(77)
+        diffs = []
+        for _ in range(40):
+            aug = mod.augment_window(win, rng)
+            arr = np.array([[[p.x, p.y, p.z] for p in s.lms2d] for s in aug], dtype=np.float64)
+            # Adjacent frame diffs cancel shared window noise (except duplicated jitter frames which are 0)
+            step = np.abs(np.diff(arr, axis=0))
+            nz = step[step > 1e-12]
+            if len(nz):
+                diffs.append(float(np.mean(nz)))
+        return float(np.mean(diffs))
+
+    j_small = _mean_frame_jitter(win_small)
+    j_large = _mean_frame_jitter(win_large)
+    ratio = j_large / max(1e-9, j_small)
+    # Expected ratio ~ 2.0 / 0.35 = 5.71 (with fixed sigma=0.003, ratio would be ~1.0!)
+    assert ratio > 3.5, f"Augmentation noise did not scale with palm_width: ratio={ratio:.2f}"
+
+
+def test_metrics_not_overwritten_without_set_latest(tmp_path: Path):
+    import json
+
+    mod = _load_train_tcn_module("train_tcn_v051_10_latest")
+    onnx_fp = tmp_path / "run_a.onnx"
+    onnx_fp.write_bytes(b"fake-onnx-run-a")
+    sentinel = tmp_path / "metrics.json"
+    sentinel.write_text(json.dumps({"sentinel": "preserve_me"}), encoding="utf-8")
+
+    # Default set_latest=False MUST NOT overwrite metrics.json
+    mod.write_training_artifacts(
+        out_dir=tmp_path,
+        name="run_a",
+        onnx_path=onnx_fp,
+        feature_set="invariant348",
+        feat_dim=FEATURE_DIM_3D,
+        seq_len=5,
+        hidden=96,
+        loss="focal",
+        augmented=True,
+        mean=np.zeros(FEATURE_DIM_3D, dtype=np.float32),
+        scale=np.ones(FEATURE_DIM_3D, dtype=np.float32),
+        temperature=1.0,
+        train_sequences=100,
+        val_sequences=20,
+        best_metrics={"val_accuracy": 0.95, "macro_f1": 0.94, "idle_fp_rate": 0.01},
+        balance_stats={},
+        dev_test_metrics=None,
+        subject_ho_metrics=None,
+        onnx_parity_samples=20,
+        onnx_max_diff=1e-6,
+        seed=42,
+        data_files_sha256_list=[],
+        set_latest=False,
+    )
+    assert (tmp_path / "run_a_metrics.json").is_file()
+    assert json.loads(sentinel.read_text(encoding="utf-8")) == {"sentinel": "preserve_me"}
+
+    # With set_latest=True, metrics.json IS updated
+    mod.write_training_artifacts(
+        out_dir=tmp_path,
+        name="run_a",
+        onnx_path=onnx_fp,
+        feature_set="invariant348",
+        feat_dim=FEATURE_DIM_3D,
+        seq_len=5,
+        hidden=96,
+        loss="focal",
+        augmented=True,
+        mean=np.zeros(FEATURE_DIM_3D, dtype=np.float32),
+        scale=np.ones(FEATURE_DIM_3D, dtype=np.float32),
+        temperature=1.0,
+        train_sequences=100,
+        val_sequences=20,
+        best_metrics={"val_accuracy": 0.95, "macro_f1": 0.94, "idle_fp_rate": 0.01},
+        balance_stats={},
+        dev_test_metrics=None,
+        subject_ho_metrics=None,
+        onnx_parity_samples=20,
+        onnx_max_diff=1e-6,
+        seed=42,
+        data_files_sha256_list=[],
+        set_latest=True,
+    )
+    assert json.loads(sentinel.read_text(encoding="utf-8"))["model_name"] == "run_a"
+
+
+def test_export_records_model_sha256(tmp_path: Path):
+    import json
+
+    from aerohand.ml.recording_io import sha256_file
+
+    mod = _load_train_tcn_module("train_tcn_v051_10_prov")
+    replay_mod = _load_replay_eval_module("replay_eval_v051_10_prov")
+
+    onnx_fp = tmp_path / "prov_model.onnx"
+    onnx_fp.write_bytes(b"onnx-payload-bytes-v051")
+    norm_fp, metrics_fp, payload = mod.write_training_artifacts(
+        out_dir=tmp_path,
+        name="prov_model",
+        onnx_path=onnx_fp,
+        feature_set="invariant348",
+        feat_dim=FEATURE_DIM_3D,
+        seq_len=5,
+        hidden=96,
+        loss="focal",
+        augmented=True,
+        mean=np.zeros(FEATURE_DIM_3D, dtype=np.float32),
+        scale=np.ones(FEATURE_DIM_3D, dtype=np.float32),
+        temperature=1.1,
+        train_sequences=200,
+        val_sequences=50,
+        best_metrics={"val_accuracy": 0.98, "macro_f1": 0.97, "idle_fp_rate": 0.005},
+        balance_stats={},
+        dev_test_metrics=None,
+        subject_ho_metrics=None,
+        onnx_parity_samples=50,
+        onnx_max_diff=2e-6,
+        seed=1337,
+        data_files_sha256_list=[{"file": "s1.json", "sha256": "0" * 64}],
+        torch_version="2.5.0-test",
+    )
+    expected_sha = sha256_file(onnx_fp)
+    expected_hash = replay_mod.compute_eval_model_hash(
+        "onnx_tcn", load_config(), model_path=onnx_fp, normalizer_path=norm_fp
+    )
+    norm_data = json.loads(norm_fp.read_text(encoding="utf-8"))
+    met_data = json.loads(metrics_fp.read_text(encoding="utf-8"))
+
+    assert norm_data["model_sha256"] == expected_sha
+    assert norm_data["seed"] == 1337
+    assert met_data["model_sha256"] == expected_sha
+    assert met_data["normalizer_sha256"] == sha256_file(norm_fp)
+    assert met_data["model_hash"] == expected_hash == payload["model_hash"]
+    assert met_data["data_files_sha256_list"] == [{"file": "s1.json", "sha256": "0" * 64}]
+    assert met_data["torch_version"] == "2.5.0-test"
+
+
+# ==============================================================================
+# V051-11: Provenance-Bound Promotion Checker & veto vs onnx Stages
+# ==============================================================================
+
+
+def test_promotion_rejects_metrics_from_different_model_hash(tmp_path: Path):
+    from aerohand.core.types import ALL_POSE_NAMES
+
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_v051_prov")
+    all_high = {p.value: {"precision": 0.99, "recall": 0.99, "f1": 0.99, "support": 500} for p in ALL_POSE_NAMES}
+    cfg = load_config()
+
+    metrics_a = {
+        "model_hash": "a" * 24,
+        "model_sha256": "1" * 64,
+        "subject_heldout_metrics": {"per_class": all_high},
+    }
+    sealed_b = {
+        "model_hash": "b" * 24,
+        "model_sha256": "2" * 64,
+        "heldout_audit": {"touched": 1, "model_hash": "b" * 24, "model_sha256": "2" * 64},
+        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+    }
+    res_mismatch = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_a,
+        sealed_eval_report=sealed_b,
+        latency_p95_ms=1.2,
+        config=cfg,
+    )
+    assert res_mismatch["passed"] is False
+    assert res_mismatch["criteria"]["provenance_hash_match"]["passed"] is False
+
+    # Missing provenance hash altogether must also fail!
+    res_missing = promo_mod.check_onnx_promotion(
+        metrics_report={"subject_heldout_metrics": {"per_class": all_high}},
+        sealed_eval_report=sealed_b,
+        latency_p95_ms=1.2,
+        config=cfg,
+    )
+    assert res_missing["passed"] is False
+    assert res_missing["criteria"]["provenance_hash_match"]["passed"] is False
+
+    # Mismatch against actual --model file bytes must also fail!
+    fake_model = tmp_path / "wrong.onnx"
+    fake_model.write_bytes(b"different-model-bytes")
+    sealed_a = {
+        "model_hash": "a" * 24,
+        "model_sha256": "1" * 64,
+        "heldout_audit": {"touched": 1, "model_hash": "a" * 24, "model_sha256": "1" * 64},
+        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+    }
+    res_file_mismatch = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_a,
+        sealed_eval_report=sealed_a,
+        latency_p95_ms=1.2,
+        config=cfg,
+        model_path=fake_model,
+    )
+    assert res_file_mismatch["passed"] is False
+    assert res_file_mismatch["criteria"]["provenance_hash_match"]["passed"] is False
+
+
+def test_promotion_stage_veto_does_not_require_subject_heldout():
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_v051_veto")
+    cfg = load_config()
+    metrics_no_ho = {"model_hash": "c" * 24, "subject_heldout_metrics": None}
+    sealed_ok = {
+        "model_hash": "c" * 24,
+        "heldout_audit": {"touched": 1, "model_hash": "c" * 24},
+        "false_triggers": {"hand_present_idle_hours": 1.60, "total_upper_bound_per_hour": 1.87},
+    }
+
+    res_veto = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_no_ho,
+        sealed_eval_report=sealed_ok,
+        latency_p95_ms=1.3,
+        config=cfg,
+        stage="veto",
+    )
+    assert res_veto["passed"] is True
+    assert res_veto["stage"] == "veto"
+    assert res_veto["criteria"]["subject_heldout_recall"]["skipped"] is True
+
+    res_onnx = promo_mod.check_onnx_promotion(
+        metrics_report=metrics_no_ho,
+        sealed_eval_report=sealed_ok,
+        latency_p95_ms=1.3,
+        config=cfg,
+        stage="onnx",
+    )
+    assert res_onnx["passed"] is False
+    assert res_onnx["criteria"]["subject_heldout_recall"]["passed"] is False
+
+
+def test_required_exposure_hours_matches_garwood_table():
+    replay_mod = _load_replay_eval_module("replay_eval_v051_11_garwood")
+    assert abs(replay_mod.required_exposure_hours(0, max_ucb=2.0) - 1.4979) < 0.01
+    assert abs(replay_mod.required_exposure_hours(1, max_ucb=2.0) - 2.3719) < 0.01
+    assert abs(replay_mod.required_exposure_hours(2, max_ucb=2.0) - 3.1479) < 0.01
+
+
+def test_promotion_zero_ft_at_1p5h_borderline_passes():
+    from aerohand.core.types import ALL_POSE_NAMES
+
+    promo_mod = _load_script_module("scripts/check_onnx_promotion.py", "check_onnx_promo_v051_border")
+    replay_mod = _load_replay_eval_module("replay_eval_v051_11_border")
+    all_high = {p.value: {"precision": 0.99, "recall": 0.985, "f1": 0.987, "support": 500} for p in ALL_POSE_NAMES}
+    cfg = load_config()
+
+    ucb_0_at_1p5 = replay_mod.poisson_upper_bound_rate(0, 1.5)
+    assert ucb_0_at_1p5 <= 2.0  # 2.9957 / 1.5 = 1.997 <= 2.0
+
+    res = promo_mod.check_onnx_promotion(
+        metrics_report={"model_hash": "d" * 24, "subject_heldout_metrics": {"per_class": all_high}},
+        sealed_eval_report={
+            "model_hash": "d" * 24,
+            "heldout_audit": {"touched": 1, "model_hash": "d" * 24},
+            "false_triggers": {
+                "total": 0,
+                "hand_present_idle_hours": 1.5,
+                "total_upper_bound_per_hour": ucb_0_at_1p5,
+            },
+        },
+        latency_p95_ms=1.5,
+        config=cfg,
+        stage="onnx",
+    )
+    assert res["passed"] is True
+    assert "requires 0 FT" in res["exposure_note"]
+    assert "k=0" in res["garwood_exposure_table"]
+
+
+# ==============================================================================
+# V051-12: Hygiene (recording_io parent scan + control_api body limit)
+# ==============================================================================
+
+
+def test_collect_json_paths_skips_heldout_dir_when_scanning_parent(tmp_path: Path, caplog):
+    from aerohand.ml.recording_io import collect_json_paths
+
+    good_dir = tmp_path / "sessions"
+    ho_dir = tmp_path / "heldout_aerohand"
+    good_dir.mkdir()
+    ho_dir.mkdir()
+    good_fp = good_dir / "rec1.json"
+    ho_fp = ho_dir / "secret_heldout.json"
+    good_fp.write_text("{}", encoding="utf-8")
+    ho_fp.write_text("{}", encoding="utf-8")
+
+    with caplog.at_level("WARNING"):
+        found = collect_json_paths([tmp_path])
+    assert found == [good_fp]
+    assert any("Skipping held-out path" in rec.message for rec in caplog.records)
+
+
+def test_collect_json_paths_explicit_heldout_file_still_raises(tmp_path: Path):
+    from aerohand.ml.recording_io import collect_json_paths
+
+    ho_dir = tmp_path / "heldout_aerohand"
+    ho_dir.mkdir()
+    ho_fp = ho_dir / "secret.json"
+    ho_fp.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="Held-out path access is forbidden"):
+        collect_json_paths([ho_fp])
+    with pytest.raises(ValueError, match="Held-out path access is forbidden"):
+        collect_json_paths([ho_dir])
+
+
+def test_api_rejects_body_over_limit(tmp_path: Path):
+    import http.client
+    import json
+
+    from aerohand.platform.control_api import MAX_API_BODY_BYTES, LocalControlAPIServer
+
+    cfg = load_config()
+    cfg["api"]["port"] = 0
+    srv = LocalControlAPIServer(
+        host="127.0.0.1",
+        port=0,
+        get_status=lambda: {"tracking": True},
+        get_config=lambda: cfg,
+        apply_config=lambda _c: None,
+        set_tracking_enabled=lambda v: v,
+        trigger_recenter=lambda: None,
+        get_vitals=lambda: {"ok": True},
+        token_path=tmp_path / "api_token",
+    )
+    srv.start()
+    try:
+        port = srv.bound_port
+        assert port > 0
+        oversized = json.dumps({"key": "cursor.gain", "value": "x" * (MAX_API_BODY_BYTES + 2048)}).encode("utf-8")
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request(
+            "PATCH",
+            "/api/settings",
+            body=oversized,
+            headers={
+                "X-AeroHand-Token": srv.token,
+                "Authorization": f"Bearer {srv.token}",
+                "Content-Type": "application/json",
+                "Content-Length": str(len(oversized)),
+            },
+        )
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        assert resp.status == 413, f"Expected HTTP 413 Payload Too Large, got {resp.status}: {body}"
+    finally:
+        srv.stop()

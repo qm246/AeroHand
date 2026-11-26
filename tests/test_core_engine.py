@@ -6060,3 +6060,16 @@ def test_swap_classifier_async_stale_generation_discarded(monkeypatch):
     t1.join(timeout=5.0)
     assert rt.classifier is clf2
     assert rt.engine.classifier is clf2
+
+
+def test_version_string_consistent_across_pyproject_and_package():
+    import tomllib
+
+    from aerohand import __version__
+    from aerohand.config import default_config_path, repo_root
+
+    pyproj = tomllib.loads((repo_root() / "pyproject.toml").read_text(encoding="utf-8"))
+    proj_version = str(pyproj["project"]["version"]).strip()
+    assert __version__ == proj_version
+    first_cfg_line = default_config_path().read_text(encoding="utf-8").splitlines()[0]
+    assert f"v{proj_version}" in first_cfg_line

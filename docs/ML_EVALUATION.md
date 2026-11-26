@@ -1,4 +1,4 @@
-# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.1)
+# Đánh giá Mô hình ML & Giao thức Thu thập Dữ liệu AeroHand (v0.5.2)
 
 Tài liệu này quy định quy trình thu thập dữ liệu, huấn luyện Causal 1D-TCN, đánh giá A/B giữa hai tập đặc trưng (`invariant348` và `airmouse885`), kiểm thử hồi quy ngoại tuyến (`replay_eval.py`) và triển khai an toàn qua Shadow Mode.
 
@@ -190,3 +190,23 @@ Bản vá `v0.5.1` khóa toàn bộ các lỗ hổng rò rỉ dữ liệu, chu�
 - **Kiểm chứng Recall 5 lớp tổng hợp & Sửa Fist Guard (`V051-09`)**:
   - Trước sửa: 3/9 bài test tổng hợp trong `tests/test_heuristic_recall_synth.py` **thất bại** do fist guard cũ (`curled_count >= 3 and min(d_idx, d_mid) > pinch_on_dist`) chặn `thumb_pinky_pinch`, `thumb_pinky_base` và xóa nhầm `st.latched`, đồng thời khi `s_pinky == s_pbase == 1.0` hai điểm bị hòa nhau kéo về `idle`.
   - Sau sửa (bỏ qua fist guard khi đang `latched` hoặc có bất kỳ pose chuẩn nào chụm chặt, loại trừ ngón đang chụm khỏi `curled_count`, phân giải hòa `s_pinky`/`s_pbase` theo khoảng cách 3D): **9/9 bài test tổng hợp đạt**, `D-dev` giữ nguyên **4 FT (`32,3/h`, UCB `74,0/h`)**, `T-dev` giảm **19 → 17 FT (`100,6/h`, UCB `150,9/h`)**.
+
+### Bản vá hậu kiểm `v0.5.2` (`V052-01` → `V052-05`)
+
+Hoàn tất 5 hạng mục theo **Plan v5** trước khi bắt đầu thu bằng chứng `shadow` và tối ưu cổng `v0.6.0`:
+
+- **Xác nhận đa khung trong Veto & đồng bộ luật Shadow (`V052-01`)**:
+  - Bổ sung `classifier.veto_confirm_frames: 3` (mặc định `3`, thêm `(K-1)` khung ≈ `+66 ms` ở 30 fps; `1` giữ tương thích ngược). Trong `veto_scope="entry"`, sự kiện chỉ chuyển `accepted` khi có `K` khung `ready` liên tiếp được ONNX duyệt; khung từ chối đặt lại `approve_streak = 0`; khung `ready=False` abstain mà không tăng/reset chuỗi; quá `veto_entry_window_ms` chưa `accepted` giữ `idle` (đếm 1 `veto_count`) cho tới khi đủ `K` khung duyệt liên tiếp (nhận muộn) hoặc tay nhả.
+  - Chế độ `shadow` chạy song song đúng luật xác nhận `K` khung và xuất `shadow_events`, `shadow_would_veto_events`, `shadow_would_veto_frames`, `shadow_would_veto_rate` trong telemetry.
+- **Khóa Provenance xuyên suốt Runtime Vitals (`V052-02`)**:
+  - Hợp nhất công thức `compute_onnx_model_hash` và `compute_heuristic_source_sha256` tại `aerohand/ml/provenance.py`. `ONNXPinchClassifier._load()` tính `model_sha256` và `model_hash` 24-hex khớp `train_tcn.py` / `replay_eval.py`; `GuardedClassifier.telemetry()` và `aerohand vitals --json` xuất `model_hash`, `model_sha256`, `heuristic_source_sha256`.
+  - `check_onnx_promotion.py` bắt buộc **FAIL** `provenance_hash_match` nếu `--vitals` thiếu hash hoặc lệch với `metrics.json` / báo cáo held-out.
+- **Nhật ký thời điểm vào Latch (`V052-03`)**:
+  - `Heuristic3DPinchClassifier` lưu `latch_info[pose]` (`since_ms`, `dist`, `raw_sc`, `eff_speed_pw`, `eff_ang_deg_s`, `open_dist`, `idx_ext`, `half_curled_count`) đúng khung chốt latch, xóa sạch khi nhả latch, và xuất `latch_age_ms` + `latch_entry` trong `gate_debug` / `--ft-jsonl`.
+  - Xác minh trên `D-dev` (4 FT, `32,33/h`, UCB `73,99/h`) và `T-dev` (17 FT, `100,60/h`, UCB `150,89/h`): **100%** pose đang `latched` có đầy đủ `latch_entry` (0 thiếu); ví dụ trên `D-dev` cả 4 FT đều chốt từ trước `65–1034 ms` (`eff_ang_deg_s` từ `50,8` đến `91,3°/s`).
+- **Chặn nắm đấm có ngón cái chạm đầu ngón trỏ (`V052-04`)**:
+  - Bổ sung `classifier.heuristic_3d.fist_guard_requires_index_curled: true`: chặn nắm đấm kín cả 4 ngón cuộn vào lòng bàn tay (`idx_dist_to_palm < 0.72` và `all_curled_count == 4`) không cho arm dictation, trong khi giữ nguyên OK-sign `thumb_index_pinch`, không tăng FT trên `D-dev`/`T-dev` và không đổi kết quả trên bộ cadence positives cục bộ.
+- **Vệ sinh hệ thống (`V052-05`)**:
+  - `recording_io.exclude_sealed_content` tìm `sealed_manifest.json` trong `data_root`, `--sealed-root` (hỗ trợ ở `train_tcn.py`, `replay_eval.py`, `domain_check.py`) và các thư mục cha của đầu vào, đồng thời cảnh báo rõ khi tìm thấy `0` manifest.
+  - `replay_eval.compute_eval_model_hash("heuristic_3d", ...)` chỉ băm `classifier.heuristic_3d` + `smoothing` + mã nguồn `heuristic_3d.py` & `palm_frame.py` (không đổi hash khi chỉnh `veto_*`).
+  - `runtime._swap_classifier_async` dùng khóa `_classifier_swap_lock` + `engine._classifier_lock` (`RLock`) để export counter sát lúc hoán đổi và loại bỏ thế hệ nạp cũ bị trễ.

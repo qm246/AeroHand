@@ -142,6 +142,7 @@ class Heuristic3DPinchClassifier:
         self.enable_grip_guard: bool = bool(c.get("enable_grip_guard", True))
         self.grip_half_curled_min: int = max(2, int(c.get("grip_half_curled_min", 3)))
         self.grip_loose_ratio: float = max(0.7, float(c.get("grip_loose_ratio", 1.05)))
+        self.fist_guard_requires_index_curled: bool = bool(c.get("fist_guard_requires_index_curled", True))
 
         self._state_gap_reset_ms: float = float(c.get("state_gap_reset_ms", 250.0))
         self._latch_score_threshold: float = float(c.get("latch_score_threshold", 0.85))
@@ -284,19 +285,35 @@ class Heuristic3DPinchClassifier:
 
         # Fist / grip guard: count how many non-pinching fingertips are tightly or half curled toward palm center
         curled_count = 0
+        all_curled_count = 0
         half_curled_count = 0
+        idx_dist_to_palm = float(np.linalg.norm(pf.coords_normalized[INDEX_TIP]))
         for tip_idx in (INDEX_TIP, MIDDLE_TIP, RING_TIP, PINKY_TIP):
-            dist_to_palm = float(np.linalg.norm(pf.coords_normalized[tip_idx]))
-            if dist_to_palm < 0.72 and tip_idx != active_tip_idx:
-                curled_count += 1
+            dist_to_palm = idx_dist_to_palm if tip_idx == INDEX_TIP else float(np.linalg.norm(pf.coords_normalized[tip_idx]))
+            if dist_to_palm < 0.72:
+                all_curled_count += 1
+                if tip_idx != active_tip_idx:
+                    curled_count += 1
             if dist_to_palm < 1.05:
                 half_curled_count += 1
 
         idx_ext = compute_finger_extension_ratios(pf).get("index", 2.0)
 
         # If >= 3 non-pinching fingers are curled tightly into a fist/grip (holding phone/cup),
-        # suppress loose pinch — never cancelling an already-latched hold or any tight canonical pinch.
-        if curled_count >= 3 and (not st.latched) and (not any_tight_pinch):
+        # suppress loose pinch — never cancelling an already-latched hold. When all 4 non-thumb
+        # fingertips (including index: `idx_dist_to_palm < 0.72`) are tightly curled into a full
+        # fist (V052-04), block even tight thumb-on-index contact (and drop any transient latch
+        # acquired mid-closing) while keeping real OK-sign `thumb_index_pinch` unaffected.
+        is_full_curled_fist = (
+            self.fist_guard_requires_index_curled
+            and curled_count >= 3
+            and idx_dist_to_palm < 0.72
+            and all_curled_count >= 4
+        )
+        if is_full_curled_fist or (curled_count >= 3 and (not st.latched) and (not any_tight_pinch)):
+            if is_full_curled_fist and st.latched:
+                st.latched.clear()
+                st.latch_info.clear()
             self.last_debug[handedness] = {
                 "valid_palm_frame": True,
                 "latched": [],

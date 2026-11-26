@@ -235,3 +235,104 @@ def make_synth_pinch_sequence(
     for _ in range(hold_frames):
         _emit(1.0, curl_amount)
     return out
+
+
+def make_fist_thumb_on_index_sequence(
+    *,
+    open_frames: int = 5,
+    close_frames: int = 6,
+    hold_frames: int = 16,
+    fps: float = 30.0,
+    curl_amount: float = 0.88,
+    scale: float = 1.0,
+) -> List[Tuple[float, List[Landmark]]]:
+    """
+    Generate a trajectory closing from open hand into a tight fist angled slightly forward
+    (pointing gate open) where ALL 4 non-thumb fingers (including index) curl into the palm
+    (`dist_to_palm < 0.72`) while the thumb rests on the radial/index side against the curled
+    index fingertip (`d_idx <= pinch_on_dist`, `d_mid > pinch_off_dist`) (V052-04).
+    """
+    base = make_base_open_hand(scale=scale)
+    dt_ms = 1000.0 / float(fps)
+    out: List[Tuple[float, List[Landmark]]] = []
+    frame_idx = 0
+
+    def _emit(t_val: float) -> None:
+        nonlocal frame_idx
+        ts_ms = frame_idx * dt_ms
+        lms = apply_finger_curl(
+            base,
+            ("index", "middle", "ring", "pinky"),
+            curl_amount=curl_amount * t_val,
+        )
+        # Keep the closed fist tilted slightly toward the screen (-z relative to wrist) so the
+        # pointing gate stays open, while every fingertip remains < 0.72 palm widths from palm center.
+        imcp = lms[INDEX_MCP]
+        pc = _palm_center(lms)
+        curled_idx = Landmark(
+            x=imcp.x - 0.012 * scale,
+            y=imcp.y + 0.018 * scale,
+            z=imcp.z - 0.025 * scale,
+        )
+        lms[INDEX_TIP] = _lerp_lm(base[INDEX_TIP], curled_idx, t_val)
+        # Shift middle tip slightly ulnarly inside palm so thumb contacts index cleanly (not dual-pinch)
+        mmcp = lms[MIDDLE_MCP]
+        curled_mid = Landmark(
+            x=mmcp.x + 0.015 * scale,
+            y=pc.y + 0.035 * scale,
+            z=mmcp.z + 0.025 * scale,
+        )
+        lms[MIDDLE_TIP] = _lerp_lm(base[MIDDLE_TIP], curled_mid, t_val)
+        # Thumb folds onto the curled index fingertip on the radial side of the fist
+        lms[THUMB_TIP] = _lerp_lm(base[THUMB_TIP], lms[INDEX_TIP], t_val * 0.95)
+        out.append((ts_ms, lms))
+        frame_idx += 1
+
+    for _ in range(open_frames):
+        _emit(0.0)
+    for k in range(1, max(1, close_frames) + 1):
+        _emit(k / float(max(1, close_frames)))
+    for _ in range(hold_frames):
+        _emit(1.0)
+    return out
+
+
+def make_ok_sign_pinch_sequence(
+    *,
+    open_frames: int = 5,
+    close_frames: int = 6,
+    hold_frames: int = 16,
+    fps: float = 30.0,
+    curl_others: bool = False,
+    scale: float = 1.0,
+) -> List[Tuple[float, List[Landmark]]]:
+    """
+    Generate a realistic OK-sign `thumb_index_pinch` trajectory where thumb & index tips meet
+    in front of the palm (`dist_to_palm(INDEX_TIP) > 0.72`, forming an open O-ring), optionally
+    with middle/ring/pinky curled (V052-04).
+    """
+    base = make_base_open_hand(scale=scale)
+    dt_ms = 1000.0 / float(fps)
+    out: List[Tuple[float, List[Landmark]]] = []
+    frame_idx = 0
+
+    def _emit(t_val: float) -> None:
+        nonlocal frame_idx
+        ts_ms = frame_idx * dt_ms
+        lms = list(base)
+        if curl_others:
+            lms = apply_finger_curl(lms, ("middle", "ring", "pinky"), curl_amount=0.85 * t_val)
+        # Thumb and index tips meet out in front of the palm (well outside palm center < 0.72)
+        meet = _lerp_lm(base[THUMB_TIP], base[INDEX_TIP], 0.55)
+        lms[INDEX_TIP] = _lerp_lm(base[INDEX_TIP], meet, t_val * 0.90)
+        lms[THUMB_TIP] = _lerp_lm(base[THUMB_TIP], meet, t_val * 0.96)
+        out.append((ts_ms, lms))
+        frame_idx += 1
+
+    for _ in range(open_frames):
+        _emit(0.0)
+    for k in range(1, max(1, close_frames) + 1):
+        _emit(k / float(max(1, close_frames)))
+    for _ in range(hold_frames):
+        _emit(1.0)
+    return out

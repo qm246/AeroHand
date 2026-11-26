@@ -146,6 +146,7 @@ classifier:
     enable_grip_guard: true            # Suppress loose contact when >= 3 fingers are half-curled
     grip_half_curled_min: 3
     grip_loose_ratio: 1.05
+    fist_guard_requires_index_curled: true  # Block fist with thumb touching curled index tip (dist_to_palm < 0.72)
 
 collector:
   subject: "minh"                      # Default collector subject ID (matches converted corpus & primary_subject)

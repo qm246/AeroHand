@@ -17,10 +17,18 @@ _TESTS_DIR = str(Path(__file__).resolve().parent)
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 
-from synth_hand import apply_finger_curl, make_base_open_hand, make_pinch_frame, make_synth_pinch_sequence  # noqa: E402
+from synth_hand import (  # noqa: E402
+    apply_finger_curl,
+    make_base_open_hand,
+    make_fist_thumb_on_index_sequence,
+    make_ok_sign_pinch_sequence,
+    make_pinch_frame,
+    make_synth_pinch_sequence,
+)
 
 from aerohand.config import load_config  # noqa: E402
-from aerohand.core.types import PoseName  # noqa: E402
+from aerohand.core.engine import HandCursorEngine  # noqa: E402
+from aerohand.core.types import HandInput, PoseName  # noqa: E402
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier  # noqa: E402
 
 
@@ -163,3 +171,50 @@ def test_synth_static_contact_without_approach_stays_idle():
 def test_synth_smoke_pose_sequence_finite(pose):
     seq = make_synth_pinch_sequence(pose, open_frames=2, close_frames=3, hold_frames=2)
     assert len(seq) == 7
+
+
+def _run_engine_dictation_armed(cfg, seq) -> bool:
+    eng_cfg = dict(cfg)
+    eng_cfg["smoothing"] = dict(cfg["smoothing"], enable_landmark_smoothing=False)
+    eng_cfg["cursor"] = dict(cfg["cursor"], reacquire_skip_frames=0)
+    eng_cfg["palm_wheel"] = dict(cfg["palm_wheel"], enabled=False)
+    clf = Heuristic3DPinchClassifier(eng_cfg["classifier"]["heuristic_3d"])
+    eng = HandCursorEngine(eng_cfg, classifier=clf)
+    armed = False
+    for ts_ms, lms in seq:
+        outs = eng.process_frame([HandInput("Right", lms, lms, timestamp_ms=int(ts_ms))], ts_ms, 1920.0, 1080.0)
+        if outs and (outs[0].pose.dictation_just_started or outs[0].pose.is_dictating):
+            armed = True
+    return armed
+
+
+def test_synth_fist_thumb_on_index_does_not_arm_dictation():
+    cfg = load_config()
+    seq = make_fist_thumb_on_index_sequence(open_frames=5, close_frames=6, hold_frames=18, fps=30.0)
+    assert _run_engine_dictation_armed(cfg, seq) is False, (
+        "Closed fist with thumb resting on curled index tip should NOT arm dictation!"
+    )
+
+
+def test_synth_ok_sign_thumb_index_pinch_still_arms():
+    cfg = load_config()
+    for curl_others in (False, True):
+        seq = make_ok_sign_pinch_sequence(
+            open_frames=5, close_frames=6, hold_frames=18, fps=30.0, curl_others=curl_others
+        )
+        assert _run_engine_dictation_armed(cfg, seq) is True, (
+            f"Real OK-sign thumb_index_pinch failed to arm dictation (curl_others={curl_others})!"
+        )
+
+
+def test_fist_guard_index_curled_param_off_restores_legacy():
+    cfg = load_config()
+    assert cfg["classifier"]["heuristic_3d"]["fist_guard_requires_index_curled"] is True
+    legacy_cfg = dict(cfg)
+    legacy_cfg["classifier"] = dict(
+        cfg["classifier"],
+        heuristic_3d=dict(cfg["classifier"]["heuristic_3d"], fist_guard_requires_index_curled=False),
+    )
+    seq = make_fist_thumb_on_index_sequence(open_frames=5, close_frames=6, hold_frames=18, fps=30.0)
+    assert _run_engine_dictation_armed(cfg, seq) is False
+    assert _run_engine_dictation_armed(legacy_cfg, seq) is True

@@ -37,7 +37,7 @@ from aerohand.core.palm_frame import compute_hand_rotation, extract_frame_diagno
 from aerohand.core.types import ALL_POSE_NAMES, HandInput
 from aerohand.ml.base import PinchClassifier
 from aerohand.ml.heuristic_3d import Heuristic3DPinchClassifier
-from aerohand.ml.onnx_classifier import ONNXPinchClassifier
+from aerohand.ml.onnx_classifier import GuardedClassifier, ONNXPinchClassifier
 from aerohand.ml.provenance import compute_heuristic_source_sha256, compute_onnx_model_hash
 from aerohand.ml.recording_io import (
     POSE_TO_IDX,
@@ -672,7 +672,8 @@ def evaluate_recordings(
         ft_ok = (total_ucb <= float(max_ft_per_hour)) and exposure_sufficient
     passed = bool(ft_ok and (not regressed_f1))
 
-    return {
+    cls_tel = classifier.telemetry() if (classifier is not None and hasattr(classifier, "telemetry")) else None
+    out_report: Dict[str, Any] = {
         "backend": backend_name,
         "sessions_evaluated": evaluated_files,
         "total_frames": len(y_true_all),
@@ -687,6 +688,9 @@ def evaluate_recordings(
         "min_exposure_hours_for_claim": float(min_exposure_hours_for_claim),
         "passed": passed,
     }
+    if cls_tel is not None:
+        out_report["classifier_telemetry"] = cls_tel
+    return out_report
 
 
 def _load_seal_heldout_module():
@@ -713,7 +717,7 @@ def compute_eval_model_hash(
     For `heuristic_3d`, hashes ONLY `cfg["classifier"]["heuristic_3d"]`, `cfg["smoothing"]`,
     `heuristic_3d.py` source, and `palm_frame.py` source (ignoring unrelated `veto_*` / `mode` settings).
     """
-    if backend_name == "onnx_tcn" and model_path and normalizer_path:
+    if backend_name in ("onnx_tcn", "veto") and model_path and normalizer_path:
         return compute_onnx_model_hash(model_path, normalizer_path)
     h = hashlib.sha256()
     h.update(str(backend_name).encode("utf-8"))
@@ -796,7 +800,9 @@ def evaluate_sealed_heldout(
         },
     )
     model_sha256 = (
-        sha256_file(model_path) if (backend_name == "onnx_tcn" and model_path and Path(model_path).is_file()) else None
+        sha256_file(model_path)
+        if (backend_name in ("onnx_tcn", "veto") and model_path and Path(model_path).is_file())
+        else None
     )
     report["model_hash"] = eff_hash
     report["model_sha256"] = model_sha256
@@ -811,17 +817,62 @@ def evaluate_sealed_heldout(
     return report
 
 
+def build_replay_classifier(
+    backend_name: str,
+    cfg: Dict[str, Any],
+    *,
+    model_path: Optional[str | Path] = None,
+    normalizer_path: Optional[str | Path] = None,
+    onnx_classifier: Optional[PinchClassifier] = None,
+) -> PinchClassifier:
+    """Build deterministic offline replay classifier (`heuristic_3d`, `veto`, or `onnx_tcn`) (V060-01b)."""
+    cls_cfg = cfg.get("classifier") or {}
+    heur = Heuristic3DPinchClassifier(cls_cfg.get("heuristic_3d"))
+    backend = str(backend_name or "heuristic_3d").strip().lower()
+    if backend == "heuristic_3d":
+        return heur
+    if backend not in ("onnx_tcn", "veto"):
+        raise ValueError(f"Unsupported replay backend: {backend_name!r}")
+
+    onnx_clf = onnx_classifier
+    if onnx_clf is None:
+        if not model_path or not normalizer_path:
+            raise ValueError(f"--model and --normalizer are required when --backend {backend}")
+        onnx_clf = ONNXPinchClassifier(
+            model_path=model_path,
+            normalizer_path=normalizer_path,
+            sequence_length=int(cls_cfg.get("sequence_length", 5)),
+            feature_set=str(cls_cfg.get("feature_set", "auto")),
+        )
+
+    if backend == "onnx_tcn":
+        return onnx_clf
+
+    # Offline veto replay: use real veto config, disable live latency guard fallback (`max_p95_ms=1e9`)
+    return GuardedClassifier(
+        onnx_clf,
+        heur,
+        mode="veto",
+        veto_min_prob=float(cls_cfg.get("veto_min_prob", 0.35)),
+        veto_idle_prob=float(cls_cfg.get("veto_idle_prob", 0.60)),
+        veto_scope=str(cls_cfg.get("veto_scope", "entry")),
+        veto_entry_window_ms=float(cls_cfg.get("veto_entry_window_ms", 300.0)),
+        veto_confirm_frames=int(cls_cfg.get("veto_confirm_frames", 3)),
+        veto_on_error=str(cls_cfg.get("veto_on_error", "pass_through")),
+        max_p95_ms=1e9,
+    )
+
+
 def _build_cli_classifier(args: argparse.Namespace, cfg: Dict[str, Any]) -> PinchClassifier:
-    if args.backend == "onnx_tcn":
-        if not args.model or not args.normalizer:
-            raise SystemExit("--model and --normalizer are required when --backend onnx_tcn")
-        return ONNXPinchClassifier(
+    try:
+        return build_replay_classifier(
+            args.backend,
+            cfg,
             model_path=args.model,
             normalizer_path=args.normalizer,
-            sequence_length=int((cfg.get("classifier") or {}).get("sequence_length", 5)),
-            feature_set=str((cfg.get("classifier") or {}).get("feature_set", "auto")),
         )
-    return Heuristic3DPinchClassifier((cfg.get("classifier") or {}).get("heuristic_3d"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
@@ -842,7 +893,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         action="store_true",
         help="Treat all files in --heldout as ground-truth idle negatives",
     )
-    parser.add_argument("--backend", choices=["heuristic_3d", "onnx_tcn"], default="heuristic_3d")
+    parser.add_argument("--backend", choices=["heuristic_3d", "veto", "onnx_tcn"], default="heuristic_3d")
     parser.add_argument("--model", type=str, default=None, help="Path to ONNX model (for onnx_tcn)")
     parser.add_argument("--normalizer", type=str, default=None, help="Path to normalizer JSON (for onnx_tcn)")
     parser.add_argument("--config", type=str, default=None, help="Optional YAML config path")

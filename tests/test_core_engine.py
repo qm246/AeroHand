@@ -7080,3 +7080,101 @@ def test_replay_eval_emits_tiered_ft_report_and_respects_config_override(tmp_pat
     assert tiers["A"]["max_ucb_per_hour"] == pytest.approx(1.5)
     assert tiers["A"]["count"] == 0
     assert "garwood_exposure_table" in tiers["A"]
+
+
+# ==============================================================================
+# V060-01b: `veto` Replay Backend & Paired Event Recall (`scripts/eval_event_recall.py`)
+# ==============================================================================
+
+
+def test_replay_eval_supports_veto_backend_without_latency_fallback():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    replay_mod = _load_replay_eval_module("replay_eval_v060_01b_veto")
+    cfg = load_config()
+    cfg["classifier"]["veto_confirm_frames"] = 3
+    cfg["classifier"]["veto_min_prob"] = 0.42
+
+    # Stub ONNX classifier passed via helper or verify CLI builder sets max_p95_ms >= 1e6
+    clf = replay_mod.build_replay_classifier(
+        "veto",
+        cfg,
+        onnx_classifier=_ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+    )
+    assert isinstance(clf, GuardedClassifier)
+    assert clf.mode == "veto"
+    assert clf.veto_confirm_frames == 3
+    assert clf.veto_min_prob == pytest.approx(0.42)
+    assert clf.max_p95_ms >= 1e6  # Latency guard disabled in offline replay
+
+
+def test_eval_event_recall_wilson_ci_paired_gate_and_sealed_refusal(tmp_path: Path):
+    import json
+
+    recall_mod = _load_script_module("scripts/eval_event_recall.py", "eval_recall_v060_01b")
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+
+    # 1. Exact Wilson 95% CI sanity check
+    lo, hi = recall_mod.wilson_interval(49, 50)
+    assert 0.89 < lo < 0.91 and 0.99 < hi <= 1.0
+
+    # 2. Build a synthetic cued_events recording with 2 `left_click` cues (both perform a clean pinch+release)
+    h_open = _make_open_hand(forward_z=-0.25)
+    h_pinch = _pinch_middle_copy(h_open)
+
+    col = PinchDataCollector(default_subject="minh")
+    col.start_cued_session(cues_per_trigger=2, hand="Right", window_ms=1000, gap_ms=1000, seed=11, triggers=["left_click"])
+    # Cue 1 starts at t=1000..2000; Cue 2 starts at t=3000..4000
+    t = 0
+    while t <= 4200:
+        col.tick_cued(t)
+        if not col.is_cued_active:
+            break
+        in_pinch_1 = 1066 <= t <= 1198
+        in_pinch_2 = 3066 <= t <= 3198
+        if t == 2500:
+            col.add_cued_frame([], t)  # Hand-absent gap between cues
+        else:
+            h_cur = h_pinch if (in_pinch_1 or in_pinch_2) else h_open
+            col.add_cued_frame([HandInput("Right", h_cur, h_cur, confidence=0.95, timestamp_ms=t)], t)
+        t += 33
+    fp = col.save_cued(tmp_path / "recall")
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+
+    # 3a. Approving ONNX veto (always approves thumb_middle_pinch) -> 2/2 hits, delta = 0 pp -> PASS!
+    approve_onnx = _ScriptedClf([(PoseName.THUMB_MIDDLE_PINCH, 0.92, 0.05, True)])
+    rep_ok = recall_mod.evaluate_paired_event_recall(
+        [fp],
+        config=cfg,
+        onnx_classifier=approve_onnx,
+        max_recall_drop=0.02,
+    )
+    assert rep_ok["heuristic"]["by_trigger"]["left_click"]["n"] == 2
+    assert rep_ok["heuristic"]["by_trigger"]["left_click"]["hits"] == 2
+    assert rep_ok["veto"]["by_trigger"]["left_click"]["hits"] == 2
+    assert rep_ok["paired"]["by_trigger"]["left_click"]["recall_delta_pp"] == pytest.approx(0.0)
+    assert rep_ok["paired"]["passed"] is True
+
+    # 3b. Always-idle ONNX veto -> blocks both clicks -> heuristic 2/2 vs veto 0/2 (-100 pp) -> FAIL!
+    reject_onnx = _ScriptedClf([(PoseName.IDLE, 0.02, 0.96, True)])
+    rep_fail = recall_mod.evaluate_paired_event_recall(
+        [fp],
+        config=cfg,
+        onnx_classifier=reject_onnx,
+        max_recall_drop=0.02,
+    )
+    assert rep_fail["heuristic"]["by_trigger"]["left_click"]["hits"] == 2
+    assert rep_fail["veto"]["by_trigger"]["left_click"]["hits"] == 0
+    assert rep_fail["paired"]["by_trigger"]["left_click"]["heuristic_only_hits"] == 2
+    assert rep_fail["paired"]["by_trigger"]["left_click"]["passed"] is False
+    assert rep_fail["paired"]["passed"] is False
+
+    # 4. Must refuse heldout paths!
+    ho_dir = tmp_path / "heldout_aerohand"
+    ho_dir.mkdir()
+    ho_fp = ho_dir / "sealed_cued.json"
+    ho_fp.write_text(json.dumps({"recording_kind": "cued_events", "cue_events": [], "samples": []}), encoding="utf-8")
+    with pytest.raises(ValueError, match="Held-out"):
+        recall_mod.evaluate_event_recall([ho_fp], config=cfg)

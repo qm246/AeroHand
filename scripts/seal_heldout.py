@@ -1,52 +1,61 @@
 #!/usr/bin/env python3
 """
-Sealed AeroHand Held-Out Dataset Manager (V050-02).
+Sealed AeroHand Held-Out Dataset Manager (V050-02 / V051-02).
 
 Enforces single-touch held-out evaluation discipline for AeroHand's own sealed test set
 (`data/heldout_aerohand/`):
-  - Copies (or moves with `--move`) chosen session JSON files into a `heldout_aerohand` folder.
+  - Moves chosen session JSON files by default (`--copy` opt-in) into a `heldout_aerohand` folder
+    so originals cannot leak back into training directories.
   - Writes `sealed_manifest.json` containing per-file SHA-256 checksums, creation timestamp,
-    touch counter (`touched: 0`), and `evaluated_model_hashes: []`.
+    touch counter (`touched: 0`), `max_touches` (default 3), and `evaluated_model_hashes: []`.
   - Refuses any GestureCtl `heldout` source path (`assert_not_heldout`).
+  - Refuses `--force` if an existing manifest has `touched > 0`, and backs up untouched manifests
+    to `sealed_manifest.<timestamp>.bak.json` before replacing.
   - `verify_sealed_heldout_manifest()` validates integrity of every sealed file before evaluation.
-  - `record_heldout_touch()` refuses evaluating the same `model_hash` twice on the sealed set
-    and increments `touched` atomically.
+  - `record_heldout_touch()` validates 24-hex `model_hash`, refuses repeated evaluations for the
+    same `model_hash` OR exceeding `max_touches`, and increments `touched` atomically.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
+import re
 import shutil
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from aerohand.ml.recording_io import assert_not_heldout, collect_json_paths
+from aerohand.ml.recording_io import assert_not_heldout, collect_json_paths, sha256_file
 
 MANIFEST_NAME = "sealed_manifest.json"
+DEFAULT_MAX_TOUCHES = 3
+_MODEL_HASH_RE = re.compile(r"^[0-9a-f]{24}$")
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            h.update(chunk)
-    return h.hexdigest()
+def validate_model_hash(model_hash: str) -> str:
+    """Validate that `model_hash` is a lowercase 24-character hex digest."""
+    norm = str(model_hash or "").strip().lower()
+    if not _MODEL_HASH_RE.fullmatch(norm):
+        raise ValueError(
+            f"REFUSED: Invalid model_hash '{model_hash}' (must match ^[0-9a-f]{{24}}$)."
+        )
+    return norm
 
 
 def seal_heldout_sessions(
     src_inputs: Sequence[str | Path],
     out_dir: str | Path = "data/heldout_aerohand",
     *,
-    move: bool = False,
+    move: bool = True,
     force: bool = False,
+    max_touches: int = DEFAULT_MAX_TOUCHES,
     note: str = "",
 ) -> Dict[str, Any]:
     """
     Seal one or more AeroHand session JSON files into `out_dir` (whose path must include
     `heldout_aerohand` and never `gesturectl`) with a SHA-256 `sealed_manifest.json`.
+    Defaults to `move=True` so sealed recordings are removed from training source directories.
     """
     dest = Path(out_dir)
     assert_not_heldout(dest, allow_sealed_aerohand=True)
@@ -56,11 +65,25 @@ def seal_heldout_sessions(
         )
 
     manifest_fp = dest / MANIFEST_NAME
-    if manifest_fp.exists() and not force:
-        raise ValueError(
-            f"REFUSED: Sealed manifest already exists at {manifest_fp}. "
-            "Do not re-seal or modify a sealed held-out set (pass --force only for brand-new sets)."
-        )
+    if manifest_fp.exists():
+        try:
+            old_manifest = json.loads(manifest_fp.read_text(encoding="utf-8"))
+        except Exception:
+            old_manifest = {}
+        old_touched = int(old_manifest.get("touched", 0))
+        if old_touched > 0:
+            raise ValueError(
+                f"REFUSED: Sealed manifest at {manifest_fp} has already been touched ({old_touched}x) "
+                "and cannot be overwritten even with --force. Create a brand-new sealed held-out set."
+            )
+        if not force:
+            raise ValueError(
+                f"REFUSED: Sealed manifest already exists at {manifest_fp}. "
+                "Pass --force only for an untouched manifest (touched == 0)."
+            )
+        bak_stamp = time.strftime("%Y%m%d_%H%M%S")
+        bak_fp = dest / f"sealed_manifest.{bak_stamp}.bak.json"
+        shutil.copy2(str(manifest_fp), str(bak_fp))
 
     src_files = collect_json_paths(src_inputs, allow_sealed_aerohand=False)
     if not src_files:
@@ -95,6 +118,7 @@ def seal_heldout_sessions(
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "note": str(note),
         "touched": 0,
+        "max_touches": max(1, int(max_touches)),
         "evaluated_model_hashes": [],
         "touch_history": [],
         "files": entries,
@@ -134,11 +158,24 @@ def verify_sealed_heldout_manifest(heldout_dir: str | Path) -> Tuple[Dict[str, A
 
 
 def check_model_not_evaluated(manifest: Dict[str, Any], model_hash: str) -> None:
-    """Refuse re-evaluating the exact same model hash on the sealed held-out set."""
-    evaluated = [str(x) for x in (manifest.get("evaluated_model_hashes") or [])]
-    if str(model_hash) in evaluated:
+    """
+    Enforce single-touch discipline & lifetime touch cap:
+      - `model_hash` must match `^[0-9a-f]{24}$`.
+      - Refuses re-evaluating the same `model_hash`.
+      - Refuses exceeding `max_touches` (default 3) regardless of `model_hash`.
+    """
+    norm_hash = validate_model_hash(model_hash)
+    touched = int(manifest.get("touched", 0))
+    max_touches = int(manifest.get("max_touches", DEFAULT_MAX_TOUCHES))
+    if touched >= max_touches:
         raise ValueError(
-            f"REFUSED: Model hash '{model_hash}' was already evaluated on this sealed held-out set "
+            f"REFUSED: Sealed held-out manifest reached max_touches ({touched}/{max_touches}). "
+            "Record and seal a new held-out dataset rather than reusing this one."
+        )
+    evaluated = [str(x).lower() for x in (manifest.get("evaluated_model_hashes") or [])]
+    if norm_hash in evaluated:
+        raise ValueError(
+            f"REFUSED: Model hash '{norm_hash}' was already evaluated on this sealed held-out set "
             "(single-touch discipline forbids repeated evaluations of the same model)."
         )
 
@@ -149,22 +186,23 @@ def record_heldout_touch(
     *,
     summary: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Increment `touched` and append `model_hash` into `sealed_manifest.json`."""
+    """Increment `touched` and append validated `model_hash` into `sealed_manifest.json`."""
+    norm_hash = validate_model_hash(model_hash)
     root = Path(heldout_dir)
     manifest_fp = root / MANIFEST_NAME
     manifest, _ = verify_sealed_heldout_manifest(root)
-    check_model_not_evaluated(manifest, model_hash)
+    check_model_not_evaluated(manifest, norm_hash)
 
     manifest["touched"] = int(manifest.get("touched", 0)) + 1
     evaluated = list(manifest.get("evaluated_model_hashes") or [])
-    evaluated.append(str(model_hash))
+    evaluated.append(norm_hash)
     manifest["evaluated_model_hashes"] = evaluated
 
     hist = list(manifest.get("touch_history") or [])
     hist.append(
         {
             "touch_index": manifest["touched"],
-            "model_hash": str(model_hash),
+            "model_hash": norm_hash,
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "summary": summary or {},
         }
@@ -179,7 +217,7 @@ def record_heldout_touch(
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     parser = argparse.ArgumentParser(
-        description="Seal AeroHand held-out sessions with SHA-256 manifest & single-touch counter (V050-02)."
+        description="Seal AeroHand held-out sessions with SHA-256 manifest & touch limits (V050-02 / V051-02)."
     )
     parser.add_argument("--src", nargs="+", required=True, help="Session JSON files or directories to seal")
     parser.add_argument(
@@ -188,16 +226,20 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default="data/heldout_aerohand",
         help="Destination sealed directory (must contain 'heldout_aerohand')",
     )
-    parser.add_argument("--move", action="store_true", help="Move files instead of copying")
-    parser.add_argument("--force", action="store_true", help="Overwrite an existing sealed_manifest.json")
+    mode_grp = parser.add_mutually_exclusive_group()
+    mode_grp.add_argument("--move", action="store_true", default=True, help="Move files out of source dir (default)")
+    mode_grp.add_argument("--copy", action="store_true", help="Copy instead of moving (opt-in)")
+    parser.add_argument("--max-touches", type=int, default=DEFAULT_MAX_TOUCHES, help="Lifetime evaluation cap (default 3)")
+    parser.add_argument("--force", action="store_true", help="Overwrite an UNTOUCHED (touched==0) manifest with backup")
     parser.add_argument("--note", type=str, default="", help="Optional description note stored in manifest")
     args = parser.parse_args(argv)
 
     manifest = seal_heldout_sessions(
         args.src,
         out_dir=args.out_dir,
-        move=args.move,
+        move=(not args.copy),
         force=args.force,
+        max_touches=args.max_touches,
         note=args.note,
     )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))

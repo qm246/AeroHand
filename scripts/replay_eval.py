@@ -42,7 +42,9 @@ from aerohand.ml.recording_io import (
     POSE_TO_IDX,
     assert_not_heldout,
     collect_json_paths,
+    exclude_sealed_content,
     load_recording_frames,
+    sha256_file,
 )
 
 NUM_CLASSES: int = len(ALL_POSE_NAMES)
@@ -530,8 +532,13 @@ def compute_eval_model_hash(
     *,
     model_path: Optional[str | Path] = None,
     normalizer_path: Optional[str | Path] = None,
+    heuristic_source_bytes: Optional[bytes] = None,
 ) -> str:
-    """Compute a deterministic SHA-256 fingerprint identifying the evaluated model/config."""
+    """
+    Compute a deterministic 24-hex SHA-256 fingerprint identifying the evaluated model/config (V051-02).
+    For `heuristic_3d`, hashes BOTH `cfg["classifier"]` AND the `heuristic_3d.py` source file so
+    code edits produce a distinct hash even when YAML thresholds are unchanged.
+    """
     h = hashlib.sha256()
     h.update(str(backend_name).encode("utf-8"))
     if backend_name == "onnx_tcn" and model_path and normalizer_path:
@@ -540,6 +547,14 @@ def compute_eval_model_hash(
     else:
         cls_blob = json.dumps(cfg.get("classifier") or {}, sort_keys=True, ensure_ascii=False)
         h.update(cls_blob.encode("utf-8"))
+        if heuristic_source_bytes is not None:
+            h.update(heuristic_source_bytes)
+        else:
+            import inspect
+
+            src_file = inspect.getsourcefile(Heuristic3DPinchClassifier)
+            if src_file and Path(src_file).is_file():
+                h.update(Path(src_file).read_bytes())
     return h.hexdigest()[:24]
 
 
@@ -561,16 +576,21 @@ def evaluate_sealed_heldout(
     ft_jsonl_path: Optional[str | Path] = None,
 ) -> Dict[str, Any]:
     """
-    Single-touch evaluation on AeroHand's own sealed `heldout_aerohand` directory (V050-02):
-      1. Verifies SHA-256 of every file listed in `sealed_manifest.json`.
-      2. Refuses a second evaluation for the same `model_hash`.
-      3. Runs `evaluate_recordings(..., allow_sealed_aerohand=True)`.
-      4. Increments `touched` and records `model_hash` in `sealed_manifest.json`.
+    Single-touch evaluation on AeroHand's own sealed `heldout_aerohand` directory (V050-02 / V051-02):
+      1. Validates 24-hex `model_hash`.
+      2. Verifies SHA-256 of every file listed in `sealed_manifest.json`.
+      3. Refuses a second evaluation for the same `model_hash` or exceeding `max_touches`.
+      4. Runs `evaluate_recordings(..., allow_sealed_aerohand=True)`.
+      5. Increments `touched` and records `model_hash` in `sealed_manifest.json`.
     """
     seal_mod = _load_seal_heldout_module()
     cfg = deepcopy(config) if config is not None else load_config()
-    eff_hash = model_hash or compute_eval_model_hash(
-        backend_name, cfg, model_path=model_path, normalizer_path=normalizer_path
+    eff_hash = seal_mod.validate_model_hash(
+        model_hash
+        if model_hash is not None
+        else compute_eval_model_hash(
+            backend_name, cfg, model_path=model_path, normalizer_path=normalizer_path
+        )
     )
     manifest, verified_files = seal_mod.verify_sealed_heldout_manifest(heldout_dir)
     seal_mod.check_model_not_evaluated(manifest, eff_hash)
@@ -602,10 +622,17 @@ def evaluate_sealed_heldout(
             "passed": report["passed"],
         },
     )
+    model_sha256 = (
+        sha256_file(model_path) if (backend_name == "onnx_tcn" and model_path and Path(model_path).is_file()) else None
+    )
+    report["model_hash"] = eff_hash
+    report["model_sha256"] = model_sha256
     report["heldout_audit"] = {
         "heldout_dir": str(Path(heldout_dir)),
         "model_hash": eff_hash,
+        "model_sha256": model_sha256,
         "touched": updated_manifest["touched"],
+        "max_touches": updated_manifest.get("max_touches", 3),
         "files_verified": len(verified_files),
     }
     return report
@@ -684,8 +711,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             ft_jsonl_path=args.ft_jsonl,
         )
     else:
-        session_paths = _collect_json_paths(args.sessions)
-        negative_paths = _collect_json_paths(args.negatives)
+        session_paths, excl_s = exclude_sealed_content(_collect_json_paths(args.sessions))
+        negative_paths, excl_n = exclude_sealed_content(_collect_json_paths(args.negatives))
+        if excl_s or excl_n:
+            print(
+                f"[WARN] Excluded {len(excl_s) + len(excl_n)} file(s) matching sealed_manifest.json SHA-256.",
+                file=sys.stderr,
+            )
         if not session_paths and not negative_paths:
             raise SystemExit("No JSON recordings found via --sessions, --negatives, or --heldout.")
 

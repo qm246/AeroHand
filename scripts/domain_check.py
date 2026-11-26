@@ -18,7 +18,11 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from aerohand.core.palm_frame import INDEX_TIP, THUMB_TIP, compute_palm_frame
-from aerohand.ml.recording_io import collect_json_paths, load_recording_frames
+from aerohand.ml.recording_io import (
+    collect_json_paths,
+    exclude_sealed_content,
+    load_recording_frames,
+)
 
 
 def ks_2samp_stat_and_pvalue(a: Sequence[float], b: Sequence[float]) -> Tuple[float, float]:
@@ -133,8 +137,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     parser.add_argument("--aerohand", nargs="+", required=True, help="Fresh AeroHand session JSON files or dirs")
     args = parser.parse_args(argv)
 
-    conv_paths = collect_json_paths(args.converted)
-    aero_paths = collect_json_paths(args.aerohand)
+    conv_paths, _ = exclude_sealed_content(collect_json_paths(args.converted))
+    aero_paths, _ = exclude_sealed_content(collect_json_paths(args.aerohand))
     report = compare_domains(conv_paths, aero_paths)
     print(json.dumps(report, indent=2))
 

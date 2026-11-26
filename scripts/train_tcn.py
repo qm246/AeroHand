@@ -36,7 +36,14 @@ import numpy as np
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 from aerohand.ml.features_3d import FEATURE_DIM_3D, extract_invariant_3d_features
 from aerohand.ml.features_885 import AIRMOUSE_885_DIM, extract_airmouse_885_features
-from aerohand.ml.recording_io import assert_not_heldout, collect_json_paths, load_recording_frames
+from aerohand.ml.recording_io import (
+    assert_not_heldout,
+    collect_json_paths,
+    exclude_sealed_content,
+    load_recording_frames,
+    load_sealed_hashes,
+    sha256_file,
+)
 
 POSE_TO_IDX: Dict[str, int] = {p.value: idx for idx, p in enumerate(ALL_POSE_NAMES)}
 NUM_CLASSES: int = len(ALL_POSE_NAMES)
@@ -967,6 +974,42 @@ def build_ab_report(
     }
 
 
+def collect_training_files(
+    inputs: Sequence[str | Path],
+    *,
+    data_root: str | Path = "data",
+) -> Tuple[List[Path], List[Path]]:
+    """Collect training JSON files while excluding any file whose SHA-256 is in a sealed held-out manifest (V051-02)."""
+    paths_in = [Path(s) for s in inputs if s]
+    for sp in paths_in:
+        assert_not_heldout(sp)
+    raw_files = collect_json_paths([sp for sp in paths_in if sp.exists()])
+    sealed_hashes = load_sealed_hashes(data_root)
+    return exclude_sealed_content(raw_files, data_root=data_root, sealed_hashes=sealed_hashes)
+
+
+def validate_disjoint_ab_negatives(
+    train_neg_paths: Sequence[Path],
+    eval_neg_paths: Sequence[Path],
+) -> None:
+    """Refuse `--ab-eval-negatives` overlapping with training negatives by content SHA-256 (V051-02)."""
+    if not train_neg_paths or not eval_neg_paths:
+        return
+    train_shas = {sha256_file(p).lower(): p for p in train_neg_paths if Path(p).is_file()}
+    overlaps: List[str] = []
+    for ep in eval_neg_paths:
+        if not Path(ep).is_file():
+            continue
+        dig = sha256_file(ep).lower()
+        if dig in train_shas:
+            overlaps.append(f"{ep.name} == {train_shas[dig].name} ({dig[:12]})")
+    if overlaps:
+        raise ValueError(
+            "REFUSED: --ab-eval-negatives overlaps with training negatives (in-sample leak): "
+            + ", ".join(overlaps)
+        )
+
+
 def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
     try:
         import onnxruntime as ort
@@ -1024,14 +1067,14 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             pt = torch.exp(-F.cross_entropy(logits, target, reduction="none"))
             return (((1.0 - pt) ** self.gamma) * ce).mean()
 
+    data_root = getattr(args, "data_root", "data") or "data"
     raw_sessions = args.sessions if isinstance(args.sessions, (list, tuple)) else [args.sessions]
-    session_inputs = [Path(s) for s in raw_sessions if s]
-    for sp in session_inputs:
-        assert_not_heldout(sp)
-    files = collect_json_paths([sp for sp in session_inputs if sp.exists()])
+    files, excl_s = collect_training_files(raw_sessions, data_root=data_root)
+    if excl_s:
+        print(f"[WARN] Excluded {len(excl_s)} session file(s) whose SHA-256 matches sealed_manifest.json.")
     if not files:
         raise SystemExit(
-            f"No session JSON files found in {[str(p) for p in session_inputs]}.\n"
+            f"No session JSON files found in {raw_sessions}.\n"
             "Record labeled data first inside AeroHand.app -> 'Dữ liệu ML' tab (or `aerohand run --collect-dir data/sessions`)."
         )
 
@@ -1048,10 +1091,10 @@ def train_and_export(args: argparse.Namespace) -> Dict[str, Any]:
             if isinstance(args.negatives_dir, (list, tuple))
             else [args.negatives_dir]
         )
-        neg_inputs = [Path(n) for n in raw_negs if n]
-        for np_dir in neg_inputs:
-            assert_not_heldout(np_dir)
-        for fp in collect_json_paths([p for p in neg_inputs if p.exists()]):
+        neg_files, excl_n = collect_training_files(raw_negs, data_root=data_root)
+        if excl_n:
+            print(f"[WARN] Excluded {len(excl_n)} negative file(s) whose SHA-256 matches sealed_manifest.json.")
+        for fp in neg_files:
             b = load_session_bundle(
                 fp, seq_len=args.seq_len, force_idle=True, max_gap_ms=args.max_gap_ms, skip_stats=skip_stats
             )
@@ -1308,11 +1351,20 @@ def run_ab_comparison(args: argparse.Namespace) -> Dict[str, Any]:
     if not seeds:
         seeds = list(AB_DEFAULT_SEEDS)
 
+    data_root = getattr(args, "data_root", "data") or "data"
     eval_neg_paths = (
-        collect_json_paths(args.ab_eval_negatives)
+        collect_training_files(args.ab_eval_negatives, data_root=data_root)[0]
         if getattr(args, "ab_eval_negatives", None)
         else []
     )
+    if eval_neg_paths and getattr(args, "negatives_dir", None):
+        raw_negs = (
+            args.negatives_dir
+            if isinstance(args.negatives_dir, (list, tuple))
+            else [args.negatives_dir]
+        )
+        train_neg_files, _ = collect_training_files(raw_negs, data_root=data_root)
+        validate_disjoint_ab_negatives(train_neg_files, eval_neg_paths)
     replay_mod = None
     if eval_neg_paths:
         rfp = Path(__file__).resolve().parent / "replay_eval.py"
@@ -1384,6 +1436,12 @@ def main() -> None:
         nargs="*",
         default=None,
         help="Optional offline negative recordings used to compute FT/hour & 95% UCB per A/B seed",
+    )
+    p.add_argument(
+        "--data-root",
+        type=str,
+        default="data",
+        help="Root data directory scanned for sealed_manifest.json SHA-256 exclusion (default 'data')",
     )
     p.add_argument("--loss", choices=["ce", "focal", "ls"], default="focal")
     p.add_argument("--augment", action=argparse.BooleanOptionalAction, default=True, help="Enable landmark augmentation (default on)")

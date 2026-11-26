@@ -658,6 +658,10 @@ class PinchDataCollector:
         dist = _slugify(meta.get("distance", "mid"), "mid")
         light = _slugify(meta.get("lighting", "bright"), "bright")
         out_fp = out_root / f"aerohand_pinch_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}.json"
+        if out_fp.exists():
+            out_fp = out_root / (
+                f"aerohand_pinch_{subj}_{hand}_{angle}deg_{dist}_{light}_{stamp}_{int(time.time() * 1000) % 1000:03d}.json"
+            )
 
         saved_counts = {p.value: 0 for p in ALL_POSE_NAMES}
         saved_by_hand = {p.value: {"Right": 0, "Left": 0} for p in ALL_POSE_NAMES}

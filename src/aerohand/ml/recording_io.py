@@ -15,14 +15,76 @@ Provides:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 from aerohand.core.types import ALL_POSE_NAMES, Handedness, Landmark, PoseName
 
+logger = logging.getLogger(__name__)
+
 POSE_TO_IDX: Dict[str, int] = {p.value: i for i, p in enumerate(ALL_POSE_NAMES)}
 MANIFEST_FILENAMES = frozenset({"manifest.json", "session_manifest.json", "sealed_manifest.json"})
+
+
+def sha256_file(path: str | Path) -> str:
+    """Compute SHA-256 hex digest of a file."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_sealed_hashes(data_root: str | Path = "data") -> Set[str]:
+    """Collect all file SHA-256 digests referenced in any `sealed_manifest.json` under `data_root`."""
+    root = Path(data_root)
+    if not root.exists():
+        return set()
+    hashes: Set[str] = set()
+    for mf in sorted(root.rglob("sealed_manifest.json")):
+        try:
+            payload = json.loads(mf.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        for entry in payload.get("files") or []:
+            digest = str(entry.get("sha256") or "").strip().lower()
+            if len(digest) == 64:
+                hashes.add(digest)
+    return hashes
+
+
+def exclude_sealed_content(
+    paths: Sequence[Path],
+    *,
+    data_root: str | Path = "data",
+    sealed_hashes: Optional[Set[str]] = None,
+) -> Tuple[List[Path], List[Path]]:
+    """
+    Filter out any recording whose content SHA-256 matches a sealed held-out manifest (V051-02).
+    Prevents train <-> held-out leakage even if a file was copied or renamed.
+    """
+    hashes = sealed_hashes if sealed_hashes is not None else load_sealed_hashes(data_root)
+    if not hashes:
+        return list(paths), []
+    kept: List[Path] = []
+    excluded: List[Path] = []
+    for fp in paths:
+        try:
+            digest = sha256_file(fp).lower()
+        except OSError:
+            kept.append(fp)
+            continue
+        if digest in hashes:
+            excluded.append(fp)
+            logger.warning(
+                f"[HELD-OUT GUARD] Excluding {fp} (SHA-256 {digest[:12]}... matches sealed_manifest.json)."
+            )
+        else:
+            kept.append(fp)
+    return kept, excluded
 
 
 def assert_not_heldout(

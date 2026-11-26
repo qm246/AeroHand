@@ -3506,18 +3506,19 @@ def test_seal_heldout_manifest_and_counter(tmp_path_factory):
     assert len(manifest["files"][0]["sha256"]) == 64
 
     # Single-touch eval verifies checksums, runs replay, and increments touched -> 1
+    h1 = "a" * 24
     rep = replay_mod.evaluate_sealed_heldout(
         ho_dir,
-        model_hash="model_v1_abc",
+        model_hash=h1,
         min_exposure_hours_for_claim=0.0,
         max_ft_per_hour=100.0,
     )
     assert rep["heldout_audit"]["touched"] == 1
-    assert rep["heldout_audit"]["model_hash"] == "model_v1_abc"
+    assert rep["heldout_audit"]["model_hash"] == h1
 
     persisted = json.loads((ho_dir / "sealed_manifest.json").read_text(encoding="utf-8"))
     assert persisted["touched"] == 1
-    assert persisted["evaluated_model_hashes"] == ["model_v1_abc"]
+    assert persisted["evaluated_model_hashes"] == [h1]
 
     # Tampering with a sealed file MUST be detected and refused!
     sealed_fp = ho_dir / manifest["files"][0]["filename"]
@@ -3543,20 +3544,21 @@ def test_heldout_second_run_refused_for_same_model(tmp_path_factory):
     seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir)
 
     # First run succeeds
+    h_same = "b" * 24
     rep1 = replay_mod.evaluate_sealed_heldout(
-        ho_dir, model_hash="same_hash_999", min_exposure_hours_for_claim=0.0
+        ho_dir, model_hash=h_same, min_exposure_hours_for_claim=0.0
     )
     assert rep1["heldout_audit"]["touched"] == 1
 
     # Second run with the exact same model hash MUST be refused!
     with pytest.raises(ValueError, match="already evaluated"):
         replay_mod.evaluate_sealed_heldout(
-            ho_dir, model_hash="same_hash_999", min_exposure_hours_for_claim=0.0
+            ho_dir, model_hash=h_same, min_exposure_hours_for_claim=0.0
         )
 
     # A distinct new model hash is permitted and increments touched -> 2
     rep2 = replay_mod.evaluate_sealed_heldout(
-        ho_dir, model_hash="new_model_hash_002", min_exposure_hours_for_claim=0.0
+        ho_dir, model_hash="c" * 24, min_exposure_hours_for_claim=0.0
     )
     assert rep2["heldout_audit"]["touched"] == 2
 
@@ -3915,3 +3917,143 @@ def test_split_subject_heldout_warns_on_default_subject_names():
     dev2, ho2 = mod.split_subject_heldout([b_minh, b_vol], primary_subject="minh")
     res = mod.validate_subject_split([b_minh, b_vol], dev2, ho2, primary_subject="minh")
     assert res["dev_bundles"] == 1 and res["heldout_bundles"] == 1
+
+
+
+def test_train_excludes_files_whose_sha_is_in_sealed_manifest(tmp_path_factory):
+    import shutil
+
+    tmp = tmp_path_factory.mktemp("v051_02_sha")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_v051_02_sha")
+    train_mod = _load_train_tcn_module("train_v051_02_sha")
+
+    data_root = tmp / "data"
+    sess_dir = data_root / "sessions"
+    ho_dir = data_root / "heldout_aerohand"
+
+    h = _make_open_hand()
+    col1 = PinchDataCollector()
+    col1.set_recording(True)
+    col1.set_pose(PoseName.IDLE)
+    for i in range(8):
+        col1.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    fp_sealed = col1.save(sess_dir)
+
+    col2 = PinchDataCollector(session_meta={"wrist_angle": "30"})
+    col2.set_recording(True)
+    col2.set_pose(PoseName.THUMB_MIDDLE_PINCH)
+    for i in range(8):
+        col2.add_frame(h, h, "Right", 0.95, 2000 + i * 33)
+    fp_keep = col2.save(sess_dir)
+
+    # Even if copied & renamed back into sessions/, SHA-256 exclusion MUST drop it!
+    seal_mod.seal_heldout_sessions([fp_sealed], out_dir=ho_dir, move=False)
+    renamed_copy = sess_dir / "renamed_leaked_copy.json"
+    shutil.copy2(str(fp_sealed), str(renamed_copy))
+
+    kept, excluded = train_mod.collect_training_files([sess_dir], data_root=data_root)
+    assert fp_keep in kept
+    assert fp_sealed not in kept and renamed_copy not in kept
+    assert len(excluded) == 2
+
+
+def test_seal_default_moves_files_out_of_source_dirs(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("v051_02_move")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_v051_02_move")
+
+    src_dir = tmp / "sessions"
+    h = _make_open_hand()
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    col.add_frame(h, h, "Right", 0.95, 1000)
+    src_fp = col.save(src_dir)
+    assert src_fp.is_file()
+
+    ho_dir = tmp / "heldout_aerohand"
+    manifest = seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir)
+    # Default mode MUST move source file out so it cannot leak back into training
+    assert not src_fp.exists()
+    assert (ho_dir / manifest["files"][0]["filename"]).is_file()
+
+
+def test_seal_force_refused_after_touch(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("v051_02_force")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_v051_02_force")
+    replay_mod = _load_replay_eval_module("replay_v051_02_force")
+
+    h = _make_open_hand(forward_z=-0.25)
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    for i in range(10):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    src_fp = col.save(tmp / "src")
+
+    ho_dir = tmp / "heldout_aerohand"
+    seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir, move=False)
+
+    # Untouched manifest allows --force and writes a .bak.json backup
+    seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir, move=False, force=True)
+    assert len(list(ho_dir.glob("sealed_manifest.*.bak.json"))) == 1
+
+    # Once touched, --force MUST be refused!
+    replay_mod.evaluate_sealed_heldout(ho_dir, model_hash="d" * 24, min_exposure_hours_for_claim=0.0)
+    with pytest.raises(ValueError, match="already been touched"):
+        seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir, move=False, force=True)
+
+
+def test_manifest_max_touches_enforced(tmp_path_factory):
+    tmp = tmp_path_factory.mktemp("v051_02_maxt")
+    seal_mod = _load_script_module("scripts/seal_heldout.py", "seal_v051_02_maxt")
+    replay_mod = _load_replay_eval_module("replay_v051_02_maxt")
+
+    h = _make_open_hand(forward_z=-0.25)
+    col = PinchDataCollector()
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    for i in range(10):
+        col.add_frame(h, h, "Right", 0.95, 1000 + i * 33)
+    src_fp = col.save(tmp / "src")
+
+    ho_dir = tmp / "heldout_aerohand"
+    seal_mod.seal_heldout_sessions([src_fp], out_dir=ho_dir, max_touches=3)
+
+    # Invalid arbitrary string hash rejected
+    with pytest.raises(ValueError, match="Invalid model_hash"):
+        replay_mod.evaluate_sealed_heldout(ho_dir, model_hash="arbitrary_bypass_hash", min_exposure_hours_for_claim=0.0)
+
+    # First 3 distinct valid 24-hex hashes succeed
+    for ch in ("1", "2", "3"):
+        replay_mod.evaluate_sealed_heldout(ho_dir, model_hash=ch * 24, min_exposure_hours_for_claim=0.0)
+
+    # 4th touch MUST be refused regardless of new hash!
+    with pytest.raises(ValueError, match="max_touches"):
+        replay_mod.evaluate_sealed_heldout(ho_dir, model_hash="4" * 24, min_exposure_hours_for_claim=0.0)
+
+
+def test_heuristic_model_hash_changes_with_source_version():
+    replay_mod = _load_replay_eval_module("replay_v051_02_hhash")
+    cfg = load_config()
+    h_v1 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg, heuristic_source_bytes=b"v1_code")
+    h_v2 = replay_mod.compute_eval_model_hash("heuristic_3d", cfg, heuristic_source_bytes=b"v2_code")
+    assert len(h_v1) == 24 and len(h_v2) == 24
+    assert h_v1 != h_v2
+
+
+def test_ab_eval_negatives_overlap_with_train_rejected(tmp_path: Path):
+    import shutil
+
+    train_mod = _load_train_tcn_module("train_v051_02_abov")
+    f1 = tmp_path / "train_neg.json"
+    f1.write_text('{"samples": []}', encoding="utf-8")
+    f1_copy = tmp_path / "eval_neg_copy.json"
+    shutil.copy2(str(f1), str(f1_copy))
+    f2 = tmp_path / "eval_neg_disjoint.json"
+    f2.write_text('{"samples": [1]}', encoding="utf-8")
+
+    # Disjoint passes cleanly
+    train_mod.validate_disjoint_ab_negatives([f1], [f2])
+    # Content-identical copy MUST raise ValueError
+    with pytest.raises(ValueError, match="overlaps with training negatives"):
+        train_mod.validate_disjoint_ab_negatives([f1], [f1_copy])

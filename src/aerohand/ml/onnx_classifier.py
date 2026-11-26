@@ -216,13 +216,23 @@ class ONNXPinchClassifier:
 
 
 class _HeurEventState:
-    """Per-hand state tracking multi-frame ONNX confirmation for one heuristic pose attempt (V052-01)."""
+    """Per-hand state tracking multi-frame ONNX confirmation for one heuristic pose attempt (V052-01 / V053-02)."""
 
-    __slots__ = ("pose", "enter_ts_ms", "accepted", "ever_accepted", "event_vetoed", "approve_streak", "saw_ready")
+    __slots__ = (
+        "pose",
+        "enter_ts_ms",
+        "last_ts_ms",
+        "accepted",
+        "ever_accepted",
+        "event_vetoed",
+        "approve_streak",
+        "saw_ready",
+    )
 
     def __init__(self, pose: PoseName, enter_ts_ms: float) -> None:
         self.pose: PoseName = pose
         self.enter_ts_ms: float = enter_ts_ms
+        self.last_ts_ms: float = enter_ts_ms
         self.accepted: bool = False
         self.ever_accepted: bool = False
         self.event_vetoed: bool = False
@@ -306,8 +316,12 @@ class GuardedClassifier:
         self._shadow_events: int = 0
         self._shadow_would_veto_events: int = 0
         self._shadow_would_veto_frames: int = 0
+        self._shadow_would_swallow_events: int = 0
+        self._shadow_would_pending_frames: int = 0
         self._veto_count: int = 0
         self._veto_frames: int = 0
+        self._veto_swallowed_events: int = 0
+        self._veto_pending_frames: int = 0
         self._veto_retried_within_1s: int = 0
         self._veto_abstain_not_ready: int = 0
         # Per-hand rising-edge event trackers (V051-05 / V052-01)
@@ -387,22 +401,26 @@ class GuardedClassifier:
             upd(cfg)
 
     def export_counters(self) -> Dict[str, int]:
-        """Export cumulative shadow/veto/error counters so rebuilds never wipe evidence (V051-06)."""
+        """Export cumulative shadow/veto/error counters so rebuilds never wipe evidence (V051-06 / V053-02)."""
         return {
             "shadow_frames": self._shadow_frames,
             "shadow_disagreements": self._shadow_disagreements,
             "shadow_events": self._shadow_events,
             "shadow_would_veto_events": self._shadow_would_veto_events,
             "shadow_would_veto_frames": self._shadow_would_veto_frames,
+            "shadow_would_swallow_events": self._shadow_would_swallow_events,
+            "shadow_would_pending_frames": self._shadow_would_pending_frames,
             "veto_count": self._veto_count,
             "veto_frames": self._veto_frames,
+            "veto_swallowed_events": self._veto_swallowed_events,
+            "veto_pending_frames": self._veto_pending_frames,
             "veto_retried_within_1s": self._veto_retried_within_1s,
             "veto_abstain_not_ready": self._veto_abstain_not_ready,
             "onnx_errors": self._total_errors,
         }
 
     def import_counters(self, counters: Optional[Dict[str, Any]]) -> None:
-        """Restore cumulative shadow/veto/error counters onto a freshly built guard (V051-06)."""
+        """Restore cumulative shadow/veto/error counters onto a freshly built guard (V051-06 / V053-02)."""
         if not counters:
             return
         self._shadow_frames = int(counters.get("shadow_frames", self._shadow_frames))
@@ -410,8 +428,16 @@ class GuardedClassifier:
         self._shadow_events = int(counters.get("shadow_events", self._shadow_events))
         self._shadow_would_veto_events = int(counters.get("shadow_would_veto_events", self._shadow_would_veto_events))
         self._shadow_would_veto_frames = int(counters.get("shadow_would_veto_frames", self._shadow_would_veto_frames))
+        self._shadow_would_swallow_events = int(
+            counters.get("shadow_would_swallow_events", self._shadow_would_swallow_events)
+        )
+        self._shadow_would_pending_frames = int(
+            counters.get("shadow_would_pending_frames", self._shadow_would_pending_frames)
+        )
         self._veto_count = int(counters.get("veto_count", self._veto_count))
         self._veto_frames = int(counters.get("veto_frames", self._veto_frames))
+        self._veto_swallowed_events = int(counters.get("veto_swallowed_events", self._veto_swallowed_events))
+        self._veto_pending_frames = int(counters.get("veto_pending_frames", self._veto_pending_frames))
         self._veto_retried_within_1s = int(counters.get("veto_retried_within_1s", self._veto_retried_within_1s))
         self._veto_abstain_not_ready = int(counters.get("veto_abstain_not_ready", self._veto_abstain_not_ready))
         self._total_errors = int(counters.get("onnx_errors", self._total_errors))
@@ -441,13 +467,17 @@ class GuardedClassifier:
 
     def reset(self, hand: Optional[Handedness] = None) -> None:
         if hand is None:
+            # Global reset (mode switch, rearm, fallback): do NOT count in-flight events as swallowed (V053-02)
             self._last_veto_by_hand.clear()
             self._heur_event_by_hand.clear()
             self._shadow_event_by_hand.clear()
         else:
+            # Per-hand reset (hand lost mid-event): finalize unaccepted pending events as swallowed (V053-02)
+            prev_v_ev = self._heur_event_by_hand.pop(hand, None)
+            self._finalize_veto_event(hand, prev_v_ev, None, released_to_idle=True)
+            prev_s_ev = self._shadow_event_by_hand.pop(hand, None)
+            self._finalize_shadow_event(prev_s_ev)
             self._last_veto_by_hand.pop(hand, None)
-            self._heur_event_by_hand.pop(hand, None)
-            self._shadow_event_by_hand.pop(hand, None)
         for clf in (self._onnx, self._fallback):
             try:
                 clf.reset(hand)  # type: ignore[call-arg]
@@ -509,11 +539,24 @@ class GuardedClassifier:
         p_idle = float(onnx_pred.probabilities.get(PoseName.IDLE, 0.0))
         return (p_proposed >= self.veto_min_prob) and (p_idle <= self.veto_idle_prob)
 
-    def _finalize_shadow_event(self, ev: Optional[_HeurEventState]) -> None:
-        """If a shadow event ended without ever reaching K approvals after seeing ready ONNX, count it."""
+    def _finalize_veto_event(
+        self,
+        handedness: Handedness,
+        ev: Optional[_HeurEventState],
+        ts_ms: Optional[float],
+        *,
+        released_to_idle: bool,
+    ) -> None:
+        """Finalize an unaccepted veto event that saw ready ONNX without explicit veto as swallowed (V053-02)."""
         if ev is not None and ev.saw_ready and (not ev.ever_accepted) and (not ev.event_vetoed):
-            ev.event_vetoed = True
-            self._shadow_would_veto_events += 1
+            self._veto_swallowed_events += 1
+            eff_ts = float(ts_ms) if ts_ms is not None else float(ev.last_ts_ms)
+            self._last_veto_by_hand[handedness] = (ev.pose, eff_ts, released_to_idle)
+
+    def _finalize_shadow_event(self, ev: Optional[_HeurEventState]) -> None:
+        """Finalize an unaccepted shadow event that saw ready ONNX without explicit veto as swallowed (V053-02)."""
+        if ev is not None and ev.saw_ready and (not ev.ever_accepted) and (not ev.event_vetoed):
+            self._shadow_would_swallow_events += 1
 
     def _track_shadow_veto_rule(
         self,
@@ -534,6 +577,7 @@ class GuardedClassifier:
             cur_ev = _HeurEventState(heur_pred.pose, float(timestamp_ms))
             self._shadow_event_by_hand[handedness] = cur_ev
             self._shadow_events += 1
+        cur_ev.last_ts_ms = float(timestamp_ms)
 
         # Unready ONNX frame: abstain cleanly (neither increment nor reset approve_streak)
         if not onnx_pred.ready:
@@ -555,7 +599,7 @@ class GuardedClassifier:
                 if self.veto_scope == "entry":
                     cur_ev.accepted = True
             else:
-                self._shadow_would_veto_frames += 1
+                self._shadow_would_pending_frames += 1
         else:
             cur_ev.approve_streak = 0
             self._shadow_would_veto_frames += 1
@@ -606,15 +650,18 @@ class GuardedClassifier:
 
             # CRITICAL INVARIANT: ONNX can NEVER create an activation when Heuristic predicts IDLE!
             if heur_pred.pose == PoseName.IDLE:
-                self._heur_event_by_hand.pop(handedness, None)
+                prev_ev = self._heur_event_by_hand.pop(handedness, None)
+                self._finalize_veto_event(handedness, prev_ev, float(timestamp_ms), released_to_idle=True)
                 prev_v = self._last_veto_by_hand.get(handedness)
                 if prev_v is not None and not prev_v[2]:
                     self._last_veto_by_hand[handedness] = (prev_v[0], prev_v[1], True)
                 return heur_pred
 
-            # Track heuristic rising-edge event per hand (V051-05 / V052-01)
+            # Track heuristic rising-edge event per hand (V051-05 / V052-01 / V053-02)
             cur_ev = self._heur_event_by_hand.get(handedness)
             if cur_ev is None or cur_ev.pose != heur_pred.pose:
+                if cur_ev is not None:
+                    self._finalize_veto_event(handedness, cur_ev, float(timestamp_ms), released_to_idle=False)
                 # Rising edge of a new heuristic pose attempt
                 prev_v = self._last_veto_by_hand.get(handedness)
                 if prev_v is not None and prev_v[2]:
@@ -623,6 +670,7 @@ class GuardedClassifier:
                     self._last_veto_by_hand.pop(handedness, None)
                 cur_ev = _HeurEventState(heur_pred.pose, float(timestamp_ms))
                 self._heur_event_by_hand[handedness] = cur_ev
+            cur_ev.last_ts_ms = float(timestamp_ms)
 
             if self._fell_back or onnx_pred is None:
                 return heur_pred
@@ -652,7 +700,8 @@ class GuardedClassifier:
                     if self.veto_scope == "entry":
                         cur_ev.accepted = True
                     return heur_pred
-                # Pending confirmation (< K consecutive ready approvals): stay IDLE
+                # Pending confirmation (< K consecutive ready approvals): stay IDLE & count pending frame
+                self._veto_pending_frames += 1
                 return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
 
             # Rejected by ONNX -> reset confirmation streak and veto
@@ -691,9 +740,13 @@ class GuardedClassifier:
             "shadow_events": self._shadow_events,
             "shadow_would_veto_events": self._shadow_would_veto_events,
             "shadow_would_veto_frames": self._shadow_would_veto_frames,
+            "shadow_would_swallow_events": self._shadow_would_swallow_events,
+            "shadow_would_pending_frames": self._shadow_would_pending_frames,
             "shadow_would_veto_rate": round(wv_rate, 4),
             "veto_count": self._veto_count,
             "veto_frames": self._veto_frames,
+            "veto_swallowed_events": self._veto_swallowed_events,
+            "veto_pending_frames": self._veto_pending_frames,
             "veto_retried_within_1s": self._veto_retried_within_1s,
             "veto_abstain_not_ready": self._veto_abstain_not_ready,
             "veto_scope": self.veto_scope,

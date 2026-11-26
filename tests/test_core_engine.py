@@ -6073,3 +6073,155 @@ def test_version_string_consistent_across_pyproject_and_package():
     assert __version__ == proj_version
     first_cfg_line = default_config_path().read_text(encoding="utf-8").splitlines()[0]
     assert f"v{proj_version}" in first_cfg_line
+
+
+# ==============================================================================
+# V053-02 (B2): Swallowed Events & Pending Frames Parity Across Veto & Shadow
+# ==============================================================================
+
+
+def test_veto_and_shadow_record_swallowed_event_when_released_before_k():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    # 2 positive frames (ONNX approves both), release to IDLE, then retry within 1s (3 approvals -> accepted)
+    heur_seq = [
+        (p, 0.95, 0.05, True),
+        (p, 0.95, 0.05, True),
+        (PoseName.IDLE, 0.0, 1.0, True),
+        (p, 0.95, 0.05, True),
+        (p, 0.95, 0.05, True),
+        (p, 0.95, 0.05, True),
+        (PoseName.IDLE, 0.0, 1.0, True),
+    ]
+    onnx_seq = [
+        (p, 0.90, 0.10, True),
+        (p, 0.90, 0.10, True),
+        (PoseName.IDLE, 0.0, 1.0, True),
+        (p, 0.90, 0.10, True),
+        (p, 0.90, 0.10, True),
+        (p, 0.90, 0.10, True),
+        (PoseName.IDLE, 0.0, 1.0, True),
+    ]
+
+    gv = GuardedClassifier(_ScriptedClf(onnx_seq), _ScriptedClf(heur_seq), mode="veto", veto_confirm_frames=3)
+    gs = GuardedClassifier(_ScriptedClf(onnx_seq), _ScriptedClf(heur_seq), mode="shadow", veto_confirm_frames=3)
+    for i in range(len(heur_seq)):
+        gv.predict(h, h, "Right", i * 33.0)
+        gs.predict(h, h, "Right", i * 33.0)
+
+    tv = gv.telemetry()
+    ts = gs.telemetry()
+    # Veto: 1st tap swallowed (not explicit veto), 2+2 pending frames across both attempts, 1 retry within 1s
+    assert tv["veto_count"] == 0
+    assert tv["veto_frames"] == 0
+    assert tv["veto_swallowed_events"] == 1
+    assert tv["veto_pending_frames"] == 4
+    assert tv["veto_retried_within_1s"] == 1
+    # Shadow mirrors the EXACT same event & frame definitions
+    assert ts["shadow_events"] == 2
+    assert ts["shadow_would_veto_events"] == 0
+    assert ts["shadow_would_veto_frames"] == 0
+    assert ts["shadow_would_swallow_events"] == 1
+    assert ts["shadow_would_pending_frames"] == 4
+
+
+def test_swallowed_event_finalized_on_pose_change_and_hand_reset_not_global_reset():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p1 = PoseName.THUMB_MIDDLE_PINCH
+    p2 = PoseName.THUMB_RING_PINCH
+    h = _make_open_hand()
+
+    for mode, sw_key in (("veto", "veto_swallowed_events"), ("shadow", "shadow_would_swallow_events")):
+        # 1. Pose switch after 2 approved frames -> finalizes p1 as 1 swallowed event
+        heur = _ScriptedClf(
+            [
+                (p1, 0.95, 0.05, True),
+                (p1, 0.95, 0.05, True),
+                (p2, 0.95, 0.05, True),
+                (p2, 0.95, 0.05, True),
+                (p2, 0.95, 0.05, True),
+            ]
+        )
+        onnx = _ScriptedClf(
+            [
+                (p1, 0.90, 0.10, True),
+                (p1, 0.90, 0.10, True),
+                (p2, 0.90, 0.10, True),
+                (p2, 0.90, 0.10, True),
+                (p2, 0.90, 0.10, True),
+            ]
+        )
+        g = GuardedClassifier(onnx, heur, mode=mode, veto_confirm_frames=3)
+        for i in range(5):
+            g.predict(h, h, "Right", i * 33.0)
+        assert g.telemetry()[sw_key] == 1
+
+        # 2. Per-hand reset("Right") (hand lost mid-pending) -> finalizes as swallowed
+        g2 = GuardedClassifier(
+            _ScriptedClf([(p1, 0.90, 0.10, True)]),
+            _ScriptedClf([(p1, 0.95, 0.05, True)]),
+            mode=mode,
+            veto_confirm_frames=3,
+        )
+        g2.predict(h, h, "Right", 0.0)
+        g2.predict(h, h, "Right", 33.0)
+        g2.reset("Right")
+        assert g2.telemetry()[sw_key] == 1
+
+        # 3. Global reset(None) (mode switch / rearm / fallback) -> MUST NOT count as swallowed
+        g3 = GuardedClassifier(
+            _ScriptedClf([(p1, 0.90, 0.10, True)]),
+            _ScriptedClf([(p1, 0.95, 0.05, True)]),
+            mode=mode,
+            veto_confirm_frames=3,
+        )
+        g3.predict(h, h, "Right", 0.0)
+        g3.predict(h, h, "Right", 33.0)
+        g3.reset(None)
+        assert g3.telemetry()[sw_key] == 0
+
+
+def test_swallowed_and_pending_counters_exported_and_in_heuristic_telemetry():
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    gv = GuardedClassifier(
+        _ScriptedClf([(p, 0.90, 0.10, True), (p, 0.90, 0.10, True), (PoseName.IDLE, 0.0, 1.0, True)]),
+        _ScriptedClf([(p, 0.95, 0.05, True), (p, 0.95, 0.05, True), (PoseName.IDLE, 0.0, 1.0, True)]),
+        mode="veto",
+        veto_confirm_frames=3,
+    )
+    for i in range(3):
+        gv.predict(h, h, "Right", i * 33.0)
+    exp = gv.export_counters()
+    assert exp["veto_swallowed_events"] == 1
+    assert exp["veto_pending_frames"] == 2
+    assert "shadow_would_swallow_events" in exp
+    assert "shadow_would_pending_frames" in exp
+
+    gv2 = GuardedClassifier(
+        _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+        _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+        mode="veto",
+    )
+    gv2.import_counters(exp)
+    assert gv2.telemetry()["veto_swallowed_events"] == 1
+    assert gv2.telemetry()["veto_pending_frames"] == 2
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "heuristic"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    htel = rt.classifier_telemetry()
+    for k in (
+        "veto_swallowed_events",
+        "veto_pending_frames",
+        "shadow_would_swallow_events",
+        "shadow_would_pending_frames",
+    ):
+        assert k in htel

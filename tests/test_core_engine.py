@@ -6738,3 +6738,144 @@ def test_cued_session_replays_expected_trigger_and_resets_lost_hand(tmp_path: Pa
             clicks_in_window += 1
     assert clicks_in_window >= 1
     assert lost_hand_reset_seen is True
+
+
+# ==============================================================================
+# V060-07: Read-Only Dataset & Cued Recall Auditor (`scripts/data_audit.py`)
+# ==============================================================================
+
+
+def test_data_audit_catches_duplicates_sealed_overlap_and_bad_cues(tmp_path: Path):
+    import json
+
+    from aerohand.ml.recording_io import sha256_file
+
+    audit_mod = _load_script_module("scripts/data_audit.py", "data_audit_v060_07_a")
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+
+    sess_dir = tmp_path / "sessions"
+    neg_dir = tmp_path / "negatives"
+    recall_dir = tmp_path / "recall"
+    sealed_dir = tmp_path / "heldout_aerohand"
+    for d in (sess_dir, neg_dir, recall_dir, sealed_dir):
+        d.mkdir(parents=True)
+
+    # 1. Valid session + exact duplicate copy -> duplicate SHA-256 error
+    h = _make_open_hand(forward_z=-0.25)
+    col = PinchDataCollector(default_subject="minh")
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    for i in range(10):
+        col.add_frame(h, h, "Right", 0.95, i * 33)
+    s1 = col.save(sess_dir)
+    s_dup = sess_dir / "dup_copy.json"
+    s_dup.write_bytes(s1.read_bytes())
+
+    # 2. Sealed manifest containing a hash that overlaps with a file in neg_dir
+    neg_fp = neg_dir / "leaked_neg.json"
+    neg_fp.write_bytes(s1.read_bytes())
+    (sealed_dir / "sealed_manifest.json").write_text(
+        json.dumps({"files": [{"filename": "sealed_01.json", "sha256": sha256_file(neg_fp)}]}),
+        encoding="utf-8",
+    )
+
+    # 3. Draft file under _drafts/ MUST be ignored
+    drafts = sess_dir / "_drafts"
+    drafts.mkdir()
+    (drafts / "draft_ignore.json").write_text("{corrupt json ignored", encoding="utf-8")
+
+    # 4. Bad cued recall file: duplicate cue_id + overlapping windows + wrong pose for trigger
+    bad_cued = recall_dir / "bad_cued.json"
+    bad_cued.write_text(
+        json.dumps(
+            {
+                "schema": "aerohand_pinch_v2",
+                "schema_version": 2,
+                "recording_kind": "cued_events",
+                "session_meta": {"subject": "minh", "hand": "Right"},
+                "cue_events": [
+                    {
+                        "cue_id": "cue_0001",
+                        "pose": PoseName.THUMB_MIDDLE_PINCH.value,
+                        "expected_trigger": "left_click",
+                        "hand": "Right",
+                        "cue_ts_ms": 1000,
+                        "window_ms": 1000,
+                        "t_start_ms": 1000,
+                        "t_end_ms": 2000,
+                    },
+                    {
+                        "cue_id": "cue_0001",  # duplicate!
+                        "pose": PoseName.THUMB_INDEX_PINCH.value,  # wrong pose for left_click!
+                        "expected_trigger": "left_click",
+                        "hand": "Right",
+                        "cue_ts_ms": 1500,  # overlaps [1000, 2000]!
+                        "window_ms": 1000,
+                        "t_start_ms": 1500,
+                        "t_end_ms": 2500,
+                    },
+                ],
+                "samples": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    rep = audit_mod.run_data_audit(
+        sessions_dirs=[sess_dir],
+        negatives_dirs=[neg_dir],
+        recall_dirs=[recall_dir],
+        sealed_root=sealed_dir,
+    )
+    assert rep["integrity_ok"] is False
+    assert rep["passed"] is False
+    assert len(rep["duplicates"]) >= 1
+    assert len(rep["sealed_overlaps"]) >= 1
+    err_text = " ".join(rep["blocking_errors"]).lower()
+    assert "duplicate" in err_text
+    assert "sealed" in err_text
+    assert "cue_id" in err_text or "overlap" in err_text
+    assert "mismatch" in err_text or "pose" in err_text
+
+
+def test_data_audit_reports_clean_partial_corpus_and_allow_partial_exit(tmp_path: Path):
+    audit_mod = _load_script_module("scripts/data_audit.py", "data_audit_v060_07_b")
+    (tmp_path / "pyproject.toml").write_text("", encoding="utf-8")
+
+    sess_dir = tmp_path / "sessions"
+    recall_dir = tmp_path / "recall"
+    sess_dir.mkdir()
+    recall_dir.mkdir()
+
+    h = _make_open_hand(forward_z=-0.25)
+    col = PinchDataCollector(default_subject="minh")
+    col.set_recording(True)
+    col.set_pose(PoseName.IDLE)
+    for i in range(30):
+        col.add_frame(h, h, "Right", 0.95, i * 33)
+    col.save(sess_dir)
+
+    cued = PinchDataCollector(default_subject="minh")
+    cued.start_cued_session(cues_per_trigger=2, hand="Right", window_ms=500, gap_ms=1000, seed=5, triggers=["left_click"])
+    for ts in (0, 1000, 1500, 2500, 3000):
+        cued.tick_cued(ts)
+        cued.add_cued_frame([HandInput("Right", h, h, confidence=0.95, timestamp_ms=ts)], ts)
+    cued.save_cued(recall_dir)
+
+    rep = audit_mod.run_data_audit(
+        sessions_dirs=[sess_dir],
+        recall_dirs=[recall_dir],
+        min_cues_per_trigger=50,
+    )
+    assert rep["integrity_ok"] is True
+    assert rep["ready_for_training"] is False  # partial dataset below 21k / 50 cues
+    assert rep["cued_recall"]["by_trigger"]["left_click"] == 2
+    assert rep["idle_hours_by_source"]["sessions"] > 0.0
+    assert any("hand" in w.lower() or "balance" in w.lower() for w in rep["warnings"])
+
+    # CLI exits non-zero without --allow-partial, and 0 with --allow-partial when integrity_ok is True
+    with pytest.raises(SystemExit) as exc_strict:
+        audit_mod.main(["--sessions", str(sess_dir), "--recall", str(recall_dir), "--json"])
+    assert exc_strict.value.code != 0
+
+    audit_mod.main(["--sessions", str(sess_dir), "--recall", str(recall_dir), "--allow-partial", "--json"])

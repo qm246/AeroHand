@@ -404,24 +404,24 @@ class AeroHandRuntime:
             self._classifier_swap_gen += 1
             gen = self._classifier_swap_gen
 
-        def _worker() -> None:
-            new_clf = build_classifier(
-                cfg_snapshot,
-                on_error=self._on_classifier_error,
-            )
-            with self._classifier_swap_lock, self.engine._classifier_lock:
-                if self._classifier_swap_gen != gen:
-                    return
-                latest = self._export_classifier_counters()
-                if latest:
-                    self._cumulative_classifier_counters = dict(latest)
-                if isinstance(new_clf, GuardedClassifier):
-                    new_clf.import_counters(latest or getattr(self, "_cumulative_classifier_counters", None))
-                self.classifier = new_clf
-                self.engine.set_classifier(new_clf)
+            def _worker() -> None:
+                new_clf = build_classifier(
+                    cfg_snapshot,
+                    on_error=self._on_classifier_error,
+                )
+                with self._classifier_swap_lock, self.engine._classifier_lock:
+                    if self._classifier_swap_gen != gen:
+                        return
+                    latest = self._export_classifier_counters()
+                    if latest:
+                        self._cumulative_classifier_counters = dict(latest)
+                    if isinstance(new_clf, GuardedClassifier):
+                        new_clf.import_counters(latest or getattr(self, "_cumulative_classifier_counters", None))
+                    self.classifier = new_clf
+                    self.engine.set_classifier(new_clf)
 
-        t = threading.Thread(target=_worker, name="aerohand-clf-reload", daemon=True)
-        self._classifier_swap_thread = t
+            t = threading.Thread(target=_worker, name="aerohand-clf-reload", daemon=True)
+            self._classifier_swap_thread = t
         t.start()
         return t
 
@@ -597,8 +597,15 @@ class AeroHandRuntime:
             or float(new_cls.get("max_onnx_p95_ms", 8.0)) != float(old_cls.get("max_onnx_p95_ms", 8.0))
         )
 
-        # V051-06: Update heuristic/veto parameters in-place without wiping counters or reloading ONNX
-        if (not model_paths_changed) and (new_mode == old_mode):
+        cls_changed = model_paths_changed or (new_mode != old_mode) or heuristic_changed or guard_params_changed
+        with self._classifier_swap_lock:
+            swap_in_flight = self._classifier_swap_thread is not None and self._classifier_swap_thread.is_alive()
+
+        # V051-06 / V053-04 (B4): Update heuristic/veto parameters in-place without wiping counters or
+        # reloading ONNX — EXCEPT when an async swap is currently in flight and any classifier setting
+        # changed, in which case we route through rebuild so `_classifier_swap_gen` increments and the
+        # stale background thread cannot overwrite newer user settings.
+        if (not (swap_in_flight and cls_changed)) and (not model_paths_changed) and (new_mode == old_mode):
             if heuristic_changed:
                 if isinstance(self.classifier, GuardedClassifier):
                     self.classifier.update_heuristic_config(new_cls.get("heuristic_3d"))
@@ -614,7 +621,11 @@ class AeroHandRuntime:
                     veto_on_error=str(new_cls.get("veto_on_error", "pass_through")),
                     max_p95_ms=float(new_cls.get("max_onnx_p95_ms", 8.0)),
                 )
-        elif (not model_paths_changed) and isinstance(self.classifier, GuardedClassifier):
+        elif (
+            (not (swap_in_flight and cls_changed))
+            and (not model_paths_changed)
+            and isinstance(self.classifier, GuardedClassifier)
+        ):
             # Mode toggle on an already-loaded GuardedClassifier: switch in-place (clears buffers, keeps counters!)
             self.classifier.set_mode(new_mode)
             if heuristic_changed:

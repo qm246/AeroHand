@@ -6269,3 +6269,122 @@ def test_veto_abstain_on_warmup_does_not_split_event_into_idle():
     g2 = GuardedClassifier(onnx2, _ScriptedClf([(p, 0.95, 0.05, True)]), mode="veto", veto_confirm_frames=3)
     outs2 = [g2.predict(h, h, "Right", i * 33.0).pose for i in range(4)]
     assert outs2 == [PoseName.IDLE, PoseName.IDLE, p, p]
+
+
+# ==============================================================================
+# V053-04 (B4): In-Flight Async Swap Must Not Overwrite Newer Classifier Config
+# ==============================================================================
+
+
+def test_async_swap_does_not_overwrite_mode_switch_to_heuristic(monkeypatch):
+    """V053-04 (B4): Switching back to `heuristic` while an async `veto` reload is in flight must win."""
+    import threading
+
+    import aerohand.runtime as rt_mod
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "shadow"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    # Start with an active GuardedClassifier so switching mode later would normally hit the in-place branch
+    initial_guarded = GuardedClassifier(
+        _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+        Heuristic3DPinchClassifier(),
+        mode="shadow",
+    )
+    rt.classifier = initial_guarded
+    rt.engine.set_classifier(initial_guarded)
+    rt._processing_thread_id = threading.get_ident()
+
+    build_started = threading.Event()
+    build_release = threading.Event()
+    stale_veto_clf = GuardedClassifier(
+        _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+        Heuristic3DPinchClassifier(),
+        mode="veto",
+    )
+
+    def _mock_build(c, *, on_error=None, preserved_counters=None):
+        mode = (c.get("classifier") or {}).get("mode")
+        if mode == "veto":
+            build_started.set()
+            assert build_release.wait(timeout=5.0)
+            return stale_veto_clf
+        return Heuristic3DPinchClassifier((c.get("classifier") or {}).get("heuristic_3d"))
+
+    monkeypatch.setattr(rt_mod, "build_classifier", _mock_build)
+
+    # 1. Trigger async reload for a new model path in mode="veto"
+    cfg_veto = deep_merge(cfg, {"classifier": {"mode": "veto", "onnx_model_path": "models/new_v2.onnx"}})
+    rt._apply_live_settings_now(cfg_veto)
+    t_bg = rt._classifier_swap_thread
+    assert t_bg is not None
+    assert build_started.wait(timeout=5.0)
+
+    # 2. While background reload is in flight, user switches back to mode="heuristic"
+    cfg_heur = deep_merge(cfg_veto, {"classifier": {"mode": "heuristic"}})
+    rt._apply_live_settings_now(cfg_heur)
+
+    # 3. Release stale background loader and wait -> final classifier MUST NOT be stale_veto_clf!
+    build_release.set()
+    t_bg.join(timeout=5.0)
+    assert rt.classifier is not stale_veto_clf
+    assert rt.classifier_telemetry()["mode"] == "heuristic"
+
+
+def test_async_swap_does_not_overwrite_veto_param_change_in_flight(monkeypatch):
+    """V053-04 (B4): Changing `veto_confirm_frames` while async `veto` load is in flight must apply latest value."""
+    import threading
+
+    import aerohand.runtime as rt_mod
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "heuristic"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    rt._processing_thread_id = threading.get_ident()
+
+    first_started = threading.Event()
+    first_release = threading.Event()
+    built: List[GuardedClassifier] = []
+
+    def _mock_build(c, *, on_error=None, preserved_counters=None):
+        k = int((c.get("classifier") or {}).get("veto_confirm_frames", 3))
+        g = GuardedClassifier(
+            _ScriptedClf([(PoseName.IDLE, 0.0, 1.0, True)]),
+            Heuristic3DPinchClassifier(),
+            mode="veto",
+            veto_confirm_frames=k,
+        )
+        built.append(g)
+        if k == 3:
+            first_started.set()
+            assert first_release.wait(timeout=5.0)
+        return g
+
+    monkeypatch.setattr(rt_mod, "build_classifier", _mock_build)
+
+    # 1. Switch heuristic -> veto (k=3): starts async load #1
+    cfg_k3 = deep_merge(cfg, {"classifier": {"mode": "veto", "veto_confirm_frames": 3}})
+    rt._apply_live_settings_now(cfg_k3)
+    t1 = rt._classifier_swap_thread
+    assert t1 is not None
+    assert first_started.wait(timeout=5.0)
+
+    # 2. While load #1 is still in flight, change veto_confirm_frames -> 2 (same mode="veto")
+    cfg_k2 = deep_merge(cfg_k3, {"classifier": {"veto_confirm_frames": 2}})
+    rt._apply_live_settings_now(cfg_k2)
+    t2 = rt._classifier_swap_thread
+    assert t2 is not None
+    if t2 is not t1:
+        t2.join(timeout=5.0)
+
+    # 3. Release load #1 -> must be discarded; final classifier MUST have veto_confirm_frames == 2!
+    first_release.set()
+    t1.join(timeout=5.0)
+    assert isinstance(rt.classifier, GuardedClassifier)
+    assert rt.classifier.veto_confirm_frames == 2

@@ -6426,3 +6426,116 @@ def test_sealed_guard_raises_on_corrupt_or_empty_manifest(tmp_path: Path):
         load_sealed_hashes(data_root=tmp_path / "case_empty")
     with pytest.raises(ValueError, match=str(empty_mf.name)):
         exclude_sealed_content([rec_fp2], data_root=tmp_path / "case_empty")
+
+
+# ==============================================================================
+# V060-00: v0.5.3 Review Leftovers (always-scope unready, partial corrupt manifest, block_rate)
+# ==============================================================================
+
+
+def test_veto_scope_always_unready_after_k_approvals_passes_heuristic():
+    """V060-00 (1): In veto_scope='always', ready=False after approve_streak >= K returns heuristic pose."""
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    heur = _ScriptedClf([(p, 0.95, 0.05, True)])
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),            # streak == 3 >= K -> passes `p`
+            (PoseName.IDLE, 0.0, 1.0, False),  # unready after K approvals -> MUST still pass `p`!
+            (PoseName.IDLE, 0.0, 0.95, True),  # explicit rejection resets streak to 0 -> IDLE
+            (PoseName.IDLE, 0.0, 1.0, False),  # unready with streak < K -> IDLE
+        ]
+    )
+    g = GuardedClassifier(onnx, heur, mode="veto", veto_scope="always", veto_confirm_frames=3)
+    outs = [g.predict(h, h, "Right", i * 33.0).pose for i in range(6)]
+    assert outs == [PoseName.IDLE, PoseName.IDLE, p, p, PoseName.IDLE, PoseName.IDLE]
+
+
+def test_sealed_manifest_raises_on_any_invalid_entry(tmp_path: Path):
+    """V060-00 (2): Even if one entry has a valid SHA-256, ANY malformed/invalid entry must raise."""
+    import json
+
+    from aerohand.ml.recording_io import read_sealed_manifest_hashes
+
+    mf = tmp_path / "sealed_manifest.json"
+    mf.write_text(
+        json.dumps(
+            {
+                "files": [
+                    {"filename": "ok.json", "sha256": "a" * 64},
+                    {"filename": "bad.json", "sha256": "not-a-valid-sha"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sealed_manifest.json"):
+        read_sealed_manifest_hashes(mf)
+
+    mf2 = tmp_path / "sealed_manifest_nondict.json"
+    mf2.write_text(
+        json.dumps({"files": [{"filename": "ok.json", "sha256": "b" * 64}, "corrupt_string_entry"]}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="sealed_manifest_nondict.json"):
+        read_sealed_manifest_hashes(mf2)
+
+
+def test_shadow_would_block_rate_includes_veto_and_swallow():
+    """V060-00 (3): shadow_would_block_rate = (would_veto + would_swallow) / shadow_events (incl. heuristic dict)."""
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+    from aerohand.runtime import AeroHandRuntime
+
+    p = PoseName.THUMB_MIDDLE_PINCH
+    h = _make_open_hand()
+    # Event 1: 2 approvals then IDLE -> swallowed (1)
+    # Event 2: 1 rejection then IDLE -> vetoed (1)
+    # Event 3: 3 approvals then IDLE -> accepted (0)
+    # Total events=3 -> shadow_would_veto_rate=1/3, shadow_would_block_rate=2/3
+    heur = _ScriptedClf(
+        [
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (p, 0.95, 0.05, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (p, 0.95, 0.05, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+        ]
+    )
+    onnx = _ScriptedClf(
+        [
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (PoseName.IDLE, 0.0, 0.95, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (p, 0.90, 0.10, True),
+            (PoseName.IDLE, 0.0, 1.0, True),
+        ]
+    )
+    g = GuardedClassifier(onnx, heur, mode="shadow", veto_confirm_frames=3)
+    for i in range(9):
+        g.predict(h, h, "Right", i * 33.0)
+    tel = g.telemetry()
+    assert tel["shadow_events"] == 3
+    assert tel["shadow_would_veto_events"] == 1
+    assert tel["shadow_would_swallow_events"] == 1
+    assert tel["shadow_would_veto_rate"] == pytest.approx(round(1 / 3, 4))
+    assert tel["shadow_would_block_rate"] == pytest.approx(round(2 / 3, 4))
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["classifier"]["mode"] = "heuristic"
+    rt = AeroHandRuntime(cfg, dry_run=True)
+    rt._cumulative_classifier_counters = g.export_counters()
+    htel = rt.classifier_telemetry()
+    assert htel["shadow_would_block_rate"] == pytest.approx(round(2 / 3, 4))

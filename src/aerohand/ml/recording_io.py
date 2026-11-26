@@ -145,12 +145,18 @@ def read_sealed_manifest_hashes(manifest_path: str | Path) -> Set[str]:
     if not isinstance(files, list):
         raise ValueError(f"REFUSED: Sealed manifest missing 'files' list: {mp}")
     hashes: Set[str] = set()
-    for entry in files:
+    for idx, entry in enumerate(files):
         if not isinstance(entry, dict):
-            continue
+            raise ValueError(
+                f"REFUSED: Sealed manifest entry #{idx} is not a JSON object: {mp}"
+            )
         digest = str(entry.get("sha256") or "").strip().lower()
-        if _SHA256_HEX_RE.fullmatch(digest):
-            hashes.add(digest)
+        if not _SHA256_HEX_RE.fullmatch(digest):
+            raise ValueError(
+                f"REFUSED: Sealed manifest entry #{idx} ({entry.get('filename')!r}) "
+                f"has invalid sha256 {entry.get('sha256')!r}: {mp}"
+            )
+        hashes.add(digest)
     if not hashes:
         raise ValueError(f"REFUSED: Sealed manifest contains zero valid SHA-256 entries: {mp}")
     return hashes

@@ -691,7 +691,9 @@ class GuardedClassifier:
                     if self.veto_scope == "entry":
                         cur_ev.accepted = True
                     return heur_pred
-                if cur_ev.accepted:
+                if cur_ev.accepted or (
+                    self.veto_scope == "always" and cur_ev.approve_streak >= self.veto_confirm_frames
+                ):
                     return heur_pred
                 return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
 
@@ -745,6 +747,11 @@ class GuardedClassifier:
             if self._shadow_events > 0
             else 0.0
         )
+        wb_rate = (
+            (self._shadow_would_veto_events + self._shadow_would_swallow_events) / float(self._shadow_events)
+            if self._shadow_events > 0
+            else 0.0
+        )
         return {
             "mode": self._mode,
             "active_backend": self.active_backend_name,
@@ -758,6 +765,7 @@ class GuardedClassifier:
             "shadow_would_swallow_events": self._shadow_would_swallow_events,
             "shadow_would_pending_frames": self._shadow_would_pending_frames,
             "shadow_would_veto_rate": round(wv_rate, 4),
+            "shadow_would_block_rate": round(wb_rate, 4),
             "veto_count": self._veto_count,
             "veto_frames": self._veto_frames,
             "veto_swallowed_events": self._veto_swallowed_events,

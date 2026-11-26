@@ -439,6 +439,7 @@ class AeroHandRuntime:
         s_dis = int(cum.get("shadow_disagreements", 0))
         s_ev = int(cum.get("shadow_events", 0))
         s_wv_ev = int(cum.get("shadow_would_veto_events", 0))
+        s_sw_ev = int(cum.get("shadow_would_swallow_events", 0))
         return {
             "mode": "heuristic",
             "active_backend": backend_name,
@@ -449,9 +450,10 @@ class AeroHandRuntime:
             "shadow_events": s_ev,
             "shadow_would_veto_events": s_wv_ev,
             "shadow_would_veto_frames": int(cum.get("shadow_would_veto_frames", 0)),
-            "shadow_would_swallow_events": int(cum.get("shadow_would_swallow_events", 0)),
+            "shadow_would_swallow_events": s_sw_ev,
             "shadow_would_pending_frames": int(cum.get("shadow_would_pending_frames", 0)),
             "shadow_would_veto_rate": round(s_wv_ev / float(s_ev), 4) if s_ev > 0 else 0.0,
+            "shadow_would_block_rate": round((s_wv_ev + s_sw_ev) / float(s_ev), 4) if s_ev > 0 else 0.0,
             "veto_count": int(cum.get("veto_count", 0)),
             "veto_frames": int(cum.get("veto_frames", 0)),
             "veto_swallowed_events": int(cum.get("veto_swallowed_events", 0)),

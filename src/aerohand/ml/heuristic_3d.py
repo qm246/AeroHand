@@ -143,6 +143,7 @@ class Heuristic3DPinchClassifier:
         self.grip_half_curled_min: int = max(2, int(c.get("grip_half_curled_min", 3)))
         self.grip_loose_ratio: float = max(0.7, float(c.get("grip_loose_ratio", 1.05)))
         self.fist_guard_requires_index_curled: bool = bool(c.get("fist_guard_requires_index_curled", True))
+        self.fist_guard_protect_latch_ms: float = max(0.0, float(c.get("fist_guard_protect_latch_ms", 500.0)))
 
         self._state_gap_reset_ms: float = float(c.get("state_gap_reset_ms", 250.0))
         self._latch_score_threshold: float = float(c.get("latch_score_threshold", 0.85))
@@ -302,18 +303,29 @@ class Heuristic3DPinchClassifier:
         # If >= 3 non-pinching fingers are curled tightly into a fist/grip (holding phone/cup),
         # suppress loose pinch — never cancelling an already-latched hold. When all 4 non-thumb
         # fingertips (including index: `idx_dist_to_palm < 0.72`) are tightly curled into a full
-        # fist (V052-04), block even tight thumb-on-index contact (and drop any transient latch
-        # acquired mid-closing) while keeping real OK-sign `thumb_index_pinch` unaffected.
+        # fist (V052-04 / V053-01), drop ONLY young/transient latches (< fist_guard_protect_latch_ms)
+        # while preserving long-held drags/dictations (scoring only those protected latches and
+        # disallowing any new latch).
         is_full_curled_fist = (
             self.fist_guard_requires_index_curled
             and curled_count >= 3
             and idx_dist_to_palm < 0.72
             and all_curled_count >= 4
         )
-        if is_full_curled_fist or (curled_count >= 3 and (not st.latched) and (not any_tight_pinch)):
-            if is_full_curled_fist and st.latched:
-                st.latched.clear()
-                st.latch_info.clear()
+        protected_fist_latches: Optional[Set[PoseName]] = None
+        if is_full_curled_fist:
+            for lp in list(st.latched):
+                info = st.latch_info.get(lp)
+                age_ms = (float(timestamp_ms) - float(info["since_ms"])) if info is not None else 0.0
+                if age_ms < self.fist_guard_protect_latch_ms:
+                    st.latched.discard(lp)
+                    st.latch_info.pop(lp, None)
+            if st.latched:
+                protected_fist_latches = set(st.latched)
+
+        if (is_full_curled_fist and not st.latched) or (
+            curled_count >= 3 and (not st.latched) and (not any_tight_pinch)
+        ):
             self.last_debug[handedness] = {
                 "valid_palm_frame": True,
                 "latched": [],
@@ -373,9 +385,18 @@ class Heuristic3DPinchClassifier:
         blocked_by: Dict[str, List[str]] = {}
         all_reasons: Set[str] = set()
 
-        # If the leading pose is already latched, preserve the full 3D score distribution so
+        # Under a full curled fist with protected long-held latches (V053-01), score ONLY the
+        # protected latches and block all other poses (never allowing new latches to be acquired).
+        if protected_fist_latches is not None:
+            for pose_key, raw_sc in list(scores.items()):
+                if pose_key not in protected_fist_latches:
+                    if raw_sc > 0.0:
+                        blocked_by[pose_key.value] = ["fist"]
+                        all_reasons.add("fist")
+                    scores[pose_key] = 0.0
+        # Otherwise, if the leading pose is already latched, preserve the full 3D score distribution so
         # ongoing holds remain strictly rotation-invariant and uninterrupted by wrist motion.
-        if raw_top_pose not in st.latched:
+        elif raw_top_pose not in st.latched:
             for pose_key, raw_sc in list(scores.items()):
                 if raw_sc <= 0.0 or pose_key in st.latched:
                     continue

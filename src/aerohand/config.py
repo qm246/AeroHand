@@ -199,6 +199,7 @@ SAFE_NUMERIC_RANGES: Dict[str, Tuple[float, float]] = {
     "classifier.heuristic_3d.max_wrist_ang_speed_deg_s": (20.0, 600.0),
     "classifier.heuristic_3d.grip_half_curled_min": (2.0, 4.0),
     "classifier.heuristic_3d.grip_loose_ratio": (0.7, 1.5),
+    "classifier.heuristic_3d.fist_guard_protect_latch_ms": (0.0, 5000.0),
     "classifier.veto_min_prob": (0.05, 0.95),
     "classifier.veto_idle_prob": (0.05, 0.95),
     "classifier.veto_entry_window_ms": (0.0, 2000.0),

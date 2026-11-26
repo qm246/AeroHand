@@ -218,3 +218,78 @@ def test_fist_guard_index_curled_param_off_restores_legacy():
     seq = make_fist_thumb_on_index_sequence(open_frames=5, close_frames=6, hold_frames=18, fps=30.0)
     assert _run_engine_dictation_armed(cfg, seq) is False
     assert _run_engine_dictation_armed(legacy_cfg, seq) is True
+
+
+def test_fist_guard_preserves_long_held_drag_when_all_four_curl():
+    """V053-01 (B1): Drag latched >= 600 ms MUST survive if all 4 fingertips curl < 0.72 mid-drag."""
+    from aerohand.core.palm_frame import INDEX_TIP, MIDDLE_TIP, THUMB_TIP
+
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    base = make_base_open_hand()
+
+    # Open frames -> enter clean dual-pinch drag -> hold >= 600 ms
+    for i in range(5):
+        clf.predict(base, base, "Right", i * 33.0)
+    drag_frame = make_pinch_frame(base, PoseName.THUMB_INDEX_MIDDLE_PINCH, 1.0)
+    t_enter = 200.0
+    p_enter = clf.predict(drag_frame, drag_frame, "Right", t_enter)
+    assert p_enter.pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+    assert PoseName.THUMB_INDEX_MIDDLE_PINCH.value in clf.last_debug["Right"]["latched"]
+
+    # Hold steady for 650 ms (step every 50 ms so gap reset never triggers)
+    for k in range(1, 14):
+        p_hold = clf.predict(drag_frame, drag_frame, "Right", t_enter + k * 50.0)
+        assert p_hold.pose == PoseName.THUMB_INDEX_MIDDLE_PINCH
+
+    # Now curl all 4 non-thumb fingers tightly (< 0.72 palm width) while keeping thumb touching index+middle
+    curled_drag = apply_finger_curl(base, ("index", "middle", "ring", "pinky"), curl_amount=0.88)
+    mid_pt = type(base[0])(
+        x=(curled_drag[INDEX_TIP].x + curled_drag[MIDDLE_TIP].x) * 0.5,
+        y=(curled_drag[INDEX_TIP].y + curled_drag[MIDDLE_TIP].y) * 0.5,
+        z=(curled_drag[INDEX_TIP].z + curled_drag[MIDDLE_TIP].z) * 0.5,
+    )
+    curled_drag[INDEX_TIP] = mid_pt
+    curled_drag[MIDDLE_TIP] = mid_pt
+    curled_drag[THUMB_TIP] = mid_pt
+
+    t_curled = t_enter + 700.0
+    for j in range(5):
+        p_after = clf.predict(curled_drag, curled_drag, "Right", t_curled + j * 33.0)
+        assert p_after.pose == PoseName.THUMB_INDEX_MIDDLE_PINCH, (
+            f"Long-held drag dropped on frame {j} when all 4 fingers curled! "
+            f"got={p_after.pose}, dbg={clf.last_debug.get('Right')}"
+        )
+        # No unrelated pose may acquire a new latch while all 4 fingers are curled into a fist
+        assert clf.last_debug["Right"]["latched"] == [PoseName.THUMB_INDEX_MIDDLE_PINCH.value]
+
+
+def test_fist_guard_preserves_long_held_dictation_when_all_four_curl():
+    """V053-01 (B1): Dictation latched >= 600 ms MUST survive if all 4 fingertips curl < 0.72 mid-hold."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    ok_seq = make_ok_sign_pinch_sequence(open_frames=5, close_frames=5, hold_frames=22, fps=30.0)
+    last_ts = 0.0
+    for ts_ms, lms in ok_seq:
+        p = clf.predict(lms, lms, "Right", ts_ms)
+        last_ts = ts_ms
+    assert p.pose == PoseName.THUMB_INDEX_PINCH
+    assert clf.last_debug["Right"]["latch_age_ms"]["thumb_index_pinch"] >= 600.0
+
+    # Now curl all 4 fingers into palm (< 0.72) while thumb stays on curled index tip (same pose as fist)
+    fist_tail = make_fist_thumb_on_index_sequence(open_frames=1, close_frames=1, hold_frames=5, fps=30.0)[-5:]
+    for j, (_, fist_lms) in enumerate(fist_tail):
+        p_after = clf.predict(fist_lms, fist_lms, "Right", last_ts + (j + 1) * 33.0)
+        assert p_after.pose == PoseName.THUMB_INDEX_PINCH, (
+            f"Long-held dictation dropped on frame {j} when all 4 fingers curled! "
+            f"got={p_after.pose}, dbg={clf.last_debug.get('Right')}"
+        )
+
+
+def test_synth_slow_fist_thumb_on_index_does_not_arm_dictation():
+    """V053-01: Slow fist closure (close_frames=15 = 500 ms) must still NOT arm dictation."""
+    cfg = load_config()
+    seq = make_fist_thumb_on_index_sequence(open_frames=5, close_frames=15, hold_frames=18, fps=30.0)
+    assert _run_engine_dictation_armed(cfg, seq) is False, (
+        "Slow fist closure with thumb on curled index tip should NOT arm dictation!"
+    )

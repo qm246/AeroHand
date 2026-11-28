@@ -19,6 +19,7 @@ Capabilities:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import threading
 import time
@@ -952,6 +953,23 @@ class MacOSInputController:
     # ------------------------------------------------------------------
 
     @staticmethod
+    def _ax_element_pid(elem: Any) -> Optional[int]:
+        if AppServices is None or elem is None:
+            return None
+        try:
+            err, pid = AppServices.AXUIElementGetPid(elem, None)
+            if err == 0 and pid is not None:
+                return int(pid)
+        except Exception:
+            pass
+        return None
+
+    @classmethod
+    def _is_own_process_ax_element(cls, elem: Any) -> bool:
+        pid = cls._ax_element_pid(elem)
+        return pid is not None and pid == os.getpid()
+
+    @staticmethod
     def _ax_get_attr(elem: Any, attr: str) -> Any:
         if AppServices is None:
             return None
@@ -963,9 +981,17 @@ class MacOSInputController:
             pass
         return None
 
-    @staticmethod
-    def _ax_set_rect(win: Any, x: float, y: float, w: float, h: float) -> bool:
+    @classmethod
+    def _ax_set_rect(cls, win: Any, x: float, y: float, w: float, h: float) -> bool:
         if AppServices is None or Quartz is None:
+            return False
+        # macOS AppKit / NSWMWindowCoordinator aborts with SIGTRAP ("Must only be used from the
+        # main thread") if AXUIElementSetAttributeValue targets an in-process NSWindow off-main.
+        if (
+            threading.current_thread() is not threading.main_thread()
+            and cls._is_own_process_ax_element(win)
+        ):
+            logger.debug("[AX TILE] Refusing off-main-thread AXUIElementSetAttributeValue on own process")
             return False
         try:
             pos_val = AppServices.AXValueCreate(AppServices.kAXValueCGPointType, Quartz.CGPoint(x, y))
@@ -980,6 +1006,67 @@ class MacOSInputController:
         except Exception:
             return False
 
+    @staticmethod
+    def _tile_own_process_window(direction: str, animate: bool = True) -> bool:
+        """
+        Safely tile AeroHand's own NSWindow on the macOS AppKit main thread.
+        Prevents SIGTRAP crash in `-[NSWMWindowCoordinator performTransactionUsingBlock:]`
+        when Window Tile is triggered while AeroHand Control Center is focused.
+        """
+        def _apply_on_main() -> bool:
+            try:
+                import AppKit
+
+                ns_app = AppKit.NSApp
+                if ns_app is None:
+                    return False
+                win = ns_app.keyWindow() or ns_app.mainWindow()
+                # Skip floating transparent NSPanel overlays; prefer standard Control Center window
+                if win is None or isinstance(win, AppKit.NSPanel):
+                    win = None
+                    for cand in list(ns_app.windows() or []):
+                        if not isinstance(cand, AppKit.NSPanel) and cand.isVisible():
+                            win = cand
+                            break
+                if win is None:
+                    return False
+
+                screens = list(AppKit.NSScreen.screens() or [])
+                primary_h = float(screens[0].frame().size.height) if screens else 1080.0
+                screen = win.screen() or AppKit.NSScreen.mainScreen()
+                if screen is None:
+                    return False
+                vf = screen.visibleFrame()
+                vis_quartz = (
+                    float(vf.origin.x),
+                    primary_h - float(vf.origin.y + vf.size.height),
+                    float(vf.size.width),
+                    float(vf.size.height),
+                )
+                target = compute_tile_rect(direction, vis_quartz)
+                if target is None:
+                    return False
+                tx, ty, tw, th = target
+                cocoa_y = primary_h - (ty + th)
+                cocoa_rect = AppKit.NSMakeRect(tx, cocoa_y, tw, th)
+                win.setFrame_display_animate_(cocoa_rect, True, bool(animate))
+                return True
+            except Exception as exc:
+                logger.debug(f"[AX TILE] Own-process main-thread tile failed: {exc}")
+                return False
+
+        if threading.current_thread() is threading.main_thread():
+            return _apply_on_main()
+
+        try:
+            from PyObjCTools import AppHelper
+
+            AppHelper.callAfter(_apply_on_main)
+            return True
+        except Exception as exc:
+            logger.debug(f"[AX TILE] Unable to schedule own-process tile on main thread: {exc}")
+            return False
+
     def _tile_via_ax(self, direction: str, animate: bool = True) -> bool:
         if AppServices is None or Quartz is None:
             return False
@@ -988,9 +1075,15 @@ class MacOSInputController:
             app = self._ax_get_attr(sys_wide, AppServices.kAXFocusedApplicationAttribute)
             if app is None:
                 return False
+            # Never call AXUIElementCopy/SetAttributeValue on our own process off the main thread!
+            if self._is_own_process_ax_element(app):
+                return self._tile_own_process_window(direction, animate=animate)
+
             win = self._ax_get_attr(app, AppServices.kAXFocusedWindowAttribute)
             if win is None:
                 return False
+            if self._is_own_process_ax_element(win):
+                return self._tile_own_process_window(direction, animate=animate)
 
             cur_pos_val = self._ax_get_attr(win, AppServices.kAXPositionAttribute)
             cur_size_val = self._ax_get_attr(win, AppServices.kAXSizeAttribute)
@@ -1011,19 +1104,36 @@ class MacOSInputController:
 
             if animate and start_rect is not None:
                 def _anim() -> None:
+                    try:
+                        import objc
+
+                        pool_ctx = objc.autorelease_pool
+                    except Exception:
+                        pool_ctx = None
+
                     steps = 4
                     sx, sy, sw, sh = start_rect
                     tx, ty, tw, th = target
                     for i in range(1, steps + 1):
                         t = i / steps
                         ease = 1.0 - (1.0 - t) ** 2
-                        self._ax_set_rect(
-                            win,
-                            sx + (tx - sx) * ease,
-                            sy + (ty - sy) * ease,
-                            sw + (tw - sw) * ease,
-                            sh + (th - sh) * ease,
-                        )
+                        if pool_ctx is not None:
+                            with pool_ctx():
+                                self._ax_set_rect(
+                                    win,
+                                    sx + (tx - sx) * ease,
+                                    sy + (ty - sy) * ease,
+                                    sw + (tw - sw) * ease,
+                                    sh + (th - sh) * ease,
+                                )
+                        else:
+                            self._ax_set_rect(
+                                win,
+                                sx + (tx - sx) * ease,
+                                sy + (ty - sy) * ease,
+                                sw + (tw - sw) * ease,
+                                sh + (th - sh) * ease,
+                            )
                         if i < steps:
                             time.sleep(0.012)
 

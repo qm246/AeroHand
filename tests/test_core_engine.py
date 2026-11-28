@@ -7598,3 +7598,84 @@ def test_collector_teleprompter_overlay_fields_and_cued_rest_privacy():
     en_c = TRANSLATIONS["en"]["collector"]
     assert set(vi_c.keys()) == set(en_c.keys())
     assert "ov_cued_rest_title" in vi_c and "ov_trig_window_tile" in vi_c
+
+
+def test_ax_window_tile_never_mutates_own_process_off_main_thread(monkeypatch):
+    """Regression: tiling AeroHand's own focused window from a worker thread must NEVER invoke
+    AXUIElementSetAttributeValue off-main-thread (causes SIGTRAP in NSWMWindowCoordinator)."""
+    import os
+    import threading
+    from types import SimpleNamespace
+
+    from aerohand.platform import input_macos
+
+    ax_set_calls: list = []
+    own_tile_calls: list = []
+    focused_win_queries: list = []
+
+    fake_app = object()
+    fake_win = object()
+
+    class _FakeAppServices:
+        kAXFocusedApplicationAttribute = "AXFocusedApplication"
+        kAXFocusedWindowAttribute = "AXFocusedWindow"
+        kAXPositionAttribute = "AXPosition"
+        kAXSizeAttribute = "AXSize"
+        kAXValueCGPointType = 1
+        kAXValueCGSizeType = 2
+
+        @staticmethod
+        def AXUIElementCreateSystemWide():
+            return "syswide"
+
+        @staticmethod
+        def AXUIElementCopyAttributeValue(elem, attr, _):
+            if elem == "syswide" and attr == "AXFocusedApplication":
+                return (0, fake_app)
+            focused_win_queries.append((elem, attr))
+            return (0, fake_win)
+
+        @staticmethod
+        def AXUIElementGetPid(elem, _):
+            if elem in (fake_app, fake_win):
+                return (0, os.getpid())
+            return (0, os.getpid() + 9999)
+
+        @staticmethod
+        def AXValueCreate(_t, v):
+            return v
+
+        @staticmethod
+        def AXUIElementSetAttributeValue(*args):
+            ax_set_calls.append(args)
+            return 0
+
+    monkeypatch.setattr(input_macos, "AppServices", _FakeAppServices)
+    monkeypatch.setattr(
+        input_macos,
+        "Quartz",
+        SimpleNamespace(kCGSessionEventTap=1, CGPoint=lambda x, y: (x, y), CGSize=lambda w, h: (w, h)),
+    )
+    monkeypatch.setattr(
+        input_macos.MacOSInputController,
+        "_tile_own_process_window",
+        staticmethod(lambda direction, animate=True: own_tile_calls.append((direction, animate)) or True),
+    )
+
+    ctl = input_macos.MacOSInputController(dry_run=False, counter_query_fn=lambda *_: 999.0)
+    results = {}
+
+    def _worker():
+        results["tile"] = ctl._tile_via_ax("left", animate=True)
+        results["direct_set"] = ctl._ax_set_rect(fake_win, 10.0, 20.0, 500.0, 400.0)
+
+    t = threading.Thread(target=_worker)
+    t.start()
+    t.join(timeout=5.0)
+    assert not t.is_alive()
+
+    assert results["tile"] is True
+    assert own_tile_calls == [("left", True)]
+    assert focused_win_queries == []
+    assert results["direct_set"] is False
+    assert ax_set_calls == []

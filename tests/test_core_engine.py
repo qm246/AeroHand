@@ -7872,3 +7872,73 @@ def test_spaces_nav_upright_palm_bypasses_pointing_gate_without_leaking_other_po
     assert st is not None
     assert PoseName.THUMB_MIDDLE_PINCH not in st.last_open_ms
     assert PoseName.THUMB_RING_PINCH not in st.last_open_ms
+
+
+def test_right_click_tolerates_ring_recoil_below_still_threshold():
+    """Thumb+ring hold with 25 px finger-closure recoil (< still_right_click_motion_px=38) must
+    emit right_click on release instead of falsely promoting to scroll_stroke."""
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["enable_pointing_gate"] = False
+    assert cfg["pose_state_machine"]["still_right_click_motion_px"] == pytest.approx(38.0)
+
+    ring_probs = idle_probabilities()
+    ring_probs[PoseName.IDLE] = 0.05
+    ring_probs[PoseName.THUMB_RING_PINCH] = 0.95
+
+    class _ScriptedRing:
+        def __init__(self) -> None:
+            self.active = True
+
+        def predict(self, *_a, **_kw):
+            from aerohand.ml.base import PinchPrediction
+
+            if self.active:
+                return PinchPrediction(PoseName.THUMB_RING_PINCH, dict(ring_probs), "high")
+            return PinchPrediction(PoseName.IDLE, idle_probabilities(), "high")
+
+        def reset(self, *_a, **_kw):
+            pass
+
+    clf = _ScriptedRing()
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 960.0, 540.0)
+    base_lms = _make_open_hand()
+
+    scrolled = False
+    rclicked = False
+    # Hold 12 frames (~400ms) with mild ~20px net cursor recoil, then release for 8 frames
+    for i in range(20):
+        clf.active = i < 12
+        # Mild ~0.008 normalized recoil (~20px at sensitivity 2.2) while holding
+        dx = 0.004 * min(i, 2) if i < 12 else 0.008
+        lms = [Landmark(lm.x + dx, lm.y, lm.z) for lm in base_lms]
+        outs = eng.process_frame([HandInput("Right", lms, lms, 0.98, i * 33)], float(i * 33), 1920.0, 1080.0)
+        if outs[0].pose.is_scrolling:
+            scrolled = True
+        if outs[0].pose.is_right_clicking:
+            rclicked = True
+
+    assert rclicked is True
+    assert scrolled is False
+
+
+def test_pointing_middle_shaft_click_not_blocked_by_fist_guard():
+    """Pointing hand (index straight up) pressing thumb onto curled middle shaft near 0.28 pw
+    must NOT be rejected as `all:fist` even when middle/ring/pinky tips are curled < 0.72."""
+    from synth_hand import make_airpoint_ergonomic_sequence
+
+    cfg = load_config()
+    clf = Heuristic3DPinchClassifier(cfg["classifier"]["heuristic_3d"])
+    assert clf.shaft_on_dist == pytest.approx(0.29)
+
+    seq = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_MIDDLE_PINCH, open_frames=6, close_frames=4, hold_frames=6, fps=30.0
+    )
+    hit_middle = False
+    for ts, lms in seq:
+        pred = clf.predict(lms, lms, "Right", ts)
+        if pred.pose == PoseName.THUMB_MIDDLE_PINCH and pred.probabilities[PoseName.THUMB_MIDDLE_PINCH] >= 0.75:
+            hit_middle = True
+    assert hit_middle is True

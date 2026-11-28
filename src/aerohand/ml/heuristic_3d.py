@@ -169,10 +169,11 @@ class Heuristic3DPinchClassifier:
         self.fist_guard_requires_index_curled: bool = bool(c.get("fist_guard_requires_index_curled", True))
         self.fist_guard_protect_latch_ms: float = max(0.0, float(c.get("fist_guard_protect_latch_ms", 500.0)))
 
-        # Airpoint ergonomic curled-finger shaft press & relaxed thumb-in-palm tuck
+        # Airpoint ergonomic curled-finger shaft presses (1/2/3 extended fingers) + relaxed
+        # thumb-in-palm tuck (4 slightly extended/curved fingers -> spaces_nav).
         self.enable_airpoint_shaft_press: bool = bool(c.get("enable_airpoint_shaft_press", True))
-        self.shaft_on_dist: float = float(c.get("shaft_on_dist", 0.26))
-        self.shaft_off_dist: float = float(c.get("shaft_off_dist", 0.46))
+        self.shaft_on_dist: float = float(c.get("shaft_on_dist", 0.29))
+        self.shaft_off_dist: float = float(c.get("shaft_off_dist", 0.48))
         self.shaft_open_dist: float = float(c.get("shaft_open_dist", 0.52))
         self.index_shaft_on_dist: float = float(c.get("index_shaft_on_dist", 0.24))
         self.index_shaft_off_dist: float = float(c.get("index_shaft_off_dist", 0.42))
@@ -578,8 +579,16 @@ class Heuristic3DPinchClassifier:
             if st.latched:
                 protected_fist_latches = set(st.latched)
 
+        pointing_middle_shaft = (
+            shaft_eligible.get(PoseName.THUMB_MIDDLE_PINCH, False)
+            and idx_dist_to_palm >= 1.15
+            and raw_shaft_scores.get(PoseName.THUMB_MIDDLE_PINCH, 0.0) >= 0.65
+        )
         if (is_full_curled_fist and not st.latched) or (
-            curled_count >= 3 and (not st.latched) and (not any_tight_pinch)
+            curled_count >= 3
+            and (not st.latched)
+            and (not any_tight_pinch)
+            and (not pointing_middle_shaft)
         ):
             self.last_debug[handedness] = {
                 "valid_palm_frame": True,

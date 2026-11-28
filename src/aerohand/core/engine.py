@@ -526,7 +526,12 @@ class HandCursorEngine:
         self.enable_click_debounce: bool = bool(psm_cfg.get("enable_click_debounce", True))
         self.click_debounce_ms: float = float(psm_cfg.get("click_debounce_ms", 200.0))
         self.double_click_window_ms: float = float(psm_cfg.get("double_click_window_ms", 350.0))
-        self.still_right_click_motion_px: float = float(psm_cfg.get("pose_hold_motion_threshold_px", 15.0))
+        self.still_right_click_motion_px: float = float(
+            psm_cfg.get(
+                "still_right_click_motion_px",
+                psm_cfg.get("pose_hold_motion_threshold_px", 38.0),
+            )
+        )
 
         cls_cfg = (config.get("classifier") or {}).get("heuristic_3d") or {}
         self.require_pointing_gate_for_actions: bool = bool(

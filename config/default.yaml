@@ -153,6 +153,8 @@ classifier:
     shaft_on_dist: 0.29                     # Thumb-to-curled-finger PIP-DIP-TIP shaft contact threshold
     shaft_off_dist: 0.48                    # Release threshold for curled-finger shaft press
     shaft_open_dist: 0.52                   # Required prior open separation before shaft press (anti-jitter)
+    shaft_eligibility_grace_frames: 3       # Grace frames for transient finger-extension flaps while latched on shaft
+    shaft_grace_min_latch_age_ms: 200.0     # Require established shaft hold (>= 200 ms) before applying eligibility grace
     index_shaft_on_dist: 0.24               # Thumb-to-index-side PIP-DIP-TIP contact threshold (dictation)
     index_shaft_off_dist: 0.42
     index_shaft_open_dist: 0.60

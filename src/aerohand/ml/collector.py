@@ -78,14 +78,14 @@ CUED_TRIGGER_SPECS: Dict[str, CuedTriggerSpec] = {
     "right_click": CuedTriggerSpec(
         trigger="right_click",
         pose=PoseName.THUMB_RING_PINCH,
-        instruction_en="2 fingers (Index+Middle) extended, Ring+Pinky curled: press Thumb on Ring shaft, hold STILL (< 15 px), then release.",
-        instruction_vi="2 ngón Trỏ + Giữa duỗi (Áp út, Út gập): bấm Cái vào thân Áp út, giữ YÊN (< 15 px) rồi thả.",
+        instruction_en="2 fingers (Index+Middle) extended, Ring+Pinky curled: press Thumb on Ring shaft, hold STILL (< 38 px), then release.",
+        instruction_vi="2 ngón Trỏ + Giữa duỗi (Áp út, Út gập): bấm Cái vào thân Áp út, giữ YÊN (< 38 px) rồi thả.",
     ),
     "scroll_stroke": CuedTriggerSpec(
         trigger="scroll_stroke",
         pose=PoseName.THUMB_RING_PINCH,
-        instruction_en="2 fingers (Index+Middle) extended, Ring+Pinky curled: press Thumb on Ring shaft and slide (>= 15 px), then release.",
-        instruction_vi="2 ngón Trỏ + Giữa duỗi (Áp út, Út gập): bấm Cái vào thân Áp út rồi trượt tay mượt (>= 15 px).",
+        instruction_en="2 fingers (Index+Middle) extended, Ring+Pinky curled: press Thumb on Ring shaft and slide (>= 38 px), then release.",
+        instruction_vi="2 ngón Trỏ + Giữa duỗi (Áp út, Út gập): bấm Cái vào thân Áp út rồi trượt tay mượt (>= 38 px).",
     ),
     "drag_start": CuedTriggerSpec(
         trigger="drag_start",
@@ -181,7 +181,13 @@ class GuidedStep:
 
 
 def default_guided_steps(step_duration_s: float = 5.0) -> List[GuidedStep]:
-    """Build a structured 7-class + all-8 hard-negative guided recording script (14 steps)."""
+    """
+    Build a structured 19-step guided recording script:
+      - 8 hard-negative `idle` scenarios
+      - 6 Airpoint ergonomic shaft/palm-tuck/3-finger positives
+      - 5 classic tip-to-tip & pinky-MCP positive variants (so ONNX TCN learns every posture
+        accepted by `Heuristic3DPinchClassifier` and never vetoes tip pinches).
+    """
     d = max(2.0, float(step_duration_s))
     return [
         GuidedStep(PoseName.IDLE, d, "Resting open/relaxed hand", "resting", "Tay thả lỏng tự nhiên / xòe mở (KHÔNG chụm)"),
@@ -192,11 +198,16 @@ def default_guided_steps(step_duration_s: float = 5.0) -> List[GuidedStep]:
         GuidedStep(PoseName.IDLE, d, "Waving / gesturing casually", "waving", "Vẫy tay / ra hiệu tự nhiên trước camera"),
         GuidedStep(PoseName.IDLE, d, "Fist open/close & stretching", "fist_open", "Nắm chặt nắm đấm rồi xòe ra & duỗi các ngón"),
         GuidedStep(PoseName.IDLE, d, "Fast pose-to-pose transitions", "transitions", "Chuyển nhanh giữa các tư thế mở / khép tay"),
-        GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Thumb press on Index side (3 others curled)", "", "Trỏ duỗi/cong nhẹ (3 ngón kia gập): bấm Ngón Cái vào cạnh Trỏ"),
-        GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "1 ext (Index): Thumb press on curled Middle shaft", "", "1 ngón Trỏ duỗi (3 ngón kia gập): bấm Ngón Cái vào thân Ngón Giữa"),
-        GuidedStep(PoseName.THUMB_RING_PINCH, d, "2 ext (Index+Middle): Thumb press on curled Ring shaft", "", "2 ngón Trỏ + Giữa duỗi (Áp út, Út gập): bấm Cái vào thân Áp út"),
-        GuidedStep(PoseName.THUMB_PINKY_PINCH, d, "3 ext: Thumb press on curled Pinky", "", "3 ngón Trỏ + Giữa + Áp út duỗi (chỉ Út gập): bấm Cái vào Út"),
-        GuidedStep(PoseName.THUMB_PINKY_BASE, d, "4 slightly extended: Thumb folded into palm", "", "4 ngón hơi duỗi/cong: gập Ngón Cái vào trong lòng bàn tay"),
+        GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Shaft: Thumb press on Index side (3 others curled)", "", "Kiểu thân ngón: Trỏ duỗi/cong nhẹ (3 ngón kia gập), bấm Cái vào cạnh Trỏ"),
+        GuidedStep(PoseName.THUMB_INDEX_PINCH, d, "Tip-to-tip: Thumb tip touching Index tip (hold)", "", "Kiểu đầu ngón: chạm đầu Ngón Cái vào đầu Ngón Trỏ (giữ)"),
+        GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "Shaft (1 ext): Thumb press on curled Middle shaft", "", "Kiểu thân ngón (1 ngón Trỏ duỗi): bấm Cái vào thân Ngón Giữa đang gập"),
+        GuidedStep(PoseName.THUMB_MIDDLE_PINCH, d, "Tip-to-tip (1 ext): Index extended, Thumb tip on Middle tip", "", "Kiểu đầu ngón: Ngón Trỏ duỗi, chạm đầu Ngón Cái vào đầu Ngón Giữa"),
+        GuidedStep(PoseName.THUMB_RING_PINCH, d, "Shaft (2 ext): Thumb press on curled Ring shaft", "", "Kiểu thân ngón (Trỏ+Giữa duỗi): bấm Cái vào thân Ngón Áp út đang gập"),
+        GuidedStep(PoseName.THUMB_RING_PINCH, d, "Tip-to-tip (2 ext): Index+Middle extended, Thumb tip on Ring tip", "", "Kiểu đầu ngón: Trỏ+Giữa duỗi, chạm đầu Ngón Cái vào đầu Ngón Áp út"),
+        GuidedStep(PoseName.THUMB_PINKY_PINCH, d, "Shaft (3 ext): Thumb press on curled Pinky", "", "Kiểu thân ngón (Trỏ+Giữa+Áp út duỗi): bấm Cái vào Ngón Út đang gập"),
+        GuidedStep(PoseName.THUMB_PINKY_PINCH, d, "Tip-to-tip (3 ext): Thumb tip touching Pinky tip", "", "Kiểu đầu ngón: Trỏ+Giữa+Áp út duỗi, chạm đầu Ngón Cái vào đầu Ngón Út"),
+        GuidedStep(PoseName.THUMB_PINKY_BASE, d, "Relaxed tuck: 4 fingers open, Thumb folded into palm", "", "Kiểu gập lòng: 4 ngón duỗi/cong nhẹ, gập Ngón Cái vào lòng bàn tay"),
+        GuidedStep(PoseName.THUMB_PINKY_BASE, d, "Classic MCP: 4 fingers open, Thumb tip touching Pinky base", "", "Kiểu gốc út: 4 ngón mở, gập đầu Ngón Cái chạm gốc Ngón Út"),
         GuidedStep(PoseName.THUMB_INDEX_MIDDLE_PINCH, d, "3-Finger pinch (Ring+Pinky curled)", "", "Gập Áp út + Út: chụm 3 ngón Cái + Trỏ + Giữa (giữ & di chuyển)"),
     ]
 
@@ -220,8 +231,8 @@ def compute_corpus_condition_matrix(
     live_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    Compute the 26k dataset Class x Condition progress matrix across saved sessions,
-    hard-negative clips, and optional in-memory unsaved samples (V040-02).
+    Compute the 21k fresh AeroHand dataset Class x Condition progress matrix across saved sessions,
+    hard-negative clips, and optional in-memory unsaved samples (V050-02).
     """
     by_class: Dict[str, Dict[str, int]] = {
         p.value: {

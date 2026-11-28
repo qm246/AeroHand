@@ -27,8 +27,8 @@
 | **Move Cursor** | Extend **1 finger (Index)** toward screen (`dirZ < -0.15`), curl others | 2-stage One-Euro + distance comp + 60 Hz lerp |
 | **Left Click / Double Click** | **1 ext (Index)** → tap **Thumb on curled Middle shaft** (`thumb_middle_pinch`) | Decoupled from index tip → zero aim drift |
 | **Click & Drag** | Curl Ring+Pinky → hold **Thumb + Index + Middle** (`thumb_index_middle_pinch`) | Distinct from tap click |
-| **Right Click** | **2 ext (Index+Middle)** → press **Thumb on curled Ring shaft** still (`< 15 px`) & release | Dual-behavior with Scroll |
-| **2D Inertial Scroll** | **2 ext (Index+Middle)** → press **Thumb on curled Ring shaft** & slide (`>= 15 px`) | X/Y axis lock + native macOS Momentum Phase |
+| **Right Click** | **2 ext (Index+Middle)** → press **Thumb on curled Ring shaft** still (`< 38 px`) & release | Dual-behavior with Scroll |
+| **2D Inertial Scroll** | **2 ext (Index+Middle)** → press **Thumb on curled Ring shaft** & slide (`>= 38 px`) | X/Y axis lock + native macOS Momentum Phase |
 | **Voice Dictation** | Index extended/slightly curved (others curled) → hold **Thumb on Index side** (`thumb_index_pinch`) | On-device Vietnamese (`vi-VN`) & English (`en-US`) |
 | **Window Tiling** | **3 ext (Index+Middle+Ring)** → press **Thumb on curled Pinky**, slide & release | Direct `AXUIElement` resize + glass ghost preview |
 | **Spaces / Mission Control** | **4 slightly extended/curved** → fold **Thumb into palm** (`thumb_pinky_base`) & slide | 4-finger trackpad swipe equivalent |

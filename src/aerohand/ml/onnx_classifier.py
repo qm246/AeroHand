@@ -611,6 +611,64 @@ class GuardedClassifier:
                 cur_ev.event_vetoed = True
                 self._shadow_would_veto_events += 1
 
+    def _call_fallback(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        timestamp_ms: float,
+        only_pose: Optional[PoseName] = None,
+    ) -> PinchPrediction:
+        if only_pose is not None:
+            predict_only = getattr(self._fallback, "predict_only_pose", None)
+            if callable(predict_only):
+                return predict_only(
+                    landmarks_2d,
+                    world_landmarks,
+                    handedness,
+                    timestamp_ms,
+                    only_pose=only_pose,
+                )
+            raw = self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
+            return self._mask_prediction_to_pose(raw, only_pose)
+        return self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
+
+    @staticmethod
+    def _mask_prediction_to_pose(pred: PinchPrediction, only_pose: PoseName) -> PinchPrediction:
+        p_val = float(pred.probabilities.get(only_pose, 0.0))
+        probs = idle_probabilities()
+        if p_val > 0.0:
+            probs[only_pose] = p_val
+            probs[PoseName.IDLE] = max(0.0, 1.0 - p_val)
+            pose = only_pose if p_val >= 0.5 else PoseName.IDLE
+        else:
+            pose = PoseName.IDLE
+        return PinchPrediction(
+            pose=pose,
+            probabilities=probs,
+            confidence=pred.confidence,
+            ready=pred.ready,
+            infer_ms=pred.infer_ms,
+            feature_ms=pred.feature_ms,
+        )
+
+    def predict_only_pose(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        timestamp_ms: float,
+        only_pose: PoseName,
+    ) -> PinchPrediction:
+        """
+        Evaluate ONLY `only_pose` (e.g. `THUMB_PINKY_BASE` under upright-palm Spaces Nav)
+        so heuristic open-history/latches for other poses remain untouched in heuristic/shadow/veto
+        modes while keeping the ONNX temporal frame buffer continuously fed.
+        """
+        return self._predict_impl(
+            landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose=only_pose
+        )
+
     def predict(
         self,
         landmarks_2d: Sequence[Landmark],
@@ -618,11 +676,22 @@ class GuardedClassifier:
         handedness: Handedness,
         timestamp_ms: float,
     ) -> PinchPrediction:
+        return self._predict_impl(landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose=None)
+
+    def _predict_impl(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        timestamp_ms: float,
+        *,
+        only_pose: Optional[PoseName] = None,
+    ) -> PinchPrediction:
         if self._fell_back or self._mode == "heuristic":
-            return self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
+            return self._call_fallback(landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose)
 
         if self._mode == "shadow":
-            heur_pred = self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
+            heur_pred = self._call_fallback(landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose)
             t0 = self._clock_s()
             try:
                 onnx_pred = self._onnx.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
@@ -630,7 +699,12 @@ class GuardedClassifier:
                 self._record_and_check_latency(onnx_pred, wall_ms, enforce=False)
                 if onnx_pred.ready:
                     self._shadow_frames += 1
-                    if onnx_pred.pose != heur_pred.pose:
+                    cmp_onnx = (
+                        self._mask_prediction_to_pose(onnx_pred, only_pose)
+                        if only_pose is not None
+                        else onnx_pred
+                    )
+                    if cmp_onnx.pose != heur_pred.pose:
                         self._shadow_disagreements += 1
                 self._track_shadow_veto_rule(heur_pred, onnx_pred, handedness, timestamp_ms)
             except Exception as exc:
@@ -638,7 +712,7 @@ class GuardedClassifier:
             return heur_pred
 
         if self._mode == "veto":
-            heur_pred = self._fallback.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
+            heur_pred = self._call_fallback(landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose)
             t0 = self._clock_s()
             onnx_pred: Optional[PinchPrediction] = None
             try:
@@ -735,7 +809,7 @@ class GuardedClassifier:
             pred = self._onnx.predict(landmarks_2d, world_landmarks, handedness, timestamp_ms)
             wall_ms = max(0.0, (self._clock_s() - t0) * 1000.0)
             self._record_and_check_latency(pred, wall_ms, enforce=True)
-            return pred
+            return self._mask_prediction_to_pose(pred, only_pose) if only_pose is not None else pred
         except Exception as exc:
             self._record_error(exc, invoke_on_error=True)
             return PinchPrediction(PoseName.IDLE, idle_probabilities(), "low")

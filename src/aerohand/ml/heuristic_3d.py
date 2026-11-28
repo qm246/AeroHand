@@ -107,6 +107,7 @@ class _PerHandIntentState:
         "last_shaft_open_dist",
         "latched",
         "latch_info",
+        "shaft_ineligible_frames",
     )
 
     def __init__(self, ts_ms: float, wrist_xy: Tuple[float, float], rot_mat: np.ndarray) -> None:
@@ -122,6 +123,7 @@ class _PerHandIntentState:
         self.last_shaft_open_dist: Dict[PoseName, float] = {}
         self.latched: Set[PoseName] = set()
         self.latch_info: Dict[PoseName, Dict[str, Any]] = {}
+        self.shaft_ineligible_frames: Dict[PoseName, int] = {}
 
 
 class Heuristic3DPinchClassifier:
@@ -175,6 +177,8 @@ class Heuristic3DPinchClassifier:
         self.shaft_on_dist: float = float(c.get("shaft_on_dist", 0.29))
         self.shaft_off_dist: float = float(c.get("shaft_off_dist", 0.48))
         self.shaft_open_dist: float = float(c.get("shaft_open_dist", 0.52))
+        self.shaft_eligibility_grace_frames: int = max(0, int(c.get("shaft_eligibility_grace_frames", 3)))
+        self.shaft_grace_min_latch_age_ms: float = max(0.0, float(c.get("shaft_grace_min_latch_age_ms", 200.0)))
         self.index_shaft_on_dist: float = float(c.get("index_shaft_on_dist", 0.24))
         self.index_shaft_off_dist: float = float(c.get("index_shaft_off_dist", 0.42))
         self.index_shaft_open_dist: float = float(c.get("index_shaft_open_dist", 0.60))
@@ -293,6 +297,15 @@ class Heuristic3DPinchClassifier:
         eff_speed_pw = max(wrist_speed_pw, st.speed_pw_ema)
         eff_speed_img = max(wrist_speed_img, st.speed_img_ema)
         eff_ang = max(wrist_ang, st.ang_ema)
+
+        # In single-pose mode (e.g. upright-palm spaces_only_mode), release any stale latches
+        # belonging to other poses immediately so they can never survive past the 250ms state reset.
+        if only_pose is not None:
+            for lp in list(st.latched):
+                if lp != only_pose:
+                    st.latched.discard(lp)
+                    st.latch_info.pop(lp, None)
+                    st.shaft_ineligible_frames.pop(lp, None)
 
         # 3D normalized distances from thumb tip (LM4) in palm-width units (LM5-LM17 = 1.0)
         c = pf.coords_normalized
@@ -456,11 +469,37 @@ class Heuristic3DPinchClassifier:
                     )
                 st.last_shaft_open_ms[pose_key] = timestamp_ms
 
+        # Apply a brief eligibility grace period (default 3 frames) for ESTABLISHED shaft holds
+        # (`used_shaft == True` AND latch age >= `shaft_grace_min_latch_age_ms`) whose physical
+        # thumb-to-shaft contact stays below `s_off`. This prevents 1-3 frame finger-extension
+        # flaps from dropping an active hold (e.g. dictation/scroll/tile/spaces) without stretching
+        # 1-frame transient false contacts into confirmed triggers.
+        eff_shaft_eligible: Dict[PoseName, bool] = dict(shaft_eligible)
+        for pose_key, (s_val, _s_on, s_off, _s_open) in shaft_specs.items():
+            if only_pose is not None and pose_key != only_pose:
+                continue
+            info = st.latch_info.get(pose_key)
+            latch_age = (float(timestamp_ms) - float(info["since_ms"])) if info is not None else 0.0
+            was_established_shaft = (
+                (pose_key in st.latched)
+                and bool((info or {}).get("used_shaft", False))
+                and latch_age >= self.shaft_grace_min_latch_age_ms
+            )
+            if shaft_eligible.get(pose_key, False):
+                st.shaft_ineligible_frames.pop(pose_key, None)
+            elif was_established_shaft and s_val < s_off and self.shaft_eligibility_grace_frames > 0:
+                miss_cnt = st.shaft_ineligible_frames.get(pose_key, 0) + 1
+                st.shaft_ineligible_frames[pose_key] = miss_cnt
+                if miss_cnt <= self.shaft_eligibility_grace_frames:
+                    eff_shaft_eligible[pose_key] = True
+            else:
+                st.shaft_ineligible_frames.pop(pose_key, None)
+
         for pose_key, (dist_val, _on_d, off_d) in tip_specs.items():
             if only_pose is not None and pose_key != only_pose:
                 continue
             tip_off = dist_val >= off_d
-            if pose_key in shaft_specs and shaft_eligible.get(pose_key, False):
+            if pose_key in shaft_specs and eff_shaft_eligible.get(pose_key, False):
                 s_val, _s_on, s_off, _s_open = shaft_specs[pose_key]
                 shaft_off = s_val >= s_off
             else:
@@ -468,6 +507,7 @@ class Heuristic3DPinchClassifier:
             if tip_off and shaft_off:
                 st.latched.discard(pose_key)
                 st.latch_info.pop(pose_key, None)
+                st.shaft_ineligible_frames.pop(pose_key, None)
 
         # Raw scores in [0, 1]: best of classic tip-to-tip contact and eligible Airpoint shaft/tuck
         raw_tip_scores: Dict[PoseName, float] = {
@@ -482,7 +522,7 @@ class Heuristic3DPinchClassifier:
         }
         raw_shaft_scores: Dict[PoseName, float] = {}
         for pose_key, (s_val, s_on, s_off, _s_open) in shaft_specs.items():
-            if shaft_eligible.get(pose_key, False) and s_on > 0.0:
+            if eff_shaft_eligible.get(pose_key, False) and s_on > 0.0:
                 raw_shaft_scores[pose_key] = _smooth_closeness(s_val, s_on, s_off)
             else:
                 raw_shaft_scores[pose_key] = 0.0
@@ -576,6 +616,7 @@ class Heuristic3DPinchClassifier:
                 if age_ms < self.fist_guard_protect_latch_ms:
                     st.latched.discard(lp)
                     st.latch_info.pop(lp, None)
+                    st.shaft_ineligible_frames.pop(lp, None)
             if st.latched:
                 protected_fist_latches = set(st.latched)
 

@@ -786,9 +786,10 @@ class AeroHandRuntime:
             self.collector.stop_cued_session()
             self._restore_cued_dry_run()
         now_ms = float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
-        self.collector.start_guided(now_ms=now_ms)
-        self._last_action_text = "Guided 14-step recording started"
-        logger.info("[COLLECT] Guided 14-step recording started.")
+        st = self.collector.start_guided(now_ms=now_ms)
+        n_steps = int(st.get("total_steps", 19))
+        self._last_action_text = f"Guided {n_steps}-step recording started"
+        logger.info(f"[COLLECT] Guided {n_steps}-step recording started.")
         return self._sync_collector_snapshot()
 
     def collector_stop_guided(self) -> Dict[str, Any]:

@@ -356,3 +356,179 @@ def test_airpoint_relaxed_palm_tuck_does_not_require_reaching_pinky_mcp():
     legacy_clf = Heuristic3DPinchClassifier(dict(cfg, enable_airpoint_shaft_press=False))
     legacy_tail = _run_seq_and_collect_hold_poses(legacy_clf, seq)
     assert all(p.pose == PoseName.IDLE for p in legacy_tail)
+
+
+def _inject_shaft_eligibility_flap(lms, pose: PoseName):
+    """Perturb finger extension enough to break strict `shaft_eligible[pose]` while keeping
+    physical thumb-to-shaft contact `< s_off` and avoiding a full 4-finger curled fist."""
+    import math
+
+    from aerohand.core.palm_frame import (
+        INDEX_MCP,
+        INDEX_TIP,
+        MIDDLE_MCP,
+        MIDDLE_TIP,
+        PINKY_MCP,
+        PINKY_TIP,
+        RING_MCP,
+        RING_TIP,
+        WRIST,
+    )
+    from aerohand.core.types import Landmark
+
+    out = list(lms)
+    w = out[WRIST]
+
+    def _set_finger_ext(tip_idx: int, mcp_idx: int, target_ext: float, side_dir: tuple[float, float, float]) -> None:
+        m = out[mcp_idx]
+        mcp_d = math.sqrt((m.x - w.x) ** 2 + (m.y - w.y) ** 2 + (m.z - w.z) ** 2)
+        dx, dy, dz = side_dir
+        n = math.sqrt(dx * dx + dy * dy + dz * dz)
+        r = target_ext * mcp_d / max(n, 1e-9)
+        out[tip_idx] = Landmark(w.x + dx * r, w.y + dy * r, w.z + dz * r)
+
+    if pose in (PoseName.THUMB_INDEX_PINCH, PoseName.THUMB_MIDDLE_PINCH):
+        # Dip index_ext to 1.10 (< 1.15 / < 1.20) while keeping idx_dist_to_palm > 0.90 (not a fist)
+        # and leaving INDEX_PIP / INDEX_DIP untouched so thumb-to-shaft contact stays < s_off.
+        _set_finger_ext(INDEX_TIP, INDEX_MCP, 1.10, (-0.58, -0.33, -0.74))
+    elif pose == PoseName.THUMB_RING_PINCH:
+        # Dip mid_ext to 1.25 (< 1.35) while keeping thumb on ring PIP-DIP
+        _set_finger_ext(MIDDLE_TIP, MIDDLE_MCP, 1.25, (0.0, -0.50, -0.86))
+    elif pose == PoseName.THUMB_PINKY_PINCH:
+        # Dip ring_ext to 1.25 (< 1.35) while keeping thumb on pinky PIP-DIP
+        _set_finger_ext(RING_TIP, RING_MCP, 1.25, (0.25, -0.50, -0.83))
+    elif pose == PoseName.THUMB_PINKY_BASE:
+        # Dip pinky_ext to 1.05 (< 1.15) while keeping thumb tucked inside inner palm
+        _set_finger_ext(PINKY_TIP, PINKY_MCP, 1.05, (0.55, -0.45, -0.70))
+    return out
+
+
+@pytest.mark.parametrize(
+    "pose",
+    [
+        PoseName.THUMB_INDEX_PINCH,
+        PoseName.THUMB_MIDDLE_PINCH,
+        PoseName.THUMB_RING_PINCH,
+        PoseName.THUMB_PINKY_PINCH,
+        PoseName.THUMB_PINKY_BASE,
+    ],
+)
+@pytest.mark.parametrize("flap_frames", [1, 2, 3])
+def test_shaft_latched_poses_survive_transient_eligibility_flap(pose, flap_frames):
+    """P0.2: After a 2 s shaft hold, a 1-3 frame eligibility flap with intact thumb-to-shaft
+    contact must NOT drop the latch or trigger post-flap approach lockout for any shaft pose."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    assert int(cfg["shaft_eligibility_grace_frames"]) == 3
+    clf = Heuristic3DPinchClassifier(cfg)
+    fps = 30.0
+    dt_ms = 1000.0 / fps
+
+    # 1. Enter cleanly and hold for 2.0 s (60 frames at 30 fps)
+    seq = make_airpoint_ergonomic_sequence(pose, open_frames=6, close_frames=6, hold_frames=60, fps=fps)
+    last_ts = 0.0
+    hold_frame = seq[-1][1]
+    for ts_ms, lms in seq:
+        pred = clf.predict(lms, lms, "Right", ts_ms)
+        last_ts = ts_ms
+    assert pred.pose == pose
+    assert pose.value in clf.last_debug["Right"]["latched"]
+    assert clf.last_debug["Right"]["latch_age_ms"][pose.value] >= 1800.0
+
+    # 2. Inject 1-3 frames where strict shaft_eligible drops to False while contact stays < s_off
+    flap_frame = _inject_shaft_eligibility_flap(hold_frame, pose)
+    for k in range(1, flap_frames + 1):
+        last_ts += dt_ms
+        p_flap = clf.predict(flap_frame, flap_frame, "Right", last_ts)
+        st = clf._hands["Right"]
+        assert st.shaft_ineligible_frames.get(pose, 0) == k, (
+            f"Expected strict shaft_eligible to fail on flap frame {k} for {pose.value}, "
+            f"dbg={clf.last_debug.get('Right')}"
+        )
+        assert pose.value in clf.last_debug["Right"]["latched"], (
+            f"Shaft latch dropped on flap frame {k}/{flap_frames} for {pose.value}! "
+            f"dbg={clf.last_debug.get('Right')}"
+        )
+        assert p_flap.pose == pose, (
+            f"Predicted {p_flap.pose} instead of {pose} on flap frame {k}/{flap_frames}! "
+            f"dbg={clf.last_debug.get('Right')}"
+        )
+
+    # 3. Return to steady hold for 5 frames: zero approach lockout & grace counter resets cleanly
+    for j in range(1, 6):
+        last_ts += dt_ms
+        p_rec = clf.predict(hold_frame, hold_frame, "Right", last_ts)
+        assert p_rec.pose == pose, (
+            f"Recovery frame {j} after {flap_frames}-frame flap failed for {pose.value}: "
+            f"got={p_rec.pose}, dbg={clf.last_debug.get('Right')}"
+        )
+        assert clf.last_debug["Right"]["blocked_reasons"] == []
+        assert clf._hands["Right"].shaft_ineligible_frames.get(pose, 0) == 0
+
+
+def test_shaft_grace_still_unlatches_on_sustained_ineligibility_or_open_thumb():
+    """P0.2: >3 consecutive ineligible frames OR physically releasing the thumb must still unlatch."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    dt_ms = 1000.0 / 30.0
+
+    # Case A: 4 consecutive ineligible frames (> grace=3) drops the shaft latch cleanly
+    clf_a = Heuristic3DPinchClassifier(cfg)
+    seq = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_INDEX_PINCH, open_frames=6, close_frames=6, hold_frames=60, fps=30.0
+    )
+    last_ts = 0.0
+    for ts_ms, lms in seq:
+        clf_a.predict(lms, lms, "Right", ts_ms)
+        last_ts = ts_ms
+    flap_frame = _inject_shaft_eligibility_flap(seq[-1][1], PoseName.THUMB_INDEX_PINCH)
+    for k in range(1, 5):
+        last_ts += dt_ms
+        pred = clf_a.predict(flap_frame, flap_frame, "Right", last_ts)
+    assert PoseName.THUMB_INDEX_PINCH.value not in clf_a.last_debug["Right"]["latched"]
+    assert pred.pose == PoseName.IDLE
+
+    # Case B: Opening the thumb immediately unlatches on frame 1 (even during an eligibility flap)
+    clf_b = Heuristic3DPinchClassifier(cfg)
+    for ts_ms, lms in seq:
+        clf_b.predict(lms, lms, "Right", ts_ms)
+        last_ts = ts_ms
+    open_frame = seq[0][1]
+    pred_open = clf_b.predict(open_frame, open_frame, "Right", last_ts + dt_ms)
+    assert pred_open.pose == PoseName.IDLE
+    assert clf_b.last_debug["Right"]["latched"] == []
+
+
+def test_spaces_only_mode_expires_stale_non_target_latches():
+    """P0.3: Entering spaces-only mode must immediately discard non-target latches so they
+    cannot survive past the 250ms state-gap reset and bypass approach gates later."""
+    cfg = load_config()["classifier"]["heuristic_3d"]
+    clf = Heuristic3DPinchClassifier(cfg)
+    dt_ms = 1000.0 / 30.0
+
+    # 1. Latch THUMB_MIDDLE_PINCH and hold past approach_window_ms (1500 ms) so ONLY the latch
+    #    is keeping the pose alive (the exact stale-latch scenario if spaces-only kept it).
+    mid_seq = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_MIDDLE_PINCH, open_frames=6, close_frames=6, hold_frames=50, fps=30.0
+    )
+    last_ts = 0.0
+    for ts_ms, lms in mid_seq:
+        p = clf.predict(lms, lms, "Right", ts_ms)
+        last_ts = ts_ms
+    assert p.pose == PoseName.THUMB_MIDDLE_PINCH
+    assert PoseName.THUMB_MIDDLE_PINCH in clf._hands["Right"].latched
+
+    # 2. Switch into spaces-only mode for 330 ms (> 250 ms gap reset)
+    upright_open = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_PINKY_BASE, open_frames=10, close_frames=1, hold_frames=1, fps=30.0
+    )[:10]
+    for _, lms in upright_open:
+        last_ts += dt_ms
+        clf.predict_only_pose(lms, lms, "Right", last_ts, only_pose=PoseName.THUMB_PINKY_BASE)
+        assert PoseName.THUMB_MIDDLE_PINCH not in clf._hands["Right"].latched
+        assert PoseName.THUMB_MIDDLE_PINCH not in clf._hands["Right"].latch_info
+
+    # 3. Return to normal mode with a static closed THUMB_MIDDLE_PINCH (no fresh open approach):
+    #    must be blocked by approach gate rather than riding a stale latch.
+    closed_mid = mid_seq[-1][1]
+    p_back = clf.predict(closed_mid, closed_mid, "Right", last_ts + dt_ms)
+    assert PoseName.THUMB_MIDDLE_PINCH not in clf._hands["Right"].latched
+    assert p_back.pose == PoseName.IDLE

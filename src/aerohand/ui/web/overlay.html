@@ -564,7 +564,7 @@
       if (guided.phase === "done") {
         root.className = "visible state-done";
         modeEl.textContent = colI18n.ov_guided_done || "DONE";
-        stepEl.textContent = `${guided.total_steps || 14} / ${guided.total_steps || 14}`;
+        stepEl.textContent = `${guided.total_steps || 19} / ${guided.total_steps || 19}`;
         titleEl.textContent = `✓ ${colI18n.ov_guided_done || "HOÀN THÀNH"}`;
         subEl.textContent = colI18n.ov_guided_done_sub || "";
         timerEl.textContent = "✓";
@@ -576,7 +576,7 @@
         modeEl.textContent = isRec
           ? (colI18n.ov_guided_rec || "RECORDING")
           : (colI18n.ov_guided_prep || "GET READY");
-        stepEl.textContent = `${isVi ? "Bước" : "Step"} ${(guided.step_index || 0) + 1} / ${guided.total_steps || 14}`;
+        stepEl.textContent = `${isVi ? "Bước" : "Step"} ${(guided.step_index || 0) + 1} / ${guided.total_steps || 19}`;
         const pLbl = poses[guided.pose] || guided.pose || "idle";
         titleEl.textContent = pLbl;
         subEl.textContent = isVi

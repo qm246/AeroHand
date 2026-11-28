@@ -7942,3 +7942,130 @@ def test_pointing_middle_shaft_click_not_blocked_by_fist_guard():
         if pred.pose == PoseName.THUMB_MIDDLE_PINCH and pred.probabilities[PoseName.THUMB_MIDDLE_PINCH] >= 0.75:
             hit_middle = True
     assert hit_middle is True
+
+
+@pytest.mark.parametrize("guard_mode", ["veto", "shadow", "heuristic"])
+def test_guarded_classifier_predict_only_pose_isolates_heuristic_and_feeds_onnx(guard_mode):
+    """P0.1: `GuardedClassifier.predict_only_pose` must forward `only_pose` to the heuristic
+    in heuristic/shadow/veto modes (keeping other poses' latches & open-history untouched) while
+    continuously feeding the ONNX temporal buffer in shadow and veto modes."""
+    from synth_hand import make_airpoint_ergonomic_sequence
+
+    from aerohand.ml.base import PinchPrediction
+    from aerohand.ml.onnx_classifier import GuardedClassifier
+
+    class _SpyOnnx:
+        def __init__(self, approve_pose: PoseName) -> None:
+            self.approve_pose = approve_pose
+            self.calls = 0
+
+        def reset(self, hand=None) -> None:
+            pass
+
+        def predict(self, landmarks_2d, world_landmarks, handedness, timestamp_ms):
+            self.calls += 1
+            probs = idle_probabilities()
+            # Emit high probability for approve_pose (and small noise on another pose to ensure masking)
+            probs[PoseName.IDLE] = 0.05
+            probs[self.approve_pose] = 0.90
+            probs[PoseName.THUMB_MIDDLE_PINCH] = 0.05
+            return PinchPrediction(self.approve_pose, probs, "high", ready=True, infer_ms=0.5, feature_ms=0.2)
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["enable_pointing_gate"] = True
+    cfg["cursor"]["pointing_forward_z_threshold"] = -0.15
+
+    heur = Heuristic3DPinchClassifier(cfg["classifier"]["heuristic_3d"])
+    spy_onnx = _SpyOnnx(PoseName.THUMB_PINKY_BASE)
+    guarded = GuardedClassifier(
+        spy_onnx,
+        heur,
+        mode=guard_mode,
+        veto_confirm_frames=2,
+        veto_min_prob=0.35,
+        veto_idle_prob=0.60,
+    )
+    eng = HandCursorEngine(cfg, classifier=guarded)
+    eng.anchor_cursor("Right", 960.0, 540.0)
+
+    seq = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_PINKY_BASE, open_frames=6, close_frames=4, hold_frames=14, fps=30.0
+    )
+    triggered_dirs = []
+    for idx, (ts, lms3d) in enumerate(seq):
+        dx = 0.008 * max(0, idx - 9)
+        lms_2d = [
+            Landmark(
+                max(0.05, min(0.95, lm.x + dx)),
+                max(0.05, min(0.95, lm.y)),
+                lm.z * 0.05,
+            )
+            for lm in lms3d
+        ]
+        outs = eng.process_frame(
+            [HandInput("Right", lms_2d, lms3d, confidence=0.98, timestamp_ms=int(round(ts)))],
+            ts,
+            1920.0,
+            1080.0,
+        )
+        assert outs[0].cursor.is_pointing is False
+        if outs[0].pose.spaces_nav_direction is not None:
+            triggered_dirs.append(outs[0].pose.spaces_nav_direction)
+
+    assert len(triggered_dirs) >= 1
+    expected_onnx_calls = 0 if guard_mode == "heuristic" else len(seq)
+    assert spy_onnx.calls == expected_onnx_calls
+
+    st = heur._hands.get("Right")
+    assert st is not None
+    # Non-target poses must NEVER have their open-history or latches polluted in spaces-only mode
+    for other_pose in (
+        PoseName.THUMB_INDEX_PINCH,
+        PoseName.THUMB_MIDDLE_PINCH,
+        PoseName.THUMB_RING_PINCH,
+        PoseName.THUMB_PINKY_PINCH,
+        PoseName.THUMB_INDEX_MIDDLE_PINCH,
+    ):
+        assert other_pose not in st.last_open_ms
+        assert other_pose not in st.last_shaft_open_ms
+        assert other_pose not in st.latched
+
+
+def test_collector_p0_copy_38px_and_tip_pinch_guided_variants():
+    """P0.4: Recall cue copy reflects 38 px threshold, guided protocol covers tip + shaft variants,
+    and canonical corpus target is 21k."""
+    from aerohand.core.types import ALL_POSE_NAMES
+    from aerohand.ml.collector import (
+        CORPUS_TOTAL_TARGET,
+        CUED_TRIGGER_SPECS,
+        HARD_NEGATIVE_GROUPS,
+        default_guided_steps,
+    )
+
+    assert CORPUS_TOTAL_TARGET == 21000
+    for trig in ("right_click", "scroll_stroke"):
+        spec = CUED_TRIGGER_SPECS[trig]
+        for key in ("instruction_en", "instruction_vi"):
+            txt = getattr(spec, key)
+            assert "38 px" in txt, f"Expected '38 px' in {trig}.{key}: {txt}"
+            assert "15 px" not in txt, f"Stale '15 px' left in {trig}.{key}: {txt}"
+
+    steps = default_guided_steps()
+    assert len(steps) == 19
+    poses = {s.pose for s in steps}
+    assert poses == set(ALL_POSE_NAMES)
+    hn_groups = {s.hard_negative_group for s in steps if s.hard_negative_group}
+    assert hn_groups == set(HARD_NEGATIVE_GROUPS)
+
+    # Every shaft-supported pinch class must have >=2 positive steps (ergonomic shaft/tuck + classic tip/MCP)
+    for pose in (
+        PoseName.THUMB_MIDDLE_PINCH,
+        PoseName.THUMB_RING_PINCH,
+        PoseName.THUMB_PINKY_PINCH,
+        PoseName.THUMB_PINKY_BASE,
+        PoseName.THUMB_INDEX_PINCH,
+    ):
+        matching = [s for s in steps if s.pose == pose]
+        assert len(matching) >= 2, f"Missing classic tip/MCP guided variant for {pose.value}"

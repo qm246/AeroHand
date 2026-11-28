@@ -48,8 +48,8 @@
 | 1 | **Di chuyển con trỏ** | Giơ **1 ngón trỏ** hướng màn hình (`dirZ < -0.15`), 3 ngón kia gập | Lọc One-Euro 2 tầng + bù khoảng cách + 60 Hz Lerp |
 | 2 | **Click trái / Double Click** | **1 ngón trỏ duỗi** → bấm nhanh **Ngón cái vào thân Ngón giữa** đang gập (`thumb_middle_pinch`) | Tách khỏi ngón trỏ → không làm lệch điểm ngắm |
 | 3 | **Kéo thả (Drag)** | Gập Áp út + Út → chụm giữ **3 ngón: Cái + Trỏ + Giữa** (`thumb_index_middle_pinch`) | Không bao giờ nhầm giữa bấm chậm và kéo thả |
-| 4 | **Chuột phải** | **2 ngón Trỏ + Giữa duỗi** → bấm **Cái vào thân Áp út** đang gập, giữ yên (`< 15 px`) rồi thả | Hành vi kép thông minh với Cuộn |
-| 5 | **Cuộn 2D quán tính** | **2 ngón Trỏ + Giữa duỗi** → bấm **Cái vào thân Áp út** và trượt (`>= 15 px`) | Khóa trục X/Y + Momentum Phase như Trackpad Apple |
+| 4 | **Chuột phải** | **2 ngón Trỏ + Giữa duỗi** → bấm **Cái vào thân Áp út** đang gập, giữ yên (`< 38 px`) rồi thả | Hành vi kép thông minh với Cuộn |
+| 5 | **Cuộn 2D quán tính** | **2 ngón Trỏ + Giữa duỗi** → bấm **Cái vào thân Áp út** và trượt (`>= 38 px`) | Khóa trục X/Y + Momentum Phase như Trackpad Apple |
 | 6 | **Đọc giọng nói (Dictation)** | Trỏ duỗi/cong nhẹ (3 ngón ngoài gập) → bấm giữ **Cái vào cạnh Trỏ** (`thumb_index_pinch`) để nói, thả để chèn chữ | Hỗ trợ Tiếng Việt có dấu (`vi-VN`) & Tiếng Anh (`en-US`) |
 | 7 | **Chia cửa sổ (Window Tile)** | **3 ngón Trỏ + Giữa + Áp út duỗi** (chỉ Út gập) → bấm **Cái vào Út**, vuốt Trái/Phải/Lên/Xuống rồi thả | Resize trực tiếp bằng `AXUIElement` + khung xem trước |
 | 8 | **Chuyển Space / Mission Control** | **4 ngón hơi duỗi/cong** → gập **Ngón cái vào lòng bàn tay** (`thumb_pinky_base`) và vuốt ngang / lên / xuống | Tương đương vuốt 4 ngón Trackpad (không cần rướn tới gốc út) |

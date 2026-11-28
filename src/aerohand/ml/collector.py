@@ -483,6 +483,10 @@ class PinchDataCollector:
         return self._cued_active
 
     @property
+    def is_guided_active(self) -> bool:
+        return self._guided_active
+
+    @property
     def is_recording(self) -> bool:
         return self._recording
 

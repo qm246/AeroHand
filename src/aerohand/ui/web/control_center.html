@@ -40,7 +40,8 @@
     padding: 36px 12px 14px;
     display: flex; flex-direction: column; gap: 4px;
   }
-  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 14px; }
+  .brand { display: flex; align-items: center; gap: 10px; padding: 4px 10px 14px; cursor: grab; user-select: none; -webkit-user-select: none; }
+  .brand:active { cursor: grabbing; }
   .brand-logo {
     width: 32px; height: 32px; border-radius: 9px;
     background: linear-gradient(135deg, #0ea5e9, #2dd4bf);
@@ -85,7 +86,9 @@
   .topbar {
     display: flex; align-items: center; justify-content: space-between;
     padding: 20px 24px 12px; border-bottom: 1px solid var(--border);
+    cursor: grab; user-select: none; -webkit-user-select: none;
   }
+  .topbar:active { cursor: grabbing; }
   .topbar-title h2 { font-size: 18px; font-weight: 700; letter-spacing: -0.2px; }
   .topbar-title p { font-size: 12px; color: var(--muted); }
   .status-badge {
@@ -130,6 +133,10 @@
   .btn.primary { background: linear-gradient(135deg, #14b8a6, #3b82f6); border-color: transparent; color: #04131c; }
   .btn.primary:hover { filter: brightness(1.08); }
   .btn.danger { background: rgba(251,113,133,0.14); border-color: rgba(251,113,133,0.35); color: var(--rose); }
+  .btn.recording {
+    background: rgba(251,113,133,0.22); border-color: rgba(251,113,133,0.65); color: #fda4af;
+    box-shadow: 0 0 18px rgba(251,113,133,0.24);
+  }
   .btn.sm { padding: 5px 10px; font-size: 11.5px; border-radius: 8px; }
 
   /* Stat Tiles */
@@ -463,7 +470,7 @@
         <div class="card">
           <div class="card-title"><span>KHUNG CAMERA NỔI (HOVER-FADE) & LỚP OVERLAY MÀN HÌNH</span></div>
           <div class="grid-2">
-            <div class="row"><div class="row-label"><strong>Vị trí góc màn hình</strong></div>
+            <div class="row"><div class="row-label"><strong id="lbl-hud-pos">Vị trí góc màn hình</strong><span id="sub-hud-pos">Kéo thả khung Camera tự do bằng chuột, hoặc chọn góc để đưa về nhanh</span></div>
               <select id="cfg-hud-pos" onchange="setKey('ui.camera_hud.position', this.value)">
                 <option value="bottom-right">Dưới - Phải</option>
                 <option value="bottom-left">Dưới - Trái</option>
@@ -645,7 +652,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
             <button class="btn danger" onclick="post('collector_clear')" id="btn-col-clear">🗑 Xóa tạm</button>
           </div>
           <div id="col-cued-banner" style="font-size:12.5px;font-weight:600;color:var(--amber);margin-bottom:6px;padding:8px 10px;border-radius:8px;background:rgba(251,191,36,0.10);border:1px solid rgba(251,191,36,0.28);display:none"></div>
-          <div id="col-guided-banner" style="font-size:12px;color:var(--teal);margin-bottom:6px;display:none"></div>
+          <div id="col-guided-banner" style="font-size:12.5px;font-weight:600;color:var(--teal);margin-bottom:6px;padding:8px 10px;border-radius:8px;background:rgba(45,212,191,0.10);border:1px solid rgba(45,212,191,0.30);display:none"></div>
+          <div id="col-manual-banner" style="font-size:12.5px;font-weight:600;color:var(--rose);margin-bottom:6px;padding:8px 10px;border-radius:8px;background:rgba(251,113,133,0.12);border:1px solid rgba(251,113,133,0.35);display:none"></div>
           <div id="col-quality-banner" style="font-size:11.5px;color:var(--green);margin-bottom:6px"></div>
           <div id="col-hold-hint" style="font-size:11px;color:var(--muted);margin-bottom:8px"></div>
           <div id="col-bars"></div>
@@ -1084,6 +1092,8 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
     document.getElementById("cfg-cam-mirror").checked = !!getPath(c, "camera.mirror", true);
     document.getElementById("cfg-hud-pos").value = getPath(c, "ui.camera_hud.position", "bottom-right");
     document.getElementById("cfg-hud-size").value = getPath(c, "ui.camera_hud.size", "medium");
+    setTxt("lbl-hud-pos", "Vị trí góc màn hình", "Corner Preset");
+    setTxt("sub-hud-pos", "Kéo thả khung Camera tự do bằng chuột, hoặc chọn góc để đưa về nhanh", "Drag the Camera HUD freely with your mouse, or pick a corner preset");
 
     document.getElementById("hud-sliders").innerHTML = [
       makeSliderRow("h-op", isVi ? "Độ mờ HUD khi rảnh" : "Camera HUD Idle Opacity", isVi ? "Tự sáng 100% khi rê chuột qua (kiểu Airpoint)" : "Auto-brightens on hover", "ui.camera_hud.opacity", 0.2, 1.0, 0.05, getPath(c, "ui.camera_hud.opacity", 0.55)),
@@ -1362,7 +1372,14 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       const col = snap.collector || {};
       const colI18n = i18n.collector || {};
       document.getElementById("col-total").textContent = (col.total || 0) + (isVi ? " mẫu" : " samples");
-      document.getElementById("btn-col-rec").textContent = col.recording ? (isVi ? "⏹ Dừng ghi mẫu" : "⏹ Stop Recording") : (isVi ? "⏺ Bắt đầu ghi mẫu" : "⏺ Start Recording");
+      const recBtn = document.getElementById("btn-col-rec");
+      const g = col.guided || {};
+      const cued = col.cued || {};
+      const manualActive = !!(col.recording && !g.active && !cued.active);
+      if (recBtn) {
+        recBtn.textContent = manualActive ? (isVi ? "⏹ Dừng ghi mẫu" : "⏹ Stop Recording") : (isVi ? "⏺ Bắt đầu ghi mẫu" : "⏺ Start Recording");
+        recBtn.classList.toggle("recording", manualActive);
+      }
 
       const badgeEl = document.getElementById("col-active-badge");
       if (badgeEl) {
@@ -1372,14 +1389,32 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
         badgeEl.style.color = col.recording ? "var(--rose)" : "var(--blue)";
       }
 
-      const g = col.guided || {};
       LAST_GUIDED_ACTIVE = !!g.active;
       const gBtn = document.getElementById("btn-col-guided");
-      if (gBtn) gBtn.textContent = g.active ? (colI18n.guided_stop || "⏹ Stop") : (colI18n.guided_start || "🎬 Guided");
-      const cued = col.cued || {};
+      if (gBtn) {
+        gBtn.textContent = g.active ? (colI18n.guided_stop || "⏹ Stop") : (colI18n.guided_start || "🎬 Guided");
+        gBtn.classList.toggle("recording", !!g.active);
+      }
       LAST_CUED_ACTIVE = !!cued.active;
       const cuedBtn = document.getElementById("btn-col-cued");
-      if (cuedBtn) cuedBtn.textContent = cued.active ? (colI18n.cued_stop || "⏹ Stop Cued") : (colI18n.cued_start || "🎯 Cued Recall");
+      if (cuedBtn) {
+        cuedBtn.textContent = cued.active ? (colI18n.cued_stop || "⏹ Stop Cued") : (colI18n.cued_start || "🎯 Cued Recall");
+        cuedBtn.classList.toggle("recording", !!cued.active);
+      }
+      const mBan = document.getElementById("col-manual-banner");
+      if (mBan) {
+        if (manualActive) {
+          const curPose = col.current_pose || "idle";
+          const pLbl = (i18n.poses && i18n.poses[curPose]) || curPose;
+          const cnt = (col.counts && col.counts[curPose]) || 0;
+          mBan.style.display = "block";
+          mBan.textContent = isVi
+            ? `⏺ ĐANG GHI THỦ CÔNG: ${pLbl} (${cnt} mẫu) — Bảng hướng dẫn đang hiển thị trên màn hình.`
+            : `⏺ RECORDING MANUAL: ${pLbl} (${cnt} samples) — Floating guide is active on screen.`;
+        } else {
+          mBan.style.display = "none";
+        }
+      }
       const cuedSaveBtn = document.getElementById("btn-col-cued-save");
       if (cuedSaveBtn) {
         cuedSaveBtn.style.display = (!cued.active && cued.has_unsaved) ? "inline-flex" : "none";
@@ -1551,6 +1586,15 @@ aerohand://open   |   aerohand://tracking/on   |   aerohand://tracking/off   |  
       if (chk) chk.textContent = done ? "✓" : "○";
     }
   };
+
+  // Allow dragging the window via JS bridge fallback on the header & sidebar brand
+  document.addEventListener("mousedown", (e) => {
+    if (e.button !== 0) return;
+    if (!e.target || !e.target.closest) return;
+    if (!e.target.closest(".topbar, .brand")) return;
+    if (e.target.closest("button, input, select, textarea, a, label")) return;
+    post("window_drag");
+  });
 
   // Notify Python bridge when page is ready
   window.addEventListener("DOMContentLoaded", () => post("ready"));

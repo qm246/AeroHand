@@ -723,45 +723,80 @@ class AeroHandRuntime:
         )
         return self._cached_saved_sessions
 
+    def _sync_collector_snapshot(self) -> Dict[str, Any]:
+        """Publish updated collector status into `_snapshot` immediately so UI/overlay reacts in <50ms."""
+        status = self.collector_status()
+        with self._snapshot_lock:
+            self._snapshot.collector = status
+            self._snapshot.dry_run = bool(self.dry_run)
+            self._snapshot.last_action = self._last_action_text
+        return status
+
     def collector_toggle_recording(self) -> Dict[str, Any]:
+        if self.collector.is_cued_active:
+            self.collector.stop_cued_session()
+            self._restore_cued_dry_run()
+        if self.collector.is_guided_active:
+            self.collector.stop_guided()
         active = self.collector.toggle_recording()
         if not active:
             self.collector.autosave_draft(self.collect_dir)
+        self._last_action_text = (
+            f"Manual recording started ({self.collector.current_pose.value})"
+            if active
+            else "Manual recording stopped"
+        )
+        logger.info(
+            f"[COLLECT] Manual recording {'ON' if active else 'OFF'} (pose={self.collector.current_pose.value})"
+        )
         self._refresh_saved_sessions_cache()
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def collector_set_recording(self, active: bool) -> Dict[str, Any]:
+        if active:
+            if self.collector.is_cued_active:
+                self.collector.stop_cued_session()
+                self._restore_cued_dry_run()
+            if self.collector.is_guided_active:
+                self.collector.stop_guided()
         was_rec = self.collector.is_recording
         self.collector.set_recording(active)
         if was_rec and not active:
             self.collector.autosave_draft(self.collect_dir)
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def collector_set_pose(self, pose_name: str) -> Dict[str, Any]:
         try:
             self.collector.set_pose(PoseName(pose_name))
         except ValueError:
             pass
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def collector_set_meta(self, meta: Dict[str, Any]) -> Dict[str, Any]:
         self.collector.set_session_meta(meta)
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def collector_undo(self, seconds: float = 5.0) -> Dict[str, Any]:
         removed = self.collector.undo_last(seconds=seconds)
         self._last_action_text = f"Undid {removed} samples"
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def collector_start_guided(self) -> Dict[str, Any]:
+        if self.collector.is_cued_active:
+            self.collector.stop_cued_session()
+            self._restore_cued_dry_run()
         now_ms = float(self._last_camera_ts_ms) if self._last_camera_ts_ms > 0 else None
         self.collector.start_guided(now_ms=now_ms)
-        return self.collector_status()
+        self._last_action_text = "Guided 14-step recording started"
+        logger.info("[COLLECT] Guided 14-step recording started.")
+        return self._sync_collector_snapshot()
 
     def collector_stop_guided(self) -> Dict[str, Any]:
         self.collector.stop_guided()
         self.collector.autosave_draft(self.collect_dir)
-        return self.collector_status()
+        self._last_action_text = "Guided recording stopped"
+        logger.info("[COLLECT] Guided recording stopped.")
+        return self._sync_collector_snapshot()
 
     def _restore_cued_dry_run(self) -> None:
         """Restore the pre-cued `dry_run` flag safely after stop, completion, error, or shutdown."""
@@ -799,7 +834,11 @@ class AeroHandRuntime:
             triggers=triggers,
         )
         self._last_action_text = "Cued recall recording started (Dry-Run)"
-        return self.collector_status()
+        logger.info(
+            f"[COLLECT] Cued recall started (hand={eff_hand}, cues_per_trigger={cues_per_trigger}, "
+            f"window_ms={window_ms}, gap_ms={gap_ms})"
+        )
+        return self._sync_collector_snapshot()
 
     def collector_stop_cued(self) -> Dict[str, Any]:
         self.collector.stop_cued_session()
@@ -809,7 +848,8 @@ class AeroHandRuntime:
             pass
         self._restore_cued_dry_run()
         self._last_action_text = "Cued recall recording stopped"
-        return self.collector_status()
+        logger.info("[COLLECT] Cued recall recording stopped.")
+        return self._sync_collector_snapshot()
 
     def collector_save_cued(self) -> Dict[str, Any]:
         if self.collector.is_cued_active:
@@ -817,7 +857,8 @@ class AeroHandRuntime:
         self._restore_cued_dry_run()
         out = self.collector.save_cued(self.recall_dir)
         self._last_action_text = f"Saved cued session: {out.name}"
-        st = self.collector_status()
+        logger.info(f"[COLLECT] Saved cued recall session -> {out}")
+        st = self._sync_collector_snapshot()
         st["saved"] = True
         st["saved_path"] = str(out)
         return st
@@ -828,14 +869,14 @@ class AeroHandRuntime:
         except QualityGateError as exc:
             self._collector_last_save_error = list(exc.warnings)
             self._last_action_text = f"Save blocked ({', '.join(exc.warnings)})"
-            st = self.collector_status()
+            st = self._sync_collector_snapshot()
             st["saved"] = False
             st["blocked_warnings"] = list(exc.warnings)
             return st
         self._collector_last_save_error = None
         self._last_action_text = f"Saved dataset: {out.name}"
         self._refresh_saved_sessions_cache()
-        st = self.collector_status()
+        st = self._sync_collector_snapshot()
         st["saved"] = True
         st["saved_path"] = str(out)
         return st
@@ -844,7 +885,7 @@ class AeroHandRuntime:
         self._collector_last_save_error = None
         self.collector.clear()
         self._refresh_saved_sessions_cache()
-        return self.collector_status()
+        return self._sync_collector_snapshot()
 
     def mark_deliberate_gesture(self, timestamp_ms: Optional[int] = None, *, note: str = "") -> Dict[str, Any]:
         """Mark a deliberate gesture during `--passive-record` (+/-1.5s excluded from idle exposure; NEVER for FT)."""
@@ -1678,6 +1719,7 @@ class AeroHandRuntime:
                 if (
                     is_idle
                     and not self.collector.is_recording
+                    and not self.collector.is_guided_active
                     and not self.collector.is_cued_active
                     and self.passive_recorder is None
                 ):

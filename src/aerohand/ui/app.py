@@ -235,6 +235,170 @@ _HUD_SIZES = {
 }
 
 
+def compute_camera_hud_rect(
+    hud_cfg: Dict[str, Any],
+    visible_frames: Sequence[Tuple[float, float, float, float]],
+    main_visible_frame: Tuple[float, float, float, float],
+) -> Tuple[float, float, float, float]:
+    """
+    Compute the Cocoa `(x, y, w, h)` rect for the Floating Camera HUD.
+    - If `custom_x` and `custom_y` are saved (user dragged the HUD), keep that position
+      and clamp it onto the nearest connected display's `visibleFrame`.
+    - Otherwise place it at the configured corner preset on `main_visible_frame`.
+    """
+    size_key = str(hud_cfg.get("size", "medium"))
+    pw, ph = _HUD_SIZES.get(size_key, (300, 210))
+    raw_cx = hud_cfg.get("custom_x")
+    raw_cy = hud_cfg.get("custom_y")
+    if (
+        raw_cx is not None
+        and raw_cy is not None
+        and not isinstance(raw_cx, bool)
+        and not isinstance(raw_cy, bool)
+    ):
+        try:
+            cx = float(raw_cx)
+            cy = float(raw_cy)
+        except (TypeError, ValueError):
+            cx = cy = None  # type: ignore[assignment]
+        if cx is not None and cy is not None:
+            frames = list(visible_frames) if visible_frames else [main_visible_frame]
+            mid_x = cx + pw * 0.5
+            mid_y = cy + ph * 0.5
+            best_sf = frames[0]
+            best_d2 = float("inf")
+            for sf in frames:
+                sx, sy, sw, sh = sf
+                clx = min(max(mid_x, sx), sx + sw)
+                cly = min(max(mid_y, sy), sy + sh)
+                d2 = (mid_x - clx) ** 2 + (mid_y - cly) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_sf = sf
+            sx, sy, sw, sh = best_sf
+            x = min(max(cx, sx), max(sx, sx + sw - pw))
+            y = min(max(cy, sy), max(sy, sy + sh - ph))
+            return (float(x), float(y), float(pw), float(ph))
+
+    pos = str(hud_cfg.get("position", "bottom-right"))
+    sx, sy, sw, sh = main_visible_frame
+    pad = 22.0
+    x = sx + pad if "left" in pos else (sx + sw - pw - pad)
+    y = sy + pad if "bottom" in pos else (sy + sh - ph - pad)
+    return (float(x), float(y), float(pw), float(ph))
+
+
+def _rect_contains_pt(rect: Tuple[float, float, float, float], x: float, y: float) -> bool:
+    rx, ry, rw, rh = rect
+    return (rx <= x <= rx + rw) and (ry <= y <= ry + rh)
+
+
+def resolve_active_overlay_index(
+    quartz_rects: Sequence[Tuple[float, float, float, float]],
+    cursor_x: float,
+    cursor_y: float,
+    hands_count: int,
+    fallback_point: Optional[Tuple[float, float]] = None,
+) -> int:
+    """Resolve which display index should receive cursor-bound hints/toasts."""
+    if not quartz_rects:
+        return 0
+    if hands_count > 0:
+        for idx, rect in enumerate(quartz_rects):
+            if _rect_contains_pt(rect, cursor_x, cursor_y):
+                return idx
+    if fallback_point is not None:
+        fx, fy = fallback_point
+        for idx, rect in enumerate(quartz_rects):
+            if _rect_contains_pt(rect, fx, fy):
+                return idx
+    for idx, rect in enumerate(quartz_rects):
+        if _rect_contains_pt(rect, cursor_x, cursor_y):
+            return idx
+    return 0
+
+
+def build_overlay_snap_payloads(
+    quartz_rects: Sequence[Tuple[float, float, float, float]],
+    snap: RuntimeSnapshot,
+    has_collector_overlay: bool,
+    compact_collector: Optional[Dict[str, Any]],
+    *,
+    fallback_point: Optional[Tuple[float, float]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Build per-display overlay snapshot payloads.
+    - Pointer/click/tile/palm-wheel visuals route to the display containing their Quartz coordinates.
+    - When ML Studio recording is active (`has_collector_overlay`), `collector_guide` is mirrored
+      onto EVERY display so the floating teleprompter is always visible on multi-monitor setups
+      even when no hand is currently in front of the camera.
+    """
+    if not quartz_rects:
+        return []
+    active_idx = resolve_active_overlay_index(
+        quartz_rects,
+        float(snap.cursor_x),
+        float(snap.cursor_y),
+        int(snap.hands_count),
+        fallback_point=fallback_point,
+    )
+    single_display = len(quartz_rects) == 1
+    out: List[Dict[str, Any]] = []
+    for idx, q_rect in enumerate(quartz_rects):
+        qx, qy, _qw, _qh = q_rect
+        is_active_panel = single_display or (idx == active_idx)
+
+        local_click = None
+        if snap.click_event is not None and (
+            single_display
+            or _rect_contains_pt(q_rect, float(snap.click_event["x"]), float(snap.click_event["y"]))
+        ):
+            local_click = dict(snap.click_event)
+            local_click["x"] = round(float(snap.click_event["x"]) - qx, 1)
+            local_click["y"] = round(float(snap.click_event["y"]) - qy, 1)
+
+        local_tile = None
+        if snap.window_tile_preview is not None:
+            tcx = float(snap.window_tile_preview["x"]) + float(snap.window_tile_preview["w"]) * 0.5
+            tcy = float(snap.window_tile_preview["y"]) + float(snap.window_tile_preview["h"]) * 0.5
+            if single_display or _rect_contains_pt(q_rect, tcx, tcy):
+                local_tile = dict(snap.window_tile_preview)
+                local_tile["x"] = round(float(snap.window_tile_preview["x"]) - qx, 1)
+                local_tile["y"] = round(float(snap.window_tile_preview["y"]) - qy, 1)
+
+        local_wheels = []
+        for pw in snap.palm_wheels:
+            px_w = float(pw.get("cursor_x", snap.cursor_x))
+            py_w = float(pw.get("cursor_y", snap.cursor_y))
+            if (
+                single_display
+                or _rect_contains_pt(q_rect, px_w, py_w)
+                or (
+                    is_active_panel
+                    and not any(_rect_contains_pt(r2, px_w, py_w) for r2 in quartz_rects)
+                )
+            ):
+                pw_local = dict(pw)
+                pw_local["cursor_x"] = round(px_w - qx, 1)
+                pw_local["cursor_y"] = round(py_w - qy, 1)
+                local_wheels.append(pw_local)
+
+        out.append(
+            {
+                "click_event_seq": snap.click_event_seq if local_click is not None else 0,
+                "click_event": local_click,
+                "palm_wheels": local_wheels,
+                "window_tile_preview": local_tile,
+                "active_hint": snap.active_hint if is_active_panel else None,
+                "active_hint_text": snap.active_hint_text if is_active_panel else None,
+                "warning": snap.warning if is_active_panel else None,
+                "dictation": snap.dictation if is_active_panel else {},
+                "collector_guide": compact_collector if has_collector_overlay else None,
+            }
+        )
+    return out
+
+
 def _acquire_single_instance() -> bool:
     global _LOCK_FD
     lock_fp = _lock_path()
@@ -318,18 +482,73 @@ def _to_py(obj: Any) -> Any:
     return str(obj)
 
 
-class HoverCameraView(AppKit.NSView):
-    """NSView hosting the Floating Camera HUD with smooth Airpoint-style hover opacity."""
+class WindowDragView(AppKit.NSView):
+    """Transparent native drag region overlaid on full-bleed WKWebView titlebars."""
 
-    def initWithFrame_idleAlpha_hoverAlpha_(self, frame, idle_alpha: float, hover_alpha: float):
+    def acceptsFirstMouse_(self, _event) -> bool:
+        return True
+
+    def mouseDownCanMoveWindow(self) -> bool:
+        return True
+
+    def mouseDown_(self, event) -> None:
+        win = self.window()
+        if win is not None:
+            win.performWindowDragWithEvent_(event)
+
+
+class NonInteractiveImageView(AppKit.NSImageView):
+    """NSImageView that passes mouse events through to its parent HoverCameraView for dragging."""
+
+    def hitTest_(self, _point):
+        return None
+
+
+class HoverCameraView(AppKit.NSView):
+    """NSView hosting the Floating Camera HUD with smooth hover opacity and free mouse dragging."""
+
+    def initWithFrame_idleAlpha_hoverAlpha_onMoved_(
+        self,
+        frame,
+        idle_alpha: float,
+        hover_alpha: float,
+        on_moved: Optional[Callable[[float, float], None]] = None,
+    ):
         self = objc.super(HoverCameraView, self).initWithFrame_(frame)
         if self is None:
             return None
         self._idle_alpha = float(idle_alpha)
         self._hover_alpha = float(hover_alpha)
+        self._on_moved = on_moved
         self._tracking_area = None
         self._hovered = False
         return self
+
+    def acceptsFirstMouse_(self, _event) -> bool:
+        return True
+
+    def mouseDownCanMoveWindow(self) -> bool:
+        return True
+
+    def resetCursorRects(self) -> None:
+        objc.super(HoverCameraView, self).resetCursorRects()
+        self.addCursorRect_cursor_(self.bounds(), AppKit.NSCursor.openHandCursor())
+
+    def mouseDown_(self, event) -> None:
+        win = self.window()
+        if win is None:
+            return
+        AppKit.NSCursor.closedHandCursor().push()
+        try:
+            win.performWindowDragWithEvent_(event)
+        finally:
+            AppKit.NSCursor.pop()
+        if self._on_moved is not None:
+            try:
+                f = win.frame()
+                self._on_moved(float(f.origin.x), float(f.origin.y))
+            except Exception as exc:
+                logger.debug(f"[HUD] Failed persisting dragged HUD origin: {exc}")
 
     def setAlphas_(self, pair) -> None:
         self._idle_alpha = float(pair[0])
@@ -382,22 +601,34 @@ class WebBridgeHandler(AppKit.NSObject):
                 if isinstance(body, dict):
                     self._callback(body)
             except Exception as exc:
-                logger.debug(f"[BRIDGE] Failed handling JS message: {exc}")
+                logger.exception(f"[BRIDGE] Failed handling JS message: {exc}")
 
 
 class OverlayNavigationDelegate(AppKit.NSObject):
-    """WKNavigationDelegate that auto-reloads overlay.html if macOS terminates WebContent."""
+    """WKNavigationDelegate that marks overlay WebViews ready and auto-reloads if WebContent crashes."""
 
-    def initWithCallback_(self, callback: Callable[[Any], None]):
+    def initWithTerminateCallback_finishCallback_(
+        self,
+        on_terminated: Callable[[Any], None],
+        on_finished: Optional[Callable[[Any], None]] = None,
+    ):
         self = objc.super(OverlayNavigationDelegate, self).init()
         if self is None:
             return None
-        self._callback = callback
+        self._on_terminated = on_terminated
+        self._on_finished = on_finished
         return self
+
+    def webView_didFinishNavigation_(self, webview, _navigation) -> None:
+        if self._on_finished is not None:
+            try:
+                self._on_finished(webview)
+            except Exception as exc:
+                logger.warning(f"[OVERLAY] Navigation finish callback failed: {exc}")
 
     def webViewWebContentProcessDidTerminate_(self, webview) -> None:
         try:
-            self._callback(webview)
+            self._on_terminated(webview)
         except Exception as exc:
             logger.warning(f"[OVERLAY] WebContent recovery callback failed: {exc}")
 
@@ -421,6 +652,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self._overlay_nav_delegate = None
         self._overlay_screen_signature: Tuple[Tuple[int, int, int, int], ...] = ()
         self._overlay_had_visuals: bool = False
+        self._overlay_collector_was_active: bool = False
         self._screen_geom = ScreenGeometry()
         self.camera_panel = None
         self.camera_container = None
@@ -664,6 +896,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
         win.setTitle_("AeroHand Control Center")
         win.setTitlebarAppearsTransparent_(True)
         win.setTitleVisibility_(AppKit.NSWindowTitleHidden)
+        win.setMovable_(True)
+        win.setMovableByWindowBackground_(True)
         win.setReleasedWhenClosed_(False)
         win.setMinSize_(Foundation.NSMakeSize(780, 560))
         try:
@@ -676,6 +910,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
         self._bridge_handler = WebBridgeHandler.alloc().initWithCallback_(self._on_js_message)
         ucc.addScriptMessageHandler_name_(self._bridge_handler, "aerohand")
         wk_cfg.setUserContentController_(ucc)
+
+        root_view = AppKit.NSView.alloc().initWithFrame_(Foundation.NSMakeRect(0, 0, w, h))
+        root_view.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
 
         wv = WebKit.WKWebView.alloc().initWithFrame_configuration_(
             Foundation.NSMakeRect(0, 0, w, h), wk_cfg
@@ -690,8 +927,29 @@ class AeroHandAppDelegate(AppKit.NSObject):
         file_url = Foundation.NSURL.fileURLWithPath_(str(html_path))
         dir_url = Foundation.NSURL.fileURLWithPath_(str(html_path.parent))
         wv.loadFileURL_allowingReadAccessToURL_(file_url, dir_url)
+        root_view.addSubview_(wv)
 
-        win.setContentView_(wv)
+        # Native transparent drag regions over the hidden titlebar, main header (.topbar),
+        # and sidebar brand header (.brand), staying clear of traffic lights and resize edges.
+        drag_top = WindowDragView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(78, h - 30, w - 84, 26)
+        )
+        drag_top.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin)
+        root_view.addSubview_(drag_top)
+
+        drag_topbar = WindowDragView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(214, h - 68, w - 220, 64)
+        )
+        drag_topbar.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewMinYMargin)
+        root_view.addSubview_(drag_topbar)
+
+        drag_brand = WindowDragView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(6, h - 80, 204, 48)
+        )
+        drag_brand.setAutoresizingMask_(AppKit.NSViewMaxXMargin | AppKit.NSViewMinYMargin)
+        root_view.addSubview_(drag_brand)
+
+        win.setContentView_(root_view)
         self.window = win
         self.control_webview = wv
 
@@ -727,8 +985,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
             if self._overlay_bridge_handler is None:
                 self._overlay_bridge_handler = WebBridgeHandler.alloc().initWithCallback_(self._on_js_message)
             if self._overlay_nav_delegate is None:
-                self._overlay_nav_delegate = OverlayNavigationDelegate.alloc().initWithCallback_(
-                    self._on_overlay_webcontent_terminated
+                self._overlay_nav_delegate = OverlayNavigationDelegate.alloc().initWithTerminateCallback_finishCallback_(
+                    self._on_overlay_webcontent_terminated,
+                    self._on_overlay_did_finish_navigation,
                 )
 
             raw_frames: List[Tuple[float, float, float, float]] = []
@@ -741,7 +1000,9 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 panel = AppKit.NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
                     sf, style, AppKit.NSBackingStoreBuffered, False
                 )
+                panel.setFrame_display_(sf, False)
                 panel.setLevel_(AppKit.NSScreenSaverWindowLevel)
+                panel.setHidesOnDeactivate_(False)
                 panel.setOpaque_(False)
                 panel.setBackgroundColor_(AppKit.NSColor.clearColor())
                 panel.setHasShadow_(False)
@@ -781,11 +1042,23 @@ class AeroHandAppDelegate(AppKit.NSObject):
                 )
 
             self._overlay_screen_signature = screen_frames_signature(raw_frames)
+            logger.info(
+                f"[OVERLAY] Built {len(self._overlay_entries)} per-display overlay panel(s): "
+                f"{[e['quartz_rect'] for e in self._overlay_entries]}"
+            )
             if self._overlay_entries:
                 prim = next((e for e in self._overlay_entries if e["is_primary"]), self._overlay_entries[0])
                 self.overlay_panel = prim["panel"]
                 self.overlay_webview = prim["webview"]
                 self._overlay_ready = True
+
+    def _on_overlay_did_finish_navigation(self, webview: Any) -> None:
+        for entry in self._overlay_entries:
+            if entry["webview"] is webview:
+                if not entry.get("ready", False):
+                    entry["ready"] = True
+                    entry["payload_builder"].reset()
+                break
 
     def _on_overlay_webcontent_terminated(self, webview: Any) -> None:
         logger.warning("[OVERLAY] WKWebView WebContent process terminated; self-healing reload triggered.")
@@ -841,17 +1114,32 @@ class AeroHandAppDelegate(AppKit.NSObject):
 
     def _compute_camera_hud_frame(self) -> Any:
         hud_cfg = ((self.config.get("ui") or {}).get("camera_hud")) or {}
-        size_key = str(hud_cfg.get("size", "medium"))
-        pw, ph = _HUD_SIZES.get(size_key, (300, 210))
-        self._hud_size_px = (pw, ph)
-        pos = str(hud_cfg.get("position", "bottom-right"))
-
-        screen = AppKit.NSScreen.mainScreen()
-        sf = screen.visibleFrame() if screen else Foundation.NSMakeRect(0, 0, 1440, 900)
-        pad = 22.0
-        x = sf.origin.x + pad if "left" in pos else (sf.origin.x + sf.size.width - pw - pad)
-        y = sf.origin.y + pad if "bottom" in pos else (sf.origin.y + sf.size.height - ph - pad)
+        screens = list(AppKit.NSScreen.screens() or [])
+        visible_frames = [
+            (
+                float(sc.visibleFrame().origin.x),
+                float(sc.visibleFrame().origin.y),
+                float(sc.visibleFrame().size.width),
+                float(sc.visibleFrame().size.height),
+            )
+            for sc in screens
+        ]
+        main_sc = AppKit.NSScreen.mainScreen()
+        if main_sc is not None:
+            msf = main_sc.visibleFrame()
+            main_vf = (float(msf.origin.x), float(msf.origin.y), float(msf.size.width), float(msf.size.height))
+        elif visible_frames:
+            main_vf = visible_frames[0]
+        else:
+            main_vf = (0.0, 0.0, 1440.0, 900.0)
+        x, y, pw, ph = compute_camera_hud_rect(hud_cfg, visible_frames, main_vf)
+        self._hud_size_px = (int(round(pw)), int(round(ph)))
         return Foundation.NSMakeRect(x, y, pw, ph)
+
+    def _on_camera_hud_moved(self, x: float, y: float) -> None:
+        set_nested_key(self.config, "ui.camera_hud.custom_x", round(float(x), 1))
+        set_nested_key(self.config, "ui.camera_hud.custom_y", round(float(y), 1))
+        self._persister.schedule(self.config)
 
     def _build_floating_camera_panel(self) -> None:
         rect = self._compute_camera_hud_frame()
@@ -865,9 +1153,11 @@ class AeroHandAppDelegate(AppKit.NSObject):
             rect, style, AppKit.NSBackingStoreBuffered, False
         )
         panel.setLevel_(AppKit.NSFloatingWindowLevel)
+        panel.setHidesOnDeactivate_(False)
         panel.setOpaque_(False)
         panel.setBackgroundColor_(AppKit.NSColor.clearColor())
         panel.setHasShadow_(True)
+        panel.setMovable_(True)
         panel.setMovableByWindowBackground_(True)
         panel.setAlphaValue_(idle_op)
         panel.setCollectionBehavior_(
@@ -875,8 +1165,8 @@ class AeroHandAppDelegate(AppKit.NSObject):
             | AppKit.NSWindowCollectionBehaviorFullScreenAuxiliary
         )
 
-        container = HoverCameraView.alloc().initWithFrame_idleAlpha_hoverAlpha_(
-            Foundation.NSMakeRect(0, 0, pw, ph), idle_op, hover_op
+        container = HoverCameraView.alloc().initWithFrame_idleAlpha_hoverAlpha_onMoved_(
+            Foundation.NSMakeRect(0, 0, pw, ph), idle_op, hover_op, self._on_camera_hud_moved
         )
         container.setWantsLayer_(True)
         container.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
@@ -887,7 +1177,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         layer.setBorderColor_(AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.18, 0.84, 0.75, 0.55).CGColor())
         layer.setBackgroundColor_(AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(0.05, 0.08, 0.13, 0.94).CGColor())
 
-        img_view = AppKit.NSImageView.alloc().initWithFrame_(Foundation.NSMakeRect(0, 0, pw, ph))
+        img_view = NonInteractiveImageView.alloc().initWithFrame_(Foundation.NSMakeRect(0, 0, pw, ph))
         img_view.setAutoresizingMask_(AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
         img_view.setImageScaling_(AppKit.NSImageScaleAxesIndependently)
         container.addSubview_(img_view)
@@ -954,11 +1244,23 @@ class AeroHandAppDelegate(AppKit.NSObject):
             for entry in self._overlay_entries:
                 entry["ready"] = True
                 entry["payload_builder"].reset()
+        elif act == "window_drag":
+            ev = AppKit.NSApp.currentEvent()
+            if ev is not None and self.window is not None:
+                try:
+                    self.window.performWindowDragWithEvent_(ev)
+                except Exception as exc:
+                    logger.debug(f"[UI] JS-triggered window_drag ignored: {exc}")
         elif act == "set_key":
             key = str(msg.get("key", ""))
             val = msg.get("value")
             if key:
                 set_nested_key(self.config, key, val)
+                if key == "ui.camera_hud.position":
+                    hud_cfg = (self.config.get("ui") or {}).get("camera_hud")
+                    if isinstance(hud_cfg, dict):
+                        hud_cfg.pop("custom_x", None)
+                        hud_cfg.pop("custom_y", None)
                 need_rehydrate = (
                     key in ("ui.language", "hand.gesture_preset")
                     or key.startswith("palm_wheel.bindings.")
@@ -1001,24 +1303,30 @@ class AeroHandAppDelegate(AppKit.NSObject):
         elif act == "collector_toggle":
             if self.runtime is not None:
                 self.runtime.collector_toggle_recording()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_set_recording":
             if self.runtime is not None:
                 self.runtime.collector_set_recording(bool(msg.get("active", False)))
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_pose":
             if self.runtime is not None:
                 self.runtime.collector_set_pose(str(msg.get("pose", "idle")))
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_meta":
             if self.runtime is not None and isinstance(msg.get("meta"), dict):
                 self.runtime.collector_set_meta(msg["meta"])
         elif act == "collector_undo":
             if self.runtime is not None:
                 self.runtime.collector_undo(float(msg.get("seconds", 5.0)))
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_guided_start":
             if self.runtime is not None:
                 self.runtime.collector_start_guided()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_guided_stop":
             if self.runtime is not None:
                 self.runtime.collector_stop_guided()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_cued_start":
             if self.runtime is not None:
                 self.runtime.collector_start_cued(
@@ -1028,18 +1336,23 @@ class AeroHandAppDelegate(AppKit.NSObject):
                     gap_ms=int(msg.get("gap_ms", 1800)),
                     seed=msg.get("seed"),
                 )
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_cued_stop":
             if self.runtime is not None:
                 self.runtime.collector_stop_cued()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_cued_save":
             if self.runtime is not None:
                 self.runtime.collector_save_cued()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_save":
             if self.runtime is not None:
                 self.runtime.collector_save(allow_low_quality=bool(msg.get("allow_low_quality", False)))
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "collector_clear":
             if self.runtime is not None:
                 self.runtime.collector_clear()
+                self._on_ui_tick_inner(force_control_telemetry=True)
         elif act == "classifier_rearm":
             if self.runtime is not None:
                 self.runtime.rearm_classifier()
@@ -1073,7 +1386,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         with objc.autorelease_pool():
             self._on_ui_tick_inner()
 
-    def _on_ui_tick_inner(self) -> None:
+    def _on_ui_tick_inner(self, *, force_control_telemetry: bool = False) -> None:
         self._tick_count += 1
 
         while not self._ui_queue.empty():
@@ -1127,7 +1440,7 @@ class AeroHandAppDelegate(AppKit.NSObject):
         mtxt = pack.get("menu") or {}
 
         # 1. Menu Bar title & localized labels (at 5 Hz to minimize AppKit layout churn)
-        if (self._tick_count % 4) == 0 or self._tick_count == 1:
+        if ((self._tick_count % 4) == 0 or self._tick_count == 1) and self.status_item is not None:
             btn = self.status_item.button()
             if btn is not None:
                 if snap.paused:
@@ -1168,92 +1481,64 @@ class AeroHandAppDelegate(AppKit.NSObject):
         if self._overlay_ready and self._overlay_entries:
             self._last_click_dispatched_seq = snap.click_event_seq
             ui_cfg = self.config.get("ui") or {}
-            active_idx = 0
-            for idx, entry in enumerate(self._overlay_entries):
-                if self._rect_contains(entry["quartz_rect"], snap.cursor_x, snap.cursor_y):
-                    active_idx = idx
-                    break
-            single_display = len(self._overlay_entries) == 1
-            for idx, entry in enumerate(self._overlay_entries):
+            if has_collector_overlay and not self._overlay_collector_was_active:
+                for entry in self._overlay_entries:
+                    try:
+                        entry["panel"].orderFrontRegardless()
+                    except Exception:
+                        pass
+            self._overlay_collector_was_active = has_collector_overlay
+
+            fallback_pt: Optional[Tuple[float, float]] = None
+            if snap.hands_count == 0:
+                if window_visible and self.window is not None:
+                    wf = self.window.frame()
+                    q_win = self._screen_geom.to_quartz_rect(
+                        (float(wf.origin.x), float(wf.origin.y), float(wf.size.width), float(wf.size.height))
+                    )
+                    fallback_pt = (q_win[0] + q_win[2] * 0.5, q_win[1] + q_win[3] * 0.5)
+                else:
+                    try:
+                        ml = AppKit.NSEvent.mouseLocation()
+                        q_m = self._screen_geom.to_quartz_rect((float(ml.x), float(ml.y), 1.0, 1.0))
+                        fallback_pt = (q_m[0], q_m[1])
+                    except Exception:
+                        pass
+
+            compact_collector = None
+            if has_collector_overlay:
+                compact_collector = {
+                    "recording": bool(col_snap.get("recording", False)),
+                    "current_pose": col_snap.get("current_pose", "idle"),
+                    "total": int(col_snap.get("total", 0)),
+                    "counts": col_snap.get("counts") or {},
+                    "session_meta": col_snap.get("session_meta") or {},
+                    "guided": col_guided,
+                    "cued": col_cued,
+                    "hand": snap.hand,
+                    "hands_count": int(snap.hands_count),
+                    "live_pose": snap.active_pose or snap.pose,
+                }
+
+            quartz_rects = [e["quartz_rect"] for e in self._overlay_entries]
+            snap_payloads = build_overlay_snap_payloads(
+                quartz_rects,
+                snap,
+                has_collector_overlay,
+                compact_collector,
+                fallback_point=fallback_pt,
+            )
+            for entry, snap_payload in zip(self._overlay_entries, snap_payloads):
                 if not entry.get("ready", False):
                     continue
-                qx, qy, _qw, _qh = entry["quartz_rect"]
-                is_active_panel = single_display or (idx == active_idx)
-
-                local_click = None
-                if snap.click_event is not None and (
-                    single_display
-                    or self._rect_contains(
-                        entry["quartz_rect"], float(snap.click_event["x"]), float(snap.click_event["y"])
-                    )
-                ):
-                    local_click = dict(snap.click_event)
-                    local_click["x"] = round(float(snap.click_event["x"]) - qx, 1)
-                    local_click["y"] = round(float(snap.click_event["y"]) - qy, 1)
-
-                local_tile = None
-                if snap.window_tile_preview is not None:
-                    tcx = float(snap.window_tile_preview["x"]) + float(snap.window_tile_preview["w"]) * 0.5
-                    tcy = float(snap.window_tile_preview["y"]) + float(snap.window_tile_preview["h"]) * 0.5
-                    if single_display or self._rect_contains(entry["quartz_rect"], tcx, tcy):
-                        local_tile = dict(snap.window_tile_preview)
-                        local_tile["x"] = round(float(snap.window_tile_preview["x"]) - qx, 1)
-                        local_tile["y"] = round(float(snap.window_tile_preview["y"]) - qy, 1)
-
-                local_wheels = []
-                for pw in snap.palm_wheels:
-                    px_w = float(pw.get("cursor_x", snap.cursor_x))
-                    py_w = float(pw.get("cursor_y", snap.cursor_y))
-                    if (
-                        single_display
-                        or self._rect_contains(entry["quartz_rect"], px_w, py_w)
-                        or (
-                            is_active_panel
-                            and not any(
-                                self._rect_contains(e2["quartz_rect"], px_w, py_w)
-                                for e2 in self._overlay_entries
-                            )
-                        )
-                    ):
-                        pw_local = dict(pw)
-                        pw_local["cursor_x"] = round(px_w - qx, 1)
-                        pw_local["cursor_y"] = round(py_w - qy, 1)
-                        local_wheels.append(pw_local)
-
-                compact_collector = None
-                if is_active_panel and has_collector_overlay:
-                    compact_collector = {
-                        "recording": bool(col_snap.get("recording", False)),
-                        "current_pose": col_snap.get("current_pose", "idle"),
-                        "total": int(col_snap.get("total", 0)),
-                        "counts": col_snap.get("counts") or {},
-                        "session_meta": col_snap.get("session_meta") or {},
-                        "guided": col_guided,
-                        "cued": col_cued,
-                        "hand": snap.hand,
-                        "hands_count": int(snap.hands_count),
-                        "live_pose": snap.active_pose or snap.pose,
-                    }
-
-                snap_payload = {
-                    "click_event_seq": snap.click_event_seq if local_click is not None else 0,
-                    "click_event": local_click,
-                    "palm_wheels": local_wheels,
-                    "window_tile_preview": local_tile,
-                    "active_hint": snap.active_hint if is_active_panel else None,
-                    "active_hint_text": snap.active_hint_text if is_active_panel else None,
-                    "warning": snap.warning if is_active_panel else None,
-                    "dictation": snap.dictation if is_active_panel else {},
-                    "collector_guide": compact_collector,
-                }
                 builder: OverlayPayloadBuilder = entry["payload_builder"]
                 ov_payload = builder.build(snap_payload, ui_cfg, lang, pack)
                 js_ov = f"window.updateOverlay && window.updateOverlay({json.dumps(ov_payload, ensure_ascii=False)});"
                 entry["webview"].evaluateJavaScript_completionHandler_(js_ov, None)
 
-        # 4. Control Center telemetry (10 Hz, only when window visible)
+        # 4. Control Center telemetry (10 Hz, or immediate on user button click when window visible)
         if (
-            (self._tick_count % 2) == 0
+            (force_control_telemetry or (self._tick_count % 2) == 0)
             and self._control_ready
             and self.control_webview is not None
             and window_visible

@@ -7679,3 +7679,97 @@ def test_ax_window_tile_never_mutates_own_process_off_main_thread(monkeypatch):
     assert focused_win_queries == []
     assert results["direct_set"] is False
     assert ax_set_calls == []
+
+
+def test_camera_hud_custom_position_preserved_and_clamped_multimonitor():
+    from aerohand.ui.app import compute_camera_hud_rect
+
+    main_vf = (0.0, 0.0, 1728.0, 1084.0)
+    ext_vf = (-1920.0, 37.0, 1920.0, 1080.0)
+    screens = [main_vf, ext_vf]
+
+    # Default corner preset (bottom-right on main screen)
+    x, y, w, h = compute_camera_hud_rect({"size": "medium", "position": "bottom-right"}, screens, main_vf)
+    assert (w, h) == (300.0, 210.0)
+    assert x == pytest.approx(1728.0 - 300.0 - 22.0)
+    assert y == pytest.approx(22.0)
+
+    # Custom dragged position on secondary monitor is preserved (no corner snap-back!)
+    cfg_drag = {"size": "medium", "position": "bottom-right", "custom_x": -1500.0, "custom_y": 400.0}
+    x2, y2, w2, h2 = compute_camera_hud_rect(cfg_drag, screens, main_vf)
+    assert (x2, y2, w2, h2) == pytest.approx((-1500.0, 400.0, 300.0, 210.0))
+
+    # If external monitor is unplugged, custom_x=-1500 safely clamps onto main display
+    x3, y3, w3, h3 = compute_camera_hud_rect(cfg_drag, [main_vf], main_vf)
+    assert x3 == pytest.approx(0.0)
+    assert 0.0 <= y3 <= main_vf[3] - h3
+
+
+def test_collector_overlay_mirrored_across_all_displays_multimonitor():
+    from aerohand.runtime import RuntimeSnapshot
+    from aerohand.ui.app import build_overlay_snap_payloads
+
+    rects = [(0.0, 0.0, 1728.0, 1117.0), (-1920.0, 0.0, 1920.0, 1080.0)]
+    snap = RuntimeSnapshot(
+        running=True,
+        hands_count=0,
+        cursor_x=0.0,
+        cursor_y=0.0,
+        active_hint="scroll",
+        active_hint_text="Scroll active",
+    )
+    compact = {"recording": True, "current_pose": "thumb_middle_pinch", "total": 0}
+
+    # Multi-monitor teleprompter MUST appear on EVERY display even when cursor=(0,0) and no hand is present
+    payloads = build_overlay_snap_payloads(
+        rects,
+        snap,
+        has_collector_overlay=True,
+        compact_collector=compact,
+        fallback_point=(-960.0, 540.0),
+    )
+    assert len(payloads) == 2
+    assert payloads[0]["collector_guide"] == compact
+    assert payloads[1]["collector_guide"] == compact
+    # Non-collector hints follow Control Center's display (fallback_point on screen[1])
+    assert payloads[0]["active_hint"] is None
+    assert payloads[1]["active_hint"] == "scroll"
+
+    # When collector overlay is inactive, collector_guide is cleared on every display
+    idle_payloads = build_overlay_snap_payloads(
+        rects, snap, has_collector_overlay=False, compact_collector=None
+    )
+    assert all(p["collector_guide"] is None for p in idle_payloads)
+
+
+def test_collector_recording_modes_mutually_exclusive_and_immediate_snapshot(tmp_path: Path):
+    from aerohand.runtime import AeroHandRuntime
+
+    cfg = load_config()
+    cfg["audio"]["enabled"] = False
+    cfg["collector"]["negatives_dir"] = str(tmp_path / "neg")
+    cfg["collector"]["recall_dir"] = str(tmp_path / "recall")
+    rt = AeroHandRuntime(cfg, dry_run=False, collect_dir=tmp_path / "sessions")
+
+    # 1. Start cued recall -> dry_run forced True AND snapshot updated immediately
+    rt.collector_start_cued(cues_per_trigger=1, window_ms=2500, gap_ms=1200, triggers=["left_click"])
+    snap1 = rt.get_snapshot()
+    assert rt.dry_run is True
+    assert snap1.dry_run is True
+    assert snap1.collector["cued"]["active"] is True
+
+    # 2. Switch directly to guided -> cued stops cleanly, dry_run restored, guided active in snapshot
+    rt.collector_start_guided()
+    snap2 = rt.get_snapshot()
+    assert rt.collector.is_cued_active is False
+    assert rt.dry_run is False
+    assert snap2.collector["cued"]["active"] is False
+    assert snap2.collector["guided"]["active"] is True
+    assert snap2.collector["guided"]["phase"] == "countdown"
+
+    # 3. Switch directly to manual toggle -> guided stops cleanly, manual recording active in snapshot
+    rt.collector_toggle_recording()
+    snap3 = rt.get_snapshot()
+    assert rt.collector.is_guided_active is False
+    assert snap3.collector["guided"]["active"] is False
+    assert snap3.collector["recording"] is True

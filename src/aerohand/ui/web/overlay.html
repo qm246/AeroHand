@@ -17,6 +17,7 @@
   /* 1. Window Tile Frosted Glass Ghost Preview */
   #tile-preview {
     position: fixed;
+    z-index: 4000;
     border-radius: 16px;
     background: rgba(56, 189, 248, 0.16);
     border: 2px solid rgba(96, 165, 250, 0.78);
@@ -56,6 +57,7 @@
   /* 3. Top Glass Toast (Gesture Hints, Dictation Waveform & Tracking Warnings) */
   #toast-stack {
     position: fixed; top: 44px; left: 50%; transform: translateX(-50%);
+    z-index: 9999;
     display: flex; flex-direction: column; align-items: center; gap: 8px;
   }
   .toast-pill {
@@ -83,7 +85,7 @@
   }
 
   /* 4. On-Screen 5-Petal Palm Wheel Radial Menu */
-  #palm-wheel-layer { position: fixed; inset: 0; }
+  #palm-wheel-layer { position: fixed; inset: 0; z-index: 5000; }
   .pw-root {
     position: fixed;
     transform: translate(-50%, -50%);

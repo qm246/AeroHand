@@ -159,6 +159,9 @@ classifier:
     palm_tuck_on_dist: 0.44                 # Relaxed thumb-in-palm distance (4 fingers slightly extended/curved -> spaces_nav)
     palm_tuck_off_dist: 0.66
     palm_tuck_open_dist: 0.72
+    spaces_nav_palm_facing_min: 0.55        # Upright open-palm facing dot allowing spaces_nav when fingers point upward
+    spaces_nav_max_wrist_speed_pw: 4.2      # Relaxed wrist speed ceiling for upright 4-finger tuck-and-swipe
+    spaces_nav_max_wrist_ang_deg_s: 240.0   # Relaxed palm angular speed ceiling for upright 4-finger tuck-and-swipe
 
 collector:
   subject: "minh"                      # Default collector subject ID (matches converted corpus & primary_subject)

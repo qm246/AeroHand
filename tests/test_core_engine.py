@@ -7773,3 +7773,102 @@ def test_collector_recording_modes_mutually_exclusive_and_immediate_snapshot(tmp
     assert rt.collector.is_guided_active is False
     assert snap3.collector["guided"]["active"] is False
     assert snap3.collector["recording"] is True
+
+
+def test_pose_state_machine_net_displacement_ignores_still_hand_jitter():
+    """Oscillating micro-jitter around a stationary thumb+ring hold must NOT falsely trigger scroll
+    or suppress right_click on release, while real directional movement still promotes to scroll."""
+    from aerohand.core.pose_state_machine import PoseStateMachine
+
+    sm = PoseStateMachine(
+        {
+            "pose_hold_threshold_ms": 180.0,
+            "pose_hold_motion_threshold_px": 15.0,
+            "thresholds": {
+                "thumb_ring_pinch": {
+                    "enter_threshold": 0.75,
+                    "exit_threshold": 0.45,
+                    "enter_frames": 2,
+                    "exit_frames": 2,
+                }
+            },
+        }
+    )
+    ring_probs = idle_probabilities()
+    ring_probs[PoseName.IDLE] = 0.05
+    ring_probs[PoseName.THUMB_RING_PINCH] = 0.95
+
+    # Enter pose (2 frames)
+    sm.process(ring_probs, 0.0)
+    evs = sm.process(ring_probs, 33.0)
+    assert any(e.type == "pose_enter" for e in evs)
+
+    # 20 frames of +-3 px jitter (path length = 60 px, but net displacement stays <= 3 px!)
+    for i in range(20):
+        sign = 1.0 if (i % 2 == 0) else -1.0
+        sm.add_motion_delta(3.0 * sign, 1.0 * sign)
+        sm.process(ring_probs, 66.0 + i * 33.0)
+    assert sm.is_hold_active is True
+    assert sm.motion_distance < 15.0
+
+    # Release -> hold_end reports motion_distance < 15 px (eligible for right_click!)
+    sm.process(idle_probabilities(), 800.0)
+    end_evs = sm.process(idle_probabilities(), 833.0)
+    assert any(e.type == "hold_end" and e.motion_distance < 15.0 for e in end_evs)
+
+    # Real directional slide (25 px down then 25 px back up) latches peak net displacement >= 25 px
+    sm.process(ring_probs, 1000.0)
+    sm.process(ring_probs, 1033.0)
+    sm.add_motion_delta(0.0, 25.0)
+    sm.add_motion_delta(0.0, -25.0)
+    assert sm.motion_distance >= 25.0
+
+
+def test_spaces_nav_upright_palm_bypasses_pointing_gate_without_leaking_other_poses():
+    """Upright 4-finger palm facing camera (dirZ > -0.15) allows ONLY thumb_pinky_base (spaces_nav)
+    without mutating open-history/latches for other pinch classes."""
+    from synth_hand import make_airpoint_ergonomic_sequence
+
+    cfg = load_config()
+    cfg["palm_wheel"]["enabled"] = False
+    cfg["smoothing"]["enable_landmark_smoothing"] = False
+    cfg["cursor"]["enable_pointing_gate"] = True
+    cfg["cursor"]["pointing_forward_z_threshold"] = -0.15
+    clf = Heuristic3DPinchClassifier(cfg["classifier"]["heuristic_3d"])
+    eng = HandCursorEngine(cfg, classifier=clf)
+    eng.anchor_cursor("Right", 960.0, 540.0)
+
+    # Shift synthetic upright spaces_nav sequence so fingers point straight up (dirZ ~ 0.0, palm faces camera)
+    # and translate horizontally during hold to trigger SpacesNavController.
+    seq = make_airpoint_ergonomic_sequence(
+        PoseName.THUMB_PINKY_BASE, open_frames=6, close_frames=4, hold_frames=14, fps=30.0
+    )
+    triggered_dirs = []
+    for idx, (ts, lms3d) in enumerate(seq):
+        # Keep upright image (x, y) facing camera, flatten z so dirZ ~ -0.04 (pointing gate CLOSED!),
+        # and slide horizontally during hold to trigger SpacesNavController.
+        dx = 0.008 * max(0, idx - 9)
+        lms_2d = [
+            Landmark(
+                max(0.05, min(0.95, lm.x + dx)),
+                max(0.05, min(0.95, lm.y)),
+                lm.z * 0.05,
+            )
+            for lm in lms3d
+        ]
+        outs = eng.process_frame(
+            [HandInput("Right", lms_2d, lms3d, confidence=0.98, timestamp_ms=int(round(ts)))],
+            ts,
+            1920.0,
+            1080.0,
+        )
+        assert outs[0].cursor.is_pointing is False
+        if outs[0].pose.spaces_nav_direction is not None:
+            triggered_dirs.append(outs[0].pose.spaces_nav_direction)
+
+    assert len(triggered_dirs) >= 1
+    # Verify non-spaces_nav pinch classes never had open history leaked while pointing gate was closed
+    st = clf._hands.get("Right")
+    assert st is not None
+    assert PoseName.THUMB_MIDDLE_PINCH not in st.last_open_ms
+    assert PoseName.THUMB_RING_PINCH not in st.last_open_ms

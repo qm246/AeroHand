@@ -13,6 +13,7 @@ Handles:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Dict, List, Literal, Optional
 
@@ -46,6 +47,8 @@ class PoseStateMachine:
         self._start_time_ms: float = 0.0
         self._hold_active: bool = False
         self._motion_distance: float = 0.0
+        self._disp_x: float = 0.0
+        self._disp_y: float = 0.0
         self.update_config(psm_cfg)
 
     def update_config(self, psm_cfg: Optional[Dict[str, Any]]) -> None:
@@ -106,6 +109,8 @@ class PoseStateMachine:
         self._start_time_ms = 0.0
         self._hold_active = False
         self._motion_distance = 0.0
+        self._disp_x = 0.0
+        self._disp_y = 0.0
 
     @property
     def active_pose(self) -> Optional[PoseName]:
@@ -122,6 +127,15 @@ class PoseStateMachine:
     def add_motion(self, distance_px: float) -> None:
         if self._active_pose is not None and distance_px > 0.0:
             self._motion_distance += float(distance_px)
+
+    def add_motion_delta(self, dx: float, dy: float) -> None:
+        """Track peak net Euclidean displacement from pose-enter anchor (immune to still-hand jitter)."""
+        if self._active_pose is not None:
+            self._disp_x += float(dx)
+            self._disp_y += float(dy)
+            net = math.hypot(self._disp_x, self._disp_y)
+            if net > self._motion_distance:
+                self._motion_distance = net
 
     def get_tap_action(self, pose: PoseName) -> Optional[str]:
         return self.tap_actions.get(pose)
@@ -183,6 +197,8 @@ class PoseStateMachine:
                 self._exit_count = 0
                 self._hold_active = False
                 self._motion_distance = 0.0
+                self._disp_x = 0.0
+                self._disp_y = 0.0
                 self._candidate_pose = None
                 self._enter_count = 0
                 events.append(PoseEvent(type="pose_enter", pose=candidate))
@@ -227,6 +243,8 @@ class PoseStateMachine:
             self._exit_count = 0
             self._hold_active = False
             self._motion_distance = 0.0
+            self._disp_x = 0.0
+            self._disp_y = 0.0
 
             if was_holding and hold_eligible:
                 events.append(PoseEvent(type="hold_end", pose=active, motion_distance=captured_motion))

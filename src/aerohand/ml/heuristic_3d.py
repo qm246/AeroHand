@@ -180,6 +180,12 @@ class Heuristic3DPinchClassifier:
         self.palm_tuck_on_dist: float = float(c.get("palm_tuck_on_dist", 0.44))
         self.palm_tuck_off_dist: float = float(c.get("palm_tuck_off_dist", 0.66))
         self.palm_tuck_open_dist: float = float(c.get("palm_tuck_open_dist", 0.72))
+        self.spaces_nav_max_wrist_speed_pw: float = max(
+            self.max_wrist_speed_pw, float(c.get("spaces_nav_max_wrist_speed_pw", 4.2))
+        )
+        self.spaces_nav_max_wrist_ang_deg_s: float = max(
+            self.max_wrist_ang_speed_deg_s, float(c.get("spaces_nav_max_wrist_ang_deg_s", 240.0))
+        )
 
         self._state_gap_reset_ms: float = float(c.get("state_gap_reset_ms", 250.0))
         self._latch_score_threshold: float = float(c.get("latch_score_threshold", 0.85))
@@ -192,12 +198,39 @@ class Heuristic3DPinchClassifier:
             self._hands.pop(hand, None)
             self.last_debug.pop(hand, None)
 
+    def predict_only_pose(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        timestamp_ms: float,
+        only_pose: PoseName,
+    ) -> PinchPrediction:
+        """
+        Evaluate ONLY `only_pose` (e.g. `THUMB_PINKY_BASE` under upright-palm Spaces Nav)
+        without mutating open-history or latches for any other pinch class.
+        """
+        return self._predict_impl(
+            landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose=only_pose
+        )
+
     def predict(
         self,
         landmarks_2d: Sequence[Landmark],
         world_landmarks: Optional[Sequence[Landmark]],
         handedness: Handedness,
         timestamp_ms: float,
+    ) -> PinchPrediction:
+        return self._predict_impl(landmarks_2d, world_landmarks, handedness, timestamp_ms, only_pose=None)
+
+    def _predict_impl(
+        self,
+        landmarks_2d: Sequence[Landmark],
+        world_landmarks: Optional[Sequence[Landmark]],
+        handedness: Handedness,
+        timestamp_ms: float,
+        *,
+        only_pose: Optional[PoseName] = None,
     ) -> PinchPrediction:
         src = world_landmarks if (world_landmarks is not None and len(world_landmarks) >= 21) else landmarks_2d
         pf = compute_palm_frame(
@@ -394,6 +427,8 @@ class Heuristic3DPinchClassifier:
         prev_shaft_open_dist = dict(st.last_shaft_open_dist)
         decay_factor = math.exp(-dt_s / self.approach_decay_tau_s) if dt_s > 0.0 else 1.0
         for pose_key, (dist_val, on_d, _off_d) in tip_specs.items():
+            if only_pose is not None and pose_key != only_pose:
+                continue
             if dist_val >= (on_d + self.approach_open_margin):
                 prev_t = st.last_open_ms.get(pose_key)
                 prev_d = st.last_open_dist.get(pose_key, 0.0)
@@ -407,6 +442,8 @@ class Heuristic3DPinchClassifier:
                 st.last_open_ms[pose_key] = timestamp_ms
 
         for pose_key, (s_val, _s_on, _s_off, s_open) in shaft_specs.items():
+            if only_pose is not None and pose_key != only_pose:
+                continue
             if s_val >= s_open:
                 prev_t = st.last_shaft_open_ms.get(pose_key)
                 prev_d = st.last_shaft_open_dist.get(pose_key, 0.0)
@@ -419,6 +456,8 @@ class Heuristic3DPinchClassifier:
                 st.last_shaft_open_ms[pose_key] = timestamp_ms
 
         for pose_key, (dist_val, _on_d, off_d) in tip_specs.items():
+            if only_pose is not None and pose_key != only_pose:
+                continue
             tip_off = dist_val >= off_d
             if pose_key in shaft_specs and shaft_eligible.get(pose_key, False):
                 s_val, _s_on, s_off, _s_open = shaft_specs[pose_key]
@@ -577,6 +616,11 @@ class Heuristic3DPinchClassifier:
         ) and d_pinky_tip > self.pinch_off_dist:
             scores[PoseName.THUMB_PINKY_PINCH] *= 0.3
 
+        if only_pose is not None:
+            for pose_key in list(scores.keys()):
+                if pose_key != only_pose:
+                    scores[pose_key] = 0.0
+
         raw_top_pose, raw_top_score = max(scores.items(), key=lambda kv: kv[1])
         blocked_by: Dict[str, List[str]] = {}
         all_reasons: Set[str] = set()
@@ -621,7 +665,17 @@ class Heuristic3DPinchClassifier:
                         ):
                             reasons.append("approach")
                 if self.enable_motion_gate:
-                    if eff_speed_pw > self.max_wrist_speed_pw or eff_ang > self.max_wrist_ang_speed_deg_s:
+                    if (
+                        only_pose == PoseName.THUMB_PINKY_BASE
+                        and pose_key == PoseName.THUMB_PINKY_BASE
+                        and shaft_eligible.get(PoseName.THUMB_PINKY_BASE, False)
+                    ):
+                        spd_lim = self.spaces_nav_max_wrist_speed_pw
+                        ang_lim = self.spaces_nav_max_wrist_ang_deg_s
+                    else:
+                        spd_lim = self.max_wrist_speed_pw
+                        ang_lim = self.max_wrist_ang_speed_deg_s
+                    if eff_speed_pw > spd_lim or eff_ang > ang_lim:
                         reasons.append("motion")
                 if self.enable_posture_gate:
                     if pose_key in _NON_INDEX_POSTURE_POSES and idx_ext < self.index_ext_min:

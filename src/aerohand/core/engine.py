@@ -20,7 +20,6 @@ Pipeline per frame:
 from __future__ import annotations
 
 import logging
-import math
 import threading
 import time
 from dataclasses import dataclass
@@ -36,6 +35,7 @@ from aerohand.core.palm_frame import (
     RING_TIP,
     THUMB_TIP,
     compute_hand_rotation,
+    compute_palm_facing_dot,
     compute_palm_frame,
     compute_pointing_dir_z,
 )
@@ -532,6 +532,9 @@ class HandCursorEngine:
         self.require_pointing_gate_for_actions: bool = bool(
             cls_cfg.get("require_pointing_gate_for_actions", True)
         )
+        self.spaces_nav_palm_facing_min: float = max(
+            0.0, min(1.0, float(cls_cfg.get("spaces_nav_palm_facing_min", 0.55)))
+        )
 
         scr_cfg = config.get("scroll") or {}
         wt_cfg = config.get("window_tile") or {}
@@ -786,6 +789,9 @@ class HandCursorEngine:
             )
 
             # 5. Pluggable Pinch Classification (fail-open to IDLE; latch gate while pose is active)
+            # Upright open 4-finger palm facing the camera (`palm_facing_dot >= spaces_nav_palm_facing_min`)
+            # may classify ONLY `thumb_pinky_base` (Spaces Nav) even when fingers point upward (`dirZ > -0.15`),
+            # while all other pinch actions remain strictly gated by the forward-pointing `dirZ` gate.
             pose_probs = idle_probabilities()
             pred_pose = PoseName.IDLE
             pose_active = hs.pose_sm.active_pose is not None
@@ -794,19 +800,57 @@ class HandCursorEngine:
                 or is_pointing
                 or (self.latch_gate_while_pose_active and pose_active)
             )
+            spaces_palm_open = False
+            if (not gate_allows) and self.enable_spaces_nav and (not pw_active):
+                facing_dot = compute_palm_facing_dot(lms, is_left_hand=(hand == "Left"), mirrored=True)
+                spaces_palm_open = facing_dot >= self.spaces_nav_palm_facing_min
+            spaces_only_mode = (
+                self.require_pointing_gate_for_actions
+                and (not is_pointing)
+                and (
+                    spaces_palm_open
+                    or (self.latch_gate_while_pose_active and hs.pose_sm.active_pose == PoseName.THUMB_PINKY_BASE)
+                )
+            )
             tm0 = time.perf_counter()
             with self._classifier_lock:
                 active_clf = self.classifier
-            if active_clf is not None and not pw_active and gate_allows:
+            if active_clf is not None and not pw_active and (gate_allows or spaces_palm_open):
                 try:
-                    pred = active_clf.predict(
-                        landmarks_2d=lms,
-                        world_landmarks=inp.world_landmarks,
-                        handedness=hand,
-                        timestamp_ms=timestamp_ms,
-                    )
-                    pred_pose = pred.pose
-                    pose_probs = pred.probabilities
+                    if not spaces_only_mode:
+                        pred = active_clf.predict(
+                            landmarks_2d=lms,
+                            world_landmarks=inp.world_landmarks,
+                            handedness=hand,
+                            timestamp_ms=timestamp_ms,
+                        )
+                        pred_pose = pred.pose
+                        pose_probs = pred.probabilities
+                    else:
+                        predict_only = getattr(active_clf, "predict_only_pose", None)
+                        if callable(predict_only):
+                            pred = predict_only(
+                                landmarks_2d=lms,
+                                world_landmarks=inp.world_landmarks,
+                                handedness=hand,
+                                timestamp_ms=timestamp_ms,
+                                only_pose=PoseName.THUMB_PINKY_BASE,
+                            )
+                        else:
+                            pred = active_clf.predict(
+                                landmarks_2d=lms,
+                                world_landmarks=inp.world_landmarks,
+                                handedness=hand,
+                                timestamp_ms=timestamp_ms,
+                            )
+                        pb_p = float(pred.probabilities.get(PoseName.THUMB_PINKY_BASE, 0.0))
+                        pose_probs = idle_probabilities()
+                        if pb_p > 0.0:
+                            pose_probs[PoseName.THUMB_PINKY_BASE] = pb_p
+                            pose_probs[PoseName.IDLE] = max(0.0, 1.0 - pb_p)
+                            pred_pose = PoseName.THUMB_PINKY_BASE if pb_p >= 0.5 else PoseName.IDLE
+                        else:
+                            pred_pose = PoseName.IDLE
                 except Exception as exc:
                     logger.warning(f"[ENGINE] Classifier failed (fail-open to IDLE): {exc}")
                     pose_probs = idle_probabilities()
@@ -935,7 +979,7 @@ class HandCursorEngine:
             hs.prev_drag_prob = drag_prob
 
             if hs.pose_sm.active_pose is not None:
-                hs.pose_sm.add_motion(math.hypot(hs.cursor_delta[0], hs.cursor_delta[1]))
+                hs.pose_sm.add_motion_delta(hs.cursor_delta[0], hs.cursor_delta[1])
 
             events = hs.pose_sm.process(
                 pose_probs, timestamp_ms, cursor_speed_px_s=cursor_out.speed
